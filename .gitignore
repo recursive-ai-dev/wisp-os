@@ -1,0 +1,32 @@
+# Build output (cargo).
+/target/
+
+# Assembled bootable ESP output from ./build.sh (EFI/BOOT/BOOTX64.EFI,
+# copied from target/ -- a build artifact, not source; esp/APPS/*.wisp
+# remain tracked, since those are hand-written source, not generated).
+/esp/EFI/
+
+# Python bytecode cache from running the tests/ scripts directly.
+__pycache__/
+*.pyc
+
+# QEMU debugcon log from ./run.sh.
+/debug.log
+
+# Phase 2, Part B: the AHCI save disk. Generated on demand by run.sh/
+# tests/acceptance_test.py (`qemu-img create -f raw save.img 64M`) -- never
+# committed, so a fresh checkout always starts from a fresh, empty disk
+# rather than one seeded with whatever a previous run happened to save.
+/save.img
+
+# Test-harness scratch output (screenshots, per-run debug logs, isolated
+# build/ESP dirs for tests/fault_test.py and tests/ahci_test.py).
+/tests/out/
+/tests/out_fault/
+/tests/out_ahci/
+
+# Release archives from scripts/make_release.sh.
+/dist/
+
+# USB test-suite scratch output.
+/tests/out_usb/

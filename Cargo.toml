@@ -1,0 +1,61 @@
+[package]
+name = "wisp-os"
+version = "1.0.0"
+edition = "2021"
+description = "WISP OS: a from-scratch x86_64 UEFI kernel and shell running the WISP scripting language. No networking, by design."
+
+[[bin]]
+# Upper-case on purpose, and not a style slip. The UEFI spec's removable
+# media fallback path is the literal filename `\EFI\BOOT\BOOTX64.EFI`
+# (see USB_INSTALL.md's "Booting the stick"), and naming the binary to
+# match means the artifact cargo drops in `target/` is already the name
+# every script, test suite and installer here expects -- `build.sh`, the
+# three `scripts/install_usb_*` installers and all four test suites copy
+# `BOOTX64.efi` by that name. A kebab-case `bootx64` would build fine and
+# then quietly disagree with every one of them.
+name = "BOOTX64"
+path = "src/main.rs"
+
+[lints.cargo]
+# Silences `cargo::non_kebab_case_bins` for the deliberate name above.
+# Scoped to this one lint rather than blanket-allowing anything: this
+# project builds with zero warnings, and a warning nobody can act on is
+# how a build stops being read at all.
+non_kebab_case_bins = "allow"
+
+[dependencies]
+# Hard-pinned per project constraints. Do not bump: this crate's API shifts
+# across releases and every call in this project was verified against the
+# exact source of 0.30.0 in ~/.cargo/registry.
+uefi = { version = "=0.30.0", default-features = false, features = ["alloc"] }
+
+[features]
+# Off by default; never enabled in the normal release binary. Used only to
+# build one-off, single-purpose bring-up/verification binaries -- see
+# CHANGES.md's account of the exit_boot_services phase for what each is for.
+panic-screen-smoke-test = []
+# Off by default; never enabled in the normal release binary. Adds one
+# hidden shell command (`__fault_test_int3`, deliberately not listed in
+# `help` and not a name anyone would type by accident) that issues a real
+# `int3` breakpoint exception, so `tests/fault_test.py` can boot a binary
+# built with this feature and confirm the GDT/IDT/fault-screen path
+# actually catches and reports a live CPU exception instead of silently
+# resetting the VM -- see CHANGES.md.
+fault-test-hooks = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+# At this opt-level (and worse with LTO on), LLVM's loop-idiom-recognize
+# pass rewrites the CStr16 length-scanning loop used internally by the
+# `uefi` crate into a call to libc's `wcslen`, which does not exist in this
+# freestanding no_std/no-libc target and fails at link time with
+# "undefined symbol: wcslen". This is not a bug in our code or in `uefi`;
+# it's inherent to bare-metal no_std targets that don't disable this class
+# of optimization. Fixed by providing our own `wcslen` in
+# src/libc_shims.rs rather than degrading codegen quality -- see
+# CHANGES.md.
+lto = true

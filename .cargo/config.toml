@@ -1,0 +1,15 @@
+# Reproducible PE output, so anyone can check a release's prebuilt
+# BOOTX64.EFI against their own build of the same source and toolchain:
+#
+#   /Brepro      lld-link derives the COFF header timestamp from a hash of
+#                the output instead of the wall clock.
+#   /DEBUG:NONE  no CodeView debug directory. Its GUID is derived from the
+#                PDB, which records absolute build paths, so it differed
+#                between two checkouts of identical source. The PDB was
+#                never shipped or used (debugging here is the debugcon log
+#                and the fault screen), so nothing is lost.
+#
+# Verified: two builds of the same tree in different directories produce a
+# byte-identical BOOTX64.EFI (see CHANGES.md, v1.0.0).
+[target.x86_64-unknown-uefi]
+rustflags = ["-C", "link-arg=/Brepro", "-C", "link-arg=/DEBUG:NONE"]
