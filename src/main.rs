@@ -38,6 +38,7 @@ mod ioapic;
 mod keyboard;
 mod lapic;
 mod libc_shims;
+mod line_editor;
 mod panic;
 mod paging;
 mod pci;

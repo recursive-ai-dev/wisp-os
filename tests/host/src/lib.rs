@@ -10,3 +10,6 @@ pub mod wisp;
 
 #[path = "../../../src/save_format.rs"]
 pub mod save_format;
+
+#[path = "../../../src/line_editor.rs"]
+pub mod line_editor;

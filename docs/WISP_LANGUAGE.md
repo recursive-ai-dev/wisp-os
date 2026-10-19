@@ -366,7 +366,10 @@ by `fn`:
 - `input(prompt)` -- writes `prompt` to the screen (no trailing newline),
   then blocks (idling the CPU between keystrokes, same as the shell's own
   prompt) until the user presses Enter, and returns everything they typed
-  as a `string`. Backspace works while typing, same as at the `>` prompt.
+  as a `string`. The line can be edited while it is typed, as at the `>`
+  prompt: Left/Right, Home/End, Backspace and Delete. (Up/Down history is
+  not offered inside a program: a game's input should not recall shell
+  commands.)
   Pressing Esc while `input()` is waiting stops the program instead of
   returning (see "Stopping a program").
 - `len(v)` -- number of bytes in `v` if it's a `string`, or number of
@@ -615,6 +618,9 @@ wisp> shout(names[0])
 - Esc stops a running line, as it stops a program. At the `wisp>`
   prompt it clears a half-typed line, as at the shell prompt; at a `...`
   continuation prompt it discards the whole unfinished input.
+- Up/Down recall earlier lines (kept from one `wisp` session to the
+  next until the machine restarts), and Left/Right/Home/End/Delete edit
+  the line -- the quick way to fix a typo in a line that failed.
 - `vars` lists the session's globals and functions; `exit` (or `quit`)
   ends the session, freeing everything it built.
 

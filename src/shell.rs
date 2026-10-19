@@ -19,6 +19,7 @@ use crate::paging;
 use crate::pmm;
 use crate::gfx::{self, Console};
 use crate::keyboard;
+use crate::line_editor::{self, History};
 use crate::usb_hid;
 use crate::clock;
 use crate::save_format;
@@ -171,10 +172,6 @@ const BANNER: &str = concat!(
     "\n",
 );
 
-/// ASCII backspace, as decoded by `keyboard.rs`.
-const BACKSPACE: u8 = 0x08;
-/// ASCII carriage return, as decoded by `keyboard.rs`.
-const ENTER: u8 = 0x0d;
 
 pub struct Shell {
     /// Every `APPS/*.wisp` file, read into memory by `fs::snapshot_apps`
@@ -198,6 +195,11 @@ pub struct Shell {
     /// route through them in a later Build Order step) can issue commands
     /// at any later point in the shell's lifetime.
     save_disk: Option<save_format::SaveDisk>,
+    /// Lines typed at the `>` prompt, for Up/Down.
+    history: History,
+    /// Lines typed at the `wisp>` prompt, kept separately (they are WISP,
+    /// not shell commands) and across sessions.
+    wisp_history: History,
 }
 
 impl Shell {
@@ -206,6 +208,8 @@ impl Shell {
             apps,
             rng_state: seed_rng(),
             save_disk,
+            history: History::new(),
+            wisp_history: History::new(),
         }
     }
 
@@ -227,7 +231,7 @@ impl Shell {
 
         loop {
             self.print_prompt(console);
-            let line = read_line(console, LineMode::Prompt);
+            let line = read_line(console, LineMode::Prompt, Some(&mut self.history));
             console.newline();
             self.execute(line.trim(), console);
         }
@@ -402,7 +406,8 @@ impl Shell {
              \x20\x20keys          List every key on the save disk\n\
              \x20\x20delete <k>    Delete key <k> from the save disk\n\
              \x20\x20format        Set up the AHCI disk for save/load (ERASES it; asks first)\n\
-             Press Esc to stop a running program.\n",
+             Press Esc to stop a running program. Arrows, Home, End and Delete edit\n\
+             a line; Up and Down recall earlier ones.\n",
         );
     }
 
@@ -566,7 +571,7 @@ impl Shell {
             },
         );
         console.set_fg(gfx::FOREGROUND);
-        let answer = read_line(console, LineMode::Program);
+        let answer = read_line(console, LineMode::Program, None);
         console.newline();
         keyboard::clear_stop_request();
         if answer.trim() != "ERASE" {
@@ -686,7 +691,7 @@ impl Shell {
             // it); a continuation line returns on Esc, which abandons the
             // whole unfinished input.
             let mode = if pending.is_empty() { LineMode::Prompt } else { LineMode::Program };
-            let line = read_line(console, mode);
+            let line = read_line(console, mode, Some(&mut self.wisp_history));
             console.newline();
             if mode == LineMode::Program && keyboard::stop_requested() {
                 keyboard::clear_stop_request();
@@ -854,40 +859,26 @@ enum LineMode {
     Program,
 }
 
-/// Read one line of text from the keyboard with echo and backspace,
-/// blocking (idling the CPU between keystrokes via `keyboard::wait_for_key`)
-/// until Enter is pressed. Shared by the shell's own prompt and by the WISP
-/// `input()` builtin, so a running script's text input behaves identically
-/// to the shell's -- except for Esc; see [`LineMode`].
-fn read_line(console: &mut Console, mode: LineMode) -> String {
-    let mut line = String::new();
-    loop {
-        let byte = keyboard::wait_for_key();
-        match byte {
-            ENTER => return line,
-            keyboard::ESC => match mode {
-                LineMode::Program => return line,
-                LineMode::Prompt => {
-                    while line.pop().is_some() {
-                        console.backspace();
-                    }
-                    // Nothing is running to stop; don't let this Esc
-                    // linger and stop the next program the instant it
-                    // starts. (`cmd_run` clears it too -- belt and braces.)
-                    keyboard::clear_stop_request();
-                }
-            },
-            BACKSPACE => {
-                if line.pop().is_some() {
-                    console.backspace();
-                }
-            }
-            0x20..=0x7e => {
-                line.push(byte as char);
-                console.put_ascii(byte);
-            }
-            _ => {}
+/// Read one line of text from the keyboard, echoed and editable (see
+/// `line_editor`: Left/Right/Home/End/Backspace/Delete, and Up/Down
+/// through `history` when there is one), blocking -- idling the CPU
+/// between keystrokes via `keyboard::wait_for_key` -- until Enter is
+/// pressed. Shared by the shell's own prompt, the `wisp>` prompt and the
+/// WISP `input()` builtin, so all of them edit alike -- except for Esc;
+/// see [`LineMode`].
+fn read_line(console: &mut Console, mode: LineMode, history: Option<&mut History>) -> String {
+    let mut next_key = || {
+        let key = keyboard::wait_for_key();
+        if key == keyboard::ESC && mode == LineMode::Prompt {
+            // Nothing is running to stop; don't let this Esc linger and
+            // stop the next program the instant it starts. (`cmd_run`
+            // clears it too -- belt and braces.)
+            keyboard::clear_stop_request();
         }
+        key
+    };
+    match line_editor::read_line(console, &mut next_key, history, mode == LineMode::Prompt) {
+        line_editor::Outcome::Line(line) | line_editor::Outcome::Escaped(line) => line,
     }
 }
 
@@ -936,7 +927,7 @@ impl wisp::interp::Host for ShellHost<'_> {
 
     fn input(&mut self, prompt: &str) -> String {
         self.console.write_str(prompt);
-        let line = read_line(self.console, LineMode::Program);
+        let line = read_line(self.console, LineMode::Program, None);
         self.console.newline();
         line
     }

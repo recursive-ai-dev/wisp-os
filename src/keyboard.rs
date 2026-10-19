@@ -2,13 +2,16 @@
 //! controller -- real or emulated -- speaks unless explicitly reprogrammed,
 //! which QEMU's default `i8042` never is), decoded into the same ASCII
 //! byte space `shell.rs` already expects (`ENTER = 0x0d`, `BACKSPACE =
-//! 0x08`, printable ASCII 0x20-0x7e). Extended (0xE0-prefixed) keys and
-//! non-printable keys (function keys, arrows, Ctrl/Alt, CapsLock, NumLock,
-//! ScrollLock) are recognized and discarded rather than mis-decoded, since
-//! nothing in this shell binds them to anything.
+//! 0x08`, printable ASCII 0x20-0x7e). The editing keys -- arrows, Home,
+//! End, Delete, all 0xE0-prefixed -- become `line_editor`'s `KEY_*` codes;
+//! keypad Enter is Enter. Every other extended or non-printable key
+//! (function keys, Ctrl/Alt, CapsLock, NumLock, ScrollLock, the "fake
+//! shift" codes some keyboards wrap arrows in) is recognized and discarded
+//! rather than mis-decoded.
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
+use crate::line_editor::{KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
 use crate::sync::Locked;
 
 const DATA_PORT: u16 = 0x60;
@@ -82,8 +85,8 @@ struct RingBuffer {
     tail: usize, // next slot to push
     len: usize,
     /// True once a decoded 0xE0 prefix byte has been consumed, so the next
-    /// scancode byte is known to be part of an extended sequence and is
-    /// discarded regardless of its own value.
+    /// scancode byte is known to be part of an extended sequence (see
+    /// [`extended_key`]).
     pending_extended: bool,
     shift_held: bool,
 }
@@ -187,9 +190,14 @@ pub fn on_irq() {
 
     QUEUE.with(|q| {
         if q.pending_extended {
-            // Second byte of an 0xE0-prefixed sequence (arrow keys, Home,
-            // End, right Ctrl/Alt, etc.) -- not bound to anything, discard.
+            // Second byte of an 0xE0-prefixed sequence: an editing key, or
+            // something (right Ctrl/Alt, a release, a fake shift) that is
+            // not bound to anything.
             q.pending_extended = false;
+            let key = extended_key(scancode);
+            if key != 0 {
+                q.push(key);
+            }
             return;
         }
         if scancode == EXTENDED_PREFIX {
@@ -225,6 +233,24 @@ pub fn on_irq() {
             q.push(ascii);
         }
     });
+}
+
+/// The byte an 0xE0-prefixed make code decodes to, or 0 for one this
+/// kernel does not use. Release codes (bit 7 set) are all 0: like ordinary
+/// keys, only presses count -- and the keyboard's own typematic repeat
+/// resends the make code while an arrow is held.
+fn extended_key(scancode: u8) -> u8 {
+    match scancode {
+        0x48 => KEY_UP,
+        0x50 => KEY_DOWN,
+        0x4B => KEY_LEFT,
+        0x4D => KEY_RIGHT,
+        0x47 => KEY_HOME,
+        0x4F => KEY_END,
+        0x53 => KEY_DELETE,
+        0x1C => ENTER, // keypad Enter
+        _ => 0,
+    }
 }
 
 /// Enqueue an already-decoded ASCII byte from an input source other than

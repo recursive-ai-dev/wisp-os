@@ -2427,3 +2427,56 @@ of the first assertions failed on OCR, not on the kernel -- tesseract
 reads `= 11` as `- 1` and the red `(Esc pressed)` as `{Ese pressed` --
 and were changed to text it reads reliably; the Esc stop is proven by
 the kernel's debugcon line instead.
+
+## A line editor for every prompt
+
+Using the new `wisp>` prompt on the emulated machine made the gap plain:
+a typo in the second line of a three-line function meant typing all
+three again. Every line of input -- the `>` prompt, the `wisp>` prompt,
+a program's `input()` -- was echo-and-backspace only, with no visible
+cursor, and the PS/2 driver deliberately discarded every `0xE0`-prefixed
+key, arrows included.
+
+- **Keys.** The PS/2 driver decodes `0xE0` make codes for the arrows,
+  Home, End and Delete (and keypad Enter); the USB HID decoder maps the
+  same keys (usages 0x4A-0x52). Both deliver them as `line_editor::KEY_*`
+  codes, 0x80 and up, outside anything that decodes to a character.
+- **`src/line_editor.rs`.** Left/Right/Home/End move, Backspace/Delete
+  delete, typing inserts mid-line; Up/Down browse a `History` (the line
+  being typed is kept as a draft and restored by Down). A 2-pixel
+  underline marks the cursor. Lines are capped at 1024 characters.
+- **Wrapping and scrolling.** A line can wrap across rows, and typing at
+  the bottom of the screen scrolls it up mid-edit. The editor records
+  where its text began and the console's scroll count at that moment
+  (`Console` now counts scrolls), so it can always find the cell of any
+  character and redraw exactly from the edit point onward, blanking what
+  a shorter line no longer covers.
+- **Where history applies.** The `>` and `wisp>` prompts each keep their
+  own (WISP lines are not shell commands); `input()` gets editing but no
+  history, so a game never offers to recall shell commands. Esc behaves
+  as before: it clears a prompt's line and ends a program's `input()`.
+
+Verified: the editor draws through a small `Screen` trait, so
+`tests/host/tests/line_editor.rs` runs the real code against a simulated
+character grid with `Console`'s exact wrap and scroll rules. A reference
+model tracks what the line should be; after every keystroke the test
+checks every on-screen cell of the line (out to the longest it has ever
+been, so nothing stale survives), that the prompt is intact, and that
+exactly one cell carries the cursor mark. 576 randomized runs on screens
+from 1x5 to 80x25 cells -- prompts that wrap, fill a row exactly, or
+start on the bottom row -- plus targeted cases. Mutation testing found
+the tests blind to one real bug: Enter on an *empty* line after a prompt
+that exactly filled its row parked the cursor one row too far, so the
+shell's newline added a blank line. Fixed, and the harness now checks
+the parked position for empty lines too. `tests/acceptance_test.py` step
+22 recalls and edits commands at both prompts over PS/2, and
+`tests/usb_test.py` drives Left, End and Up over USB.
+
+The visible cursor has one side effect on the OCR-based suites: tesseract
+reads the underline as `_`, and can then take the character before it
+for lowercase (`abcXX` read as `abcxX_`). Every existing step still
+passed with the cursor in place; step 5a -- which OCRs a line *while* it
+is being typed -- is now checked case-insensitively, on a cleared screen.
+The new steps' assertions were also chosen around tesseract's known
+misreads in this font (`OK` as `ok`, `bcde` as `bede`), each noted where
+it is asserted.

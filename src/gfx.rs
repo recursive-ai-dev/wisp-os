@@ -78,6 +78,9 @@ pub struct Console {
     cursor_row: usize,
     fg: Color,
     bg: Color,
+    /// How many times the contents have scrolled up a row, ever -- what
+    /// lets `line_editor` find a line that scrolled while being typed.
+    scrolls: u64,
 }
 
 impl Console {
@@ -136,6 +139,7 @@ impl Console {
             cursor_row: 0,
             fg: FOREGROUND,
             bg: BLACK,
+            scrolls: 0,
         };
         console.clear();
         Ok(console)
@@ -216,6 +220,8 @@ impl Console {
             core::ptr::copy(src, dst, move_bytes);
         }
 
+        self.scrolls += 1;
+
         // Blank the newly-exposed last row.
         let bg = self.encode(self.bg);
         let last_row_y0 = usable_height - GLYPH_HEIGHT;
@@ -247,22 +253,6 @@ impl Console {
         let bg = self.bg;
         self.draw_glyph(self.cursor_col, self.cursor_row, byte, fg, bg);
         self.cursor_col += 1;
-    }
-
-    /// Erase the character before the cursor and move the cursor back onto
-    /// it, wrapping to the end of the previous line if already at column
-    /// zero. Does nothing at the very top-left of the screen.
-    pub fn backspace(&mut self) {
-        if self.cursor_col > 0 {
-            self.cursor_col -= 1;
-        } else if self.cursor_row > 0 {
-            self.cursor_row -= 1;
-            self.cursor_col = self.cols - 1;
-        } else {
-            return;
-        }
-        let bg = self.bg;
-        self.draw_glyph(self.cursor_col, self.cursor_row, b' ', bg, bg);
     }
 
     /// Write a string, honoring `\n` as a line break and rendering every
@@ -537,5 +527,58 @@ impl fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         Console::write_str(self, s);
         Ok(())
+    }
+}
+
+/// The line editor's view of the console (see `line_editor::Screen`).
+/// Positions are character cells, exactly the console's own cursor.
+impl crate::line_editor::Screen for Console {
+    fn cols(&self) -> usize {
+        self.cols
+    }
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn position(&self) -> (usize, usize) {
+        (self.cursor_col, self.cursor_row)
+    }
+
+    fn set_position(&mut self, col: usize, row: usize) {
+        self.cursor_col = col.min(self.cols);
+        self.cursor_row = row.min(self.rows - 1);
+    }
+
+    fn scrolls(&self) -> u64 {
+        self.scrolls
+    }
+
+    fn put(&mut self, byte: u8) {
+        self.put_ascii(byte);
+    }
+
+    fn scroll_up(&mut self) {
+        self.scroll_up_one_row();
+    }
+
+    /// The cursor is a two-pixel underline across the cell's bottom rows,
+    /// in the text color: visible on any character, and clear of the
+    /// glyph itself, which a block cursor would cover.
+    fn mark(&mut self, col: usize, row: usize, byte: u8, on: bool) {
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let (fg, bg) = (self.fg, self.bg);
+        self.draw_glyph(col, row, byte, fg, bg);
+        if on {
+            let px = self.encode(fg);
+            let y0 = row * GLYPH_HEIGHT + GLYPH_HEIGHT - 2;
+            for y in y0..y0 + 2 {
+                for x in col * GLYPH_WIDTH..(col + 1) * GLYPH_WIDTH {
+                    self.put_pixel(x, y, px);
+                }
+            }
+        }
     }
 }

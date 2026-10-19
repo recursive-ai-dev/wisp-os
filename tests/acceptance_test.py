@@ -98,6 +98,15 @@ class Monitor:
         self.cmd("sendkey ret")
         time.sleep(0.05)
 
+    def key(self, name: str, times: int = 1, gap: float = 0.05):
+        """Press a named key (a QEMU qcode: up, left, home, delete, ...)
+        `times` times. `gap` must exceed QEMU's 100 ms sendkey hold when
+        the same key repeats on a USB keyboard, whose boot reports carry
+        key *state*: two presses inside one hold read as one."""
+        for _ in range(times):
+            self.cmd(f"sendkey {name}")
+            time.sleep(gap)
+
     def backspace(self):
         self.cmd("sendkey backspace")
         time.sleep(0.02)
@@ -601,7 +610,12 @@ def main():
 
         # Backspace test: type "abcXX" then backspace twice, then submit so
         # the resulting "unknown command: abc" line proves the trailing
-        # "XX" was actually deleted, not just visually obscured.
+        # "XX" was actually deleted, not just visually obscured. On a
+        # cleared screen: at the bottom of a full one, tesseract read this
+        # line as "abexX".
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
         mon.type_text("abcXX")
         time.sleep(0.1)
         shot = mon.screendump("05a_before_backspace")
@@ -609,7 +623,13 @@ def main():
         # sometimes misread as 'E'); "XX" alone is enough to prove both
         # trailing characters were actually typed before the backspace
         # test below proves they were then deleted.
-        assert_ocr(shot, "XX", "step 5a (before backspace)")
+        # Case-insensitively: the line editor's underline cursor sits right
+        # after the second "X", and tesseract then reads the first as "x"
+        # ("abcxX_"). What this step proves is that two characters were
+        # typed; step 5c proves they were deleted.
+        text = assert_ocr(shot, [], "step 5a (before backspace)")
+        if "xx" not in text.lower():
+            raise RuntimeError(f"step 5a (before backspace): typed 'XX' not on screen.\nOCR text:\n{text}")
         print("step 5a (before backspace):", shot, "-- OCR verified")
         mon.backspace()
         mon.backspace()
@@ -1291,6 +1311,66 @@ def main():
         assert_ocr(shot, ["left the WISP prompt", "prompt_done"], "step 21c (wisp prompt -- exit back to the shell)")
         assert_debug_log("[wisp] interactive prompt ended", "step 21c (wisp prompt -- exit back to the shell)")
         print("step 21c (wisp prompt -- exit back to the shell):", shot, "-- debug log + OCR verified")
+
+        # The line editor: Up recalls the last command, which is edited
+        # mid-line before it runs; then Home/Right/Delete/End/Backspace
+        # edit a fresh line; then history at the wisp> prompt.
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("echo first_entry")
+        mon.enter()
+        time.sleep(0.2)
+        mon.key("up")
+        mon.key("left", 5)
+        mon.type_text("x_")
+        mon.enter()
+        time.sleep(0.2)
+        # Delete takes the "K" after "echo ", Backspace the trailing "X".
+        # (Words tesseract reads reliably in this font: "bcde" reads as
+        # "bede".)
+        mon.type_text("echo Kfirst_twoX")
+        mon.key("home")
+        mon.key("right", 5)
+        mon.key("delete")
+        mon.key("end")
+        mon.key("backspace")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("22a_line_editing")
+        assert_ocr(
+            shot,
+            # The command's output line, pinned at both ends: a failed
+            # Delete would print "Kfirst_two", a failed Backspace
+            # "first_twoX". (Not the echoed command line: tesseract reads
+            # its "f" as "F".)
+            ["first_x_entry", "\nfirst_two\n"],
+            "step 22a (line editor -- history recall and mid-line edits)",
+            must_not_contain=["Kfirst", "twoX"],
+        )
+        print("step 22a (line editor -- Up recalled and edited a command; Home/Right/Delete/End/Backspace):", shot, "-- OCR verified")
+
+        mon.type_text("wisp")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("let n = 41")
+        mon.enter()
+        time.sleep(0.2)
+        mon.key("up")
+        mon.key("backspace")
+        mon.type_text("6")
+        mon.enter()
+        time.sleep(0.2)
+        # Echoed as a word: tesseract skips a bare two-digit line like "92".
+        mon.type_text('str(n) + "_ok"')
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("22b_wisp_history")
+        assert_ocr(shot, ["let n = 46", "46_ok"], "step 22b (wisp prompt -- Up recalled and edited a line)")
+        mon.type_text("exit")
+        mon.enter()
+        time.sleep(0.2)
+        print("step 22b (wisp prompt -- Up recalled 'let n = 41', edited to 46):", shot, "-- OCR verified")
 
         mon.quit()
     finally:

@@ -45,7 +45,9 @@ bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
 `stopwatch`, `primes`, `calc`) runs one. `wisp` opens an interactive
 WISP prompt that runs each line as you type it -- the way to try the
-language, or write a quick program, on the machine itself.
+language, or write a quick program, on the machine itself. Every line of
+input can be edited with the arrow keys, Home, End and Delete, and Up/Down
+recall earlier lines at the `>` and `wisp>` prompts.
 **Esc stops any running program.**
 `save`/`load` persist key/value pairs to the AHCI disk (after a one-time
 `format`, which names the disk and asks before erasing anything) -- each
@@ -125,6 +127,7 @@ src/                  the kernel (no_std, no_main)
   gfx.rs / font.rs            direct-framebuffer console, 8x16 bitmap font
   fs.rs                        FAT32 reads via UEFI protocols (pre-exit)
   shell.rs                      the `>` prompt and its commands
+  line_editor.rs                 cursor editing and history for every typed line
   libc_shims.rs                  freestanding `wcslen`
   wisp/                           lexer -> parser -> tree-walking interpreter
                                    (one Session per program, or per `wisp` prompt)
