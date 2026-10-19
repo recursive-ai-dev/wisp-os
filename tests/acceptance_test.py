@@ -507,6 +507,44 @@ def main():
         )
         print("step 1b (paging + mainline stack active): debug log verified")
 
+        # The two-phase physical-memory handover (`pmm.rs`): boot-services
+        # memory -- where firmware's still-live page tables, stack and IDT
+        # sit -- is withheld while `paging::init` allocates and zeroes its
+        # tables, and released only after the switch onto our own tables
+        # and stack. Checked numerically, not just by the lines existing:
+        # every frame of firmware's live hierarchy must be inside the
+        # withheld memory, nothing may have been pinned (which would mean
+        # firmware state was typed conventional), and the release must
+        # free exactly what was withheld, after the stack switch.
+        log = assert_debug_log(
+            ["[pmm] released ", "[pmm] firmware's live paging hierarchy: "],
+            "step 1c (boot-services memory withheld until own tables live)",
+        )
+        withheld = re.search(r"\[pmm\] \d+ frames free; (\d+) boot-services frames withheld", log)
+        hierarchy = re.search(r"\[pmm\] firmware's live paging hierarchy: (\d+) frames, (\d+) of them in withheld", log)
+        released = re.search(r"\[pmm\] released (\d+) boot-services frames", log)
+        problems = []
+        if not (withheld and hierarchy and released):
+            problems.append("a [pmm] handover line did not match its expected format")
+        else:
+            if int(withheld.group(1)) == 0:
+                problems.append("no boot-services memory was withheld")
+            if int(hierarchy.group(1)) == 0 or hierarchy.group(1) != hierarchy.group(2):
+                problems.append(f"firmware's live page tables are not all in withheld memory ({hierarchy.group(0)!r})")
+            if released.group(1) != withheld.group(1):
+                problems.append(f"released {released.group(1)} frames but withheld {withheld.group(1)}")
+            stack_switch = log.find("[stack] running on the dedicated mainline stack")
+            if not (log.find("[paging] active, cr3=") < stack_switch < released.start()):
+                problems.append("the release did not happen after the CR3 and stack switches")
+        if "[pmm] WARNING" in log:
+            problems.append("live firmware state was found in conventional memory and pinned")
+        if problems:
+            raise RuntimeError(f"step 1c: {'; '.join(problems)}\nFull debug log:\n{log}")
+        print(
+            f"step 1c (two-phase frame handover): {withheld.group(1)} boot-services frames withheld "
+            f"(firmware's {hierarchy.group(1)} live table frames among them), released after the switch"
+        )
+
         mon.type_text("help")
         mon.enter()
         time.sleep(0.3)

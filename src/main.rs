@@ -177,6 +177,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // From here on, Boot Services no longer exists. Nothing below this
     // line may reference `bs`, `st_for_bs`, or any UEFI protocol.
 
+    // Conventional memory only, for now: firmware's page tables, IDT and
+    // the stack this code is running on still live in boot-services
+    // memory, which stays withheld until `continue_boot_on_new_stack` has
+    // replaced all three (see `pmm.rs`).
     pmm::init(&mmap);
     match pmm::self_test() {
         Ok(()) => {
@@ -238,7 +242,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         gdt::double_fault_stack_guard_range(),
         gdt::mainline_stack_guard_range(),
     ];
-    let pml4_phys = unsafe { paging::init(&mmap, &extra_ranges, &guard_ranges, image_range) };
+    let root_phys = unsafe { paging::init(&mmap, &extra_ranges, &guard_ranges, image_range) };
 
     // First point in the entire program that live CPU descriptor-table
     // state changes. Order matters: the IDT's gates name
@@ -263,7 +267,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // independently-tested step (see CHANGES.md); `tests/fault_test.py`
     // now proves each restriction faults where it should.
     unsafe {
-        paging::load(pml4_phys);
+        paging::load(root_phys);
     }
 
     // Build Order Step 4 of the Phase 2 plan: take ownership of the
@@ -375,6 +379,17 @@ extern "C" fn continue_boot_on_new_stack(ctx: *mut BootContinuation) -> ! {
     unsafe { asm!("mov {}, rsp", out(reg) rsp_now, options(nomem, nostack, preserves_flags)) };
     debugcon::write_str("\n[stack] running on the dedicated mainline stack, rsp=0x");
     let _ = debugcon::write_fmt(format_args!("{rsp_now:x}\n"));
+
+    // The first point at which nothing of firmware's is live any more: the
+    // CPU translates through our page tables, faults through our IDT,
+    // segments through our GDT, and runs on our stack. Only now may the
+    // boot-services memory those used to live in be handed out -- see
+    // `pmm.rs`'s module doc comment for what overwriting it any earlier
+    // could do.
+    let released = pmm::release_boot_services_memory();
+    let _ = debugcon::write_fmt(format_args!(
+        "[pmm] released {released} boot-services frames (firmware's tables, stack and IDT are no longer live)\n"
+    ));
 
     // SAFETY: `ctx` was produced by `Box::into_raw` in `efi_main`,
     // immediately before the switch that reached this function, and its

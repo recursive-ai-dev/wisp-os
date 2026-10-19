@@ -109,6 +109,61 @@ const EFER_NXE: u64 = 1 << 11;
 /// and constants; W^X would only bind user mode, which this kernel has none
 /// of.
 const CR0_WP: u64 = 1 << 16;
+/// `CR4.LA57` (bit 12): 5-level paging. When firmware has turned it on,
+/// `CR3` names a PML5, not a PML4, and it cannot be turned off again while
+/// paging is enabled in long mode (Intel SDM Vol 3, 4.1.1) -- so the
+/// kernel's tables have to adopt the same shape. See [`init`].
+const CR4_LA57: u64 = 1 << 12;
+/// Page-size bit (bit 7) in a PDPT or PD entry: the entry maps a 1 GiB or
+/// 2 MiB page directly instead of pointing at a lower-level table.
+const PAGE_SIZE_BIT: u64 = 1 << 7;
+
+/// Whether 5-level paging is active (firmware's choice; see [`CR4_LA57`]).
+fn la57_enabled() -> bool {
+    let cr4: u64;
+    // SAFETY: reading CR4 has no side effects.
+    unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    cr4 & CR4_LA57 != 0
+}
+
+/// Call `visit` with the physical address of every paging-structure frame
+/// (the root, and every table below it) of the hierarchy `CR3` currently
+/// points at -- 4 or 5 levels, whichever is live, stopping at 1 GiB/2 MiB
+/// leaves. Used before the switch to this kernel's own tables, to learn
+/// exactly which frames firmware's translation still depends on (see
+/// `pmm::init`): zeroing any of them while they are live would unmap
+/// memory out from under the running code.
+///
+/// Reads each table through the identity mapping firmware is required to
+/// provide for all memory it describes (UEFI 2.10, 2.3.4), which includes
+/// the memory its own tables live in.
+pub fn for_each_live_table_frame(mut visit: impl FnMut(u64)) {
+    // Levels below the root: PML5 (if LA57) -> PML4 -> PDPT -> PD -> PT.
+    fn walk(table: u64, levels_below: u32, visit: &mut dyn FnMut(u64)) {
+        visit(table);
+        if levels_below == 0 {
+            return;
+        }
+        for index in 0..ENTRIES_PER_TABLE as u64 {
+            // SAFETY: `table` is a live paging structure, identity-mapped
+            // by the tables that are themselves live right now (see this
+            // function's doc comment); reading an entry has no effect.
+            let entry = unsafe { core::ptr::read_volatile((table + index * 8) as *const u64) };
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            // A PDPT entry (2 levels below it) or PD entry (1 level below)
+            // with PS set is a 1 GiB / 2 MiB leaf, not a table. PS is
+            // reserved in PML4/PML5 entries, so it is only honoured here.
+            if levels_below <= 2 && entry & PAGE_SIZE_BIT != 0 {
+                continue;
+            }
+            walk(entry & ADDR_MASK, levels_below - 1, visit);
+        }
+    }
+    let levels_below = if la57_enabled() { 4 } else { 3 };
+    walk(current_root_phys(), levels_below, &mut visit);
+}
 
 /// Set once by [`init`] from CPUID; read by [`PageFlags::bits`] and
 /// [`load`]. Never changes afterwards.
@@ -480,8 +535,9 @@ fn flags_for_memory_type(ty: MemoryType, image_protected: bool) -> PageFlags {
 /// their own memory-map entry), minus `guard_ranges` (pages deliberately
 /// left unmapped), with the running image (`image` = its base and size, as
 /// reported by the firmware's LoadedImage protocol) mapped section by
-/// section under W^X. Returns the new PML4's physical address, ready to be
-/// passed to [`load`].
+/// section under W^X. Returns the physical address of the new hierarchy's
+/// root -- the PML4, or under 5-level paging a PML5 whose entry 0 is that
+/// PML4 -- ready to be passed to [`load`].
 ///
 /// Pure allocation and memory writes into freshly-obtained frames -- the
 /// CPU is still running under whatever tables were live before this call
@@ -569,6 +625,25 @@ pub unsafe fn init(
     debugcon::write_str("\n[paging] tables built: pml4=0x");
     let _ = debugcon::write_fmt(format_args!("{pml4_phys:x} pages_mapped~={pages_mapped}\n"));
 
+    // Under 5-level paging `CR3` must name a PML5. Every address this
+    // kernel maps is an identity mapping of physical memory, far below
+    // 2^48, so every one of them is selected by PML5 entry 0 (linear
+    // address bits 56:48 are all zero); pointing that one entry at the
+    // PML4 just built translates every such address exactly as the PML4
+    // alone would under 4-level paging (Intel SDM Vol 3, 4.5).
+    let root_phys = if la57_enabled() {
+        let pml5_phys = alloc_table_frame();
+        // SAFETY: `pml5_phys` was just allocated and zeroed by
+        // `alloc_table_frame` and is identity-mapped right now.
+        unsafe { (*(pml5_phys as *mut PageTable)).0[0] = (pml4_phys & ADDR_MASK) | PRESENT | WRITABLE };
+        let _ = debugcon::write_fmt(format_args!(
+            "[paging] firmware enabled 5-level paging (CR4.LA57): pml5=0x{pml5_phys:x}, PML4 installed as PML5[0]\n"
+        ));
+        pml5_phys
+    } else {
+        pml4_phys
+    };
+
     // Logged unconditionally (not just under a test feature): knowing
     // exactly where every guard page landed is generally useful boot
     // diagnostics, and it's what lets `tests/fault_test.py`'s guard-page
@@ -581,7 +656,7 @@ pub unsafe fn init(
         let _ = debugcon::write_fmt(format_args!("{g_start:x}..0x{g_end:x}\n"));
     }
 
-    pml4_phys
+    root_phys
 }
 
 /// Map a single already-page-aligned virtual/physical range into an
@@ -618,15 +693,30 @@ pub unsafe fn map(virt: u64, phys: u64, len: u64, flags: PageFlags) -> Result<()
     Ok(())
 }
 
-/// Read `CR3` back to find the currently-active PML4's physical address
-/// (masking off the low control bits `CR3` also carries -- PCD/PWT when
-/// PCID is disabled, which it is here). Used by [`map`] so a runtime caller
-/// never needs to thread the boot-time `pml4_phys` value through every
-/// layer that might eventually need to add a mapping.
-fn current_pml4_phys() -> u64 {
+/// Read `CR3` back to find the currently-active root table's physical
+/// address (masking off the low control bits `CR3` also carries -- PCD/PWT
+/// when PCID is disabled, which it is here): a PML4, or a PML5 under
+/// 5-level paging.
+fn current_root_phys() -> u64 {
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
     cr3 & ADDR_MASK
+}
+
+/// The currently-active PML4's physical address. Used by [`map`] so a
+/// runtime caller never needs to thread the boot-time root through every
+/// layer that might eventually need to add a mapping. Under 5-level paging
+/// the live root is the PML5 [`init`] built, whose entry 0 is the PML4
+/// that holds every identity mapping.
+fn current_pml4_phys() -> u64 {
+    let root = current_root_phys();
+    if la57_enabled() {
+        // SAFETY: `root` is the live PML5, identity-mapped like every
+        // other page-table frame this module allocates.
+        unsafe { (*(root as *const PageTable)).0[0] & ADDR_MASK }
+    } else {
+        root
+    }
 }
 
 /// Switch the CPU to the page tables built by [`init`]. This is the single
@@ -650,11 +740,11 @@ fn current_pml4_phys() -> u64 {
 /// memory operation across this call in either direction.
 ///
 /// # Safety
-/// `pml4_phys` must be a value returned by [`init`] (or otherwise point at
-/// a fully-built, valid PML4). Must be called after `gdt::load`/`idt::load`
-/// (so this kernel's own fault handler is already the live safety net if
-/// the new mapping is subtly wrong) and with interrupts still disabled.
-pub unsafe fn load(pml4_phys: u64) {
+/// `root_phys` must be a value returned by [`init`]. Must be called after
+/// `gdt::load`/`idt::load` (so this kernel's own fault handler is already
+/// the live safety net if the new mapping is subtly wrong) and with
+/// interrupts still disabled.
+pub unsafe fn load(root_phys: u64) {
     // NX must be architecturally enabled *before* any table using bit 63
     // becomes live, or the very first translation through one is a
     // reserved-bit fault.
@@ -669,7 +759,7 @@ pub unsafe fn load(pml4_phys: u64) {
 
     compiler_fence(Ordering::SeqCst);
     unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack, preserves_flags));
+        core::arch::asm!("mov cr3, {}", in(reg) root_phys, options(nostack, preserves_flags));
     }
     compiler_fence(Ordering::SeqCst);
 
@@ -686,7 +776,7 @@ pub unsafe fn load(pml4_phys: u64) {
 
     debugcon::write_str("\n[paging] active, cr3=0x");
     let _ = debugcon::write_fmt(format_args!(
-        "{pml4_phys:x} nx={} wp=on\n",
+        "{root_phys:x} nx={} wp=on\n",
         if nx_enabled() { "on" } else { "unsupported" }
     ));
 }

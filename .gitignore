@@ -30,3 +30,6 @@ __pycache__/
 
 # USB test-suite scratch output.
 /tests/out_usb/
+
+# Build output of the host-side test crate (tests/host: `cargo test --release`).
+/tests/host/target/
