@@ -2300,3 +2300,130 @@ Verified:
   byte (and nothing else in the superblock) changed, the update written
   copy-on-write at generation 1, the old copy freed, the untouched v1 copy
   byte-identical, nothing outside the region written.
+
+## WISP v2, Part 2: `for` loops, slicing, strings, and list builtins
+
+`docs/WISP_LANGUAGE.md` closed with a list of what v1 deliberately left
+out, "the first things to reach for if you outgrow v1". The ones that
+cost the most in real programs were the string ones: with no indexing,
+no slicing and no splitting, a script could not take a typed line apart,
+which is why `adventure.wisp` only understands whole lines. This adds:
+
+- **`for x in list_or_string { ... }`.** A list is iterated as a
+  snapshot of its element handles (refcount bumps, no deep copy), so
+  growing the list inside the loop cannot make it run forever; a string
+  is walked one character at a time without copying it (strings are
+  immutable). The loop variable lives in each pass's fresh scope. Esc is
+  checked before every pass, like `while`.
+- **Slicing** `a[i:j]` (either bound optional) on lists and strings, and
+  **string indexing** `s[i]`. Bounds are strict -- `0 <= start <= end <=
+  len` or a runtime error, never a silently shortened result, the same
+  stance as indexing. Assigning to a slice, or into a string, is a
+  precise error.
+- **String offsets are bytes**, the unit `len()` has always counted in.
+  An offset inside a multi-byte UTF-8 character is an error ("falls
+  inside a multi-byte character") rather than half a character; `for`
+  and `chars()` iterate by character. `find()` answers in bytes, so its
+  result slices correctly.
+- **List `+`**, making a new list.
+- **Builtins:** strings -- `split` (whitespace, or an explicit separator
+  that round-trips through `join`), `join`, `find`, `contains`,
+  `replace`, `upper`/`lower` (ASCII only; everything else unchanged),
+  `trim`, `starts_with`, `ends_with`, `chars`, `repeat`, `chr`, `ord`;
+  lists -- `insert`, `remove`, `sort` (all ints or all strings, in
+  place, no allocation), `reverse`, `range`, plus `find`/`contains` on
+  lists; numbers and types -- `abs`, `min`, `max`, `type`.
+- **`calc.wisp`**, an integer calculator whose recursive-descent
+  expression parser is written in WISP. It never ends in a WISP error:
+  numbers are capped at 18 digits and every result at 10^18 (so no
+  operation can overflow), and parentheses and minus signs together nest
+  at most 40 deep (so its recursion stays inside the call limit). The
+  first draft bounded only parentheses; 300 minus signs in a row would
+  have hit WISP's own recursion limit. Caught while writing its test.
+
+Every resource bound the audit remediation established still holds for
+the new code:
+
+- Every string a builtin builds is size-checked against the 256 KiB
+  limit *before* allocating and allocated fallibly, like `+`.
+- `split`/`chars` build up to 32,768 small strings in one call, more
+  than the 1.5 MiB heap reserve covers; they check the host's heap
+  reserve every 256 elements, as the interpreter does every loop pass.
+- Every list a builtin or slice or `+` creates is registered with the
+  session's list registry, so a cycle built from one is still reclaimed
+  (AUD-09). `builtins::call` now takes the registry, so a future builtin
+  cannot create a list any other way.
+- Native stack depth (AUD-10), measured on the UEFI target as before
+  (`--emit=asm`, prologue sizes): every existing recursive frame is
+  unchanged (`eval_expr` 160 bytes, `exec_stmt` 304, `eval_binary` 288).
+  But a nested `for` body costs ~1040 bytes between consecutive nesting
+  units, against the ~750 `MAX_NESTING` was sized for -- a recursive
+  function with deeply nested `for` loops could have needed more than
+  the 1 MiB stack. No test caught this; the measurement did. A `for`
+  statement is now charged two units of the budget (~500 bytes each).
+  `nested_for_loops_inside_deep_recursion_are_a_clean_error` overflows
+  its 640 KiB host stack without the double charge, and ends in a clean
+  "stack overflow" WISP error with it.
+
+A review pass for unbounded work in the new builtins, before commit,
+found two more:
+
+- `repeat("", n)`: the output-size check bounds the work only for a
+  non-empty string. With an empty one it passed (0 bytes) and the loop
+  then ran `n` times -- up to 9 * 10^18, with no Esc check: a hung
+  kernel. An empty string now returns at once.
+- `find`/`contains` on a list: each element comparison may legitimately
+  take up to the 100,000-step equality budget, and a list holds up to
+  32,768 elements, with no Esc check in between. They now check for Esc
+  before each element, as a loop does before each pass.
+
+Both have tests (`repeat_is_bounded`, `searching_a_list_honours_esc`;
+the latter fails with its check removed).
+
+New keywords `for` and `in`, and the new builtin names, could break an
+existing program; none of the bundled apps or documented examples uses
+any of them as an identifier or function name.
+
+## The interactive prompt
+
+Every WISP program used to be written on another computer and copied to
+the stick. `wisp` at the shell prompt now opens an interactive session:
+each line runs as it is entered, an expression's value is shown
+(strings quoted, so `"1"` and `1` differ), and the session keeps every
+global, function and list it builds until `exit`.
+
+- The interpreter was split into a `Session` (globals, functions, list
+  registry) and an `Interp` (one run against a session and a host), so
+  a session can outlive one run while the shell lends it the console,
+  keyboard and save disk afresh for each line.
+- `Session::run_interactive` differs from a program run exactly where a
+  prompt needs it to: `let` may re-declare a global, `fn` may redefine a
+  function from an *earlier* line (within one line, both are still
+  errors), and a trailing bare expression's value is returned. A line
+  whose functions fail validation registers none of them.
+- `wisp::parse_interactive` accepts a line missing only its final `;`.
+- A line with more `(`/`[`/`{` than closers continues at a `...` prompt
+  (`wisp::open_brackets`, which ignores brackets in strings and
+  comments); Esc there discards the unfinished input.
+- Esc stops a running line exactly as it stops a program; the session
+  continues. `vars` lists globals and functions.
+- A long session can hold most of the heap; once free heap is below the
+  script reserve the prompt says so and names the remedy (`exit`).
+
+Verified: `tests/host/tests/language.rs` (41 tests) covers every new
+construct and builtin, including each error message, the size limits,
+cycle reclamation for every list-creating path (allocator-counted), the
+heap-reserve checks inside `split`/`chars`, interactive sessions, the
+documented examples, and `calc.wisp` driven through scripted sessions
+on a 640 KiB stack. Nine deliberate bugs -- an unregistered list from
+each of `split`, `range`, slicing and `+`; no heap check in
+`split`/`chars`; `for` iterating the live list; registering functions
+before validating them; no Esc check in `for`; string indexing without
+the character-boundary check -- each fail at least one test.
+`tests/acceptance_test.py` steps 20-21 run `calc.wisp` and an
+interactive session (a function typed over three lines, an error, Esc
+stopping `while true { }`, `vars`, `exit`) on the emulated machine. Two
+of the first assertions failed on OCR, not on the kernel -- tesseract
+reads `= 11` as `- 1` and the red `(Esc pressed)` as `{Ese pressed` --
+and were changed to text it reads reliably; the Esc stop is proven by
+the kernel's debugcon line instead.

@@ -23,6 +23,8 @@ pub enum Tok {
     Elif,
     Else,
     While,
+    For,
+    In,
     Fn,
     Return,
     Break,
@@ -52,6 +54,7 @@ pub enum Tok {
     RBracket,
     Comma,
     Semi,
+    Colon,
 
     Eof,
 }
@@ -72,6 +75,8 @@ fn keyword(ident: &str) -> Option<Tok> {
         "elif" => Tok::Elif,
         "else" => Tok::Else,
         "while" => Tok::While,
+        "for" => Tok::For,
+        "in" => Tok::In,
         "fn" => Tok::Fn,
         "return" => Tok::Return,
         "break" => Tok::Break,
@@ -273,6 +278,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
             }
             b';' => {
                 tokens.push(Token { tok: Tok::Semi, line });
+                i += 1;
+            }
+            b':' => {
+                tokens.push(Token { tok: Tok::Colon, line });
                 i += 1;
             }
             b'=' => {

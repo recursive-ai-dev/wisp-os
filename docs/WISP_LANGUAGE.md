@@ -1,4 +1,4 @@
-# WISP Language Reference (v1)
+# WISP Language Reference
 
 WISP is the small scripting language embedded in this UEFI shell's `run`
 command. It exists so that plain-text programs -- written by a person, or by
@@ -8,10 +8,15 @@ no compiler, no OS, and no network stack anywhere in the loop.
 
 This document is the complete spec for what a WISP script can do today.
 If a program only uses what's described here, it will run. The core
-language (v1) is deliberately **text and logic only**; pixel/graphics
-primitives -- the first piece of v2 to land -- are documented in their
-own section below and, in full depth, in `docs/WISP_GRAPHICS.md`. See
-"What's not in v1" at the end for what's still deliberately missing.
+language (v1) was deliberately **text and logic only**; v2 is landing in
+pieces: pixel/graphics primitives (their own section below, and in full
+depth `docs/WISP_GRAPHICS.md`), then `for` loops, slicing, string
+indexing and the string and list builtins. See "What's still not in
+WISP" at the end for what's deliberately missing.
+
+To try things out without writing a file, type `wisp` at the shell
+prompt: an interactive prompt that runs each line as you type it (see
+"The interactive prompt" below).
 
 Looking to run a trained model (a tiny neural net doing fixed-point
 forward-pass inference, not anything resembling an LLM) rather than
@@ -69,8 +74,8 @@ Run it from the shell with `run guess.wisp` (or just `run guess` -- the
   token separators. Statements are terminated by `;`, not by newlines --
   you can format a program however you like.
 - **Keywords** (reserved, cannot be used as identifiers): `let`, `if`,
-  `elif`, `else`, `while`, `fn`, `return`, `break`, `continue`, `true`,
-  `false`, `nil`, `and`, `or`, `not`.
+  `elif`, `else`, `while`, `for`, `in`, `fn`, `return`, `break`,
+  `continue`, `true`, `false`, `nil`, `and`, `or`, `not`.
 
 ## Values
 
@@ -81,7 +86,7 @@ Every value in WISP is one of exactly five types:
   end without a `return`.
 - `bool` -- `true` or `false`.
 - `int` -- a 64-bit signed integer.
-- `string` -- an immutable UTF-8 text value.
+- `string` -- an immutable UTF-8 text value. See "Strings" below.
 - `list` -- a growable, shared, mutable sequence of values. See "Lists"
   below.
 
@@ -102,8 +107,17 @@ let grid = [[1, 2], [3, 4]];             # and nest
 - **Indexing** reads an element by position, 0-based: `a[0]` is `1`. The
   index must be an `int` and in bounds (`0 <= i < len(a)`); anything else
   (a negative index, an index `>= len(a)`, a non-`int` index, or indexing
-  something that isn't a list at all) is a runtime error. There is no
-  negative-indexing-from-the-end shorthand in v1.
+  something that isn't a list or a string) is a runtime error. There is
+  no negative-indexing-from-the-end shorthand.
+- **Slicing** copies a run of elements into a new list: `a[1:3]` is the
+  elements at 1 and 2; either bound may be left out (`a[2:]`, `a[:2]`,
+  and `a[:]`, a copy of the whole list). Bounds are `int`s with
+  `0 <= start <= end <= len(a)` -- anything else is a runtime error, not
+  a silently shortened slice. The new list holds the same element values
+  (a nested list in it is the *same* nested list, as with any copy of an
+  element). You cannot assign to a slice.
+- **`+`** on two lists makes a new list: the first's elements, then the
+  second's. `[1] + [2, 3]` is `[1, 2, 3]`.
 - **Index assignment** writes an element in place: `a[0] = 99;`. Same
   bounds/type rules as reading. Chains work for nested lists:
   `grid[0][1] = 99;`.
@@ -111,6 +125,10 @@ let grid = [[1, 2], [3, 4]];             # and nest
   returns `nil`.
 - **`pop(list)`** removes and returns the last element of `list`.
   Calling it on an empty list is a runtime error.
+- **`insert(list, i, value)`** / **`remove(list, i)`** add or take out
+  the element at any position; **`sort(list)`** and **`reverse(list)`**
+  reorder in place; **`find`/`contains`** search; **`range(n)`** builds
+  `[0, 1, ..., n - 1]`. See "Built-in functions".
 - **`len(list)`** returns the element count (the same `len()` used for
   strings; it dispatches on whichever type you pass it).
 - Lists are **shared and mutable, not copied**: assigning a list to a new
@@ -154,11 +172,50 @@ let grid = [[1, 2], [3, 4]];             # and nest
   holds at most 32,768 elements and a string at most 256 KiB. If a
   program runs the kernel heap down to its reserve it is stopped with an
   "out of memory" error.
-- No slicing (`a[1..3]`), no `+` concatenation between lists, no
-  `insert`/`remove`-at-arbitrary-index, no `sort`/`map`/`filter` in v1.
-  `oracle.wisp` (under `esp/APPS/`) shows the standard workaround for
-  "remove an arbitrary index without a builtin for it": swap the target
-  element with the last element, then `pop()`.
+- `for x in list { ... }` visits each element in order; see
+  "Statements".
+- There is no `map`/`filter`: write the loop. (`oracle.wisp` predates
+  `remove()` and still shows the older swap-with-last-then-`pop()` way
+  of removing an arbitrary element, which is also the fastest.)
+
+## Strings
+
+```
+let s = "hello, world";
+print(s[0]);             # h
+print(s[7:]);            # world
+print(upper(s[:5]));     # HELLO
+for word in split("go north now") {
+    print(word);         # go / north / now
+}
+```
+
+Strings are immutable: every operation on one makes a new string, and
+`s[0] = "x";` is a runtime error.
+
+**Offsets are bytes**, the same unit `len()` counts in. For ASCII text --
+everything the console font can draw -- a byte is a character and this
+is all you need to know. For other characters, which are 2-4 bytes in
+UTF-8, an offset must land on the first byte of a character:
+
+- `s[i]` is the character *starting at* byte `i`, as a new one-character
+  string; `"héllo"[1]` is `"é"`, and `"héllo"[2]` -- the middle of that
+  `é` -- is a runtime error rather than half a character.
+- `s[a:b]` is the text between byte offsets `a` and `b`, with the same
+  rules as list slices plus the same character-boundary check at both
+  ends.
+- `find(s, part)` answers in bytes too, so its result can be used to
+  slice: `s[find(s, ","):]`.
+- `for c in s { ... }` and `chars(s)` go one *character* at a time, so
+  they are the way to walk text that may not be ASCII.
+
+The string builtins (details under "Built-in functions"): `split`,
+`join`, `find`, `contains`, `replace`, `upper`, `lower`, `trim`,
+`starts_with`, `ends_with`, `chars`, `repeat`, `chr`, `ord`, plus `len`,
+`str` and `int`. Like `+`, none of them builds a string over 256 KiB.
+
+`esp/APPS/calc.wisp` -- an arithmetic calculator whose expression parser
+is written in WISP -- is the worked example.
 
 ## Variables and scoping
 
@@ -226,16 +283,17 @@ From lowest to highest precedence:
 | 5 | `+` `-` | left |
 | 6 | `*` `/` `%` | left |
 | 7 | unary `not` `-` | right (prefix) |
-| 8 | `( )` grouping, function calls, `[ ]` list literals/indexing | -- |
+| 8 | `( )` grouping, function calls, `[ ]` list literals, indexing and slicing | -- |
 
 Semantics:
 
 - `+ - * / %` operate on `int`s. Division and modulo by zero are runtime
   errors (not a crash, not a silently wrong answer).
-- `+` on two `string`s concatenates them. `+` where exactly one side is a
-  `string` is a runtime error -- use `str(x)` to convert explicitly rather
-  than relying on implicit coercion, so a typo'd variable doesn't silently
-  concatenate the word "nil" into your output.
+- `+` on two `string`s concatenates them, and on two `list`s makes a new
+  list of both lists' elements. `+` on any other mix of types (a `string`
+  and an `int`, say) is a runtime error -- use `str(x)` to convert
+  explicitly rather than relying on implicit coercion, so a typo'd
+  variable doesn't silently concatenate the word "nil" into your output.
 - `==` `!=` compare same-typed values for equality (`int`/`int`,
   `string`/`string`, `bool`/`bool`, `nil`/`nil`). Comparing different types
   is always `false` for `==` and `true` for `!=` (never an error).
@@ -258,8 +316,9 @@ if EXPR { ... } else { ... }
 if EXPR { ... } elif EXPR { ... } else { ... }   # any number of elif
 
 while EXPR { ... }
-break;                           # exit innermost while
-continue;                        # skip to next iteration of innermost while
+for NAME in EXPR { ... }         # EXPR: a list or a string
+break;                           # exit innermost while/for
+continue;                        # skip to next iteration of innermost while/for
 
 fn NAME(PARAM, PARAM, ...) {
     ...
@@ -268,6 +327,17 @@ fn NAME(PARAM, PARAM, ...) {
 
 EXPR;                            # expression statement (e.g. a bare call: print("hi");)
 ```
+
+`for x in EXPR { ... }` evaluates `EXPR` once. If it is a list, the
+body runs once per element, in order, with `x` holding that element; the
+loop visits the elements the list held when the loop *started* -- adding
+to or removing from the list inside the body does not change, or
+endlessly extend, the loop. If it is a string, the body runs once per
+character (not per byte), `x` a one-character string. Anything else is a
+runtime error. Each pass runs in its own fresh scope holding `x`, so
+`x` does not exist after the loop, and `let x` inside the body is an
+"already declared" error. `break` and `continue` work as in `while`.
+`for i in range(10) { ... }` is the counting loop.
 
 Function declarations may appear anywhere at the top level of a program
 (not nested inside other functions, not inside `if`/`while` bodies) and
@@ -279,9 +349,11 @@ and a combined nesting budget (1024 levels of nested calls, statements
 and expressions together) that produce a clean "stack overflow" runtime
 error instead of crashing the shell. A simple recursive function reaches
 about 250 calls; one whose body nests deeper reaches the combined budget
-sooner. Independently, one block or expression may nest at most 128
-levels deep (parentheses, `not`/`-`, indexing, blocks, and each operator
-in a chain like `1 + 2 + 3` all count) -- deeper is a parse error.
+sooner (a `for` statement counts twice, because the interpreter's own
+work for one is larger). Independently, one block or expression may nest
+at most 128 levels deep (parentheses, `not`/`-`, indexing, slicing,
+blocks, and each operator in a chain like `1 + 2 + 3` all count) --
+deeper is a parse error.
 
 ## Built-in functions
 
@@ -377,6 +449,59 @@ by `fn`:
   Does not move the text cursor; see "Graphics" below for how this
   differs from `clear()`.
 
+Strings (see "Strings" above; offsets are bytes; every result is a new
+string; none longer than 256 KiB):
+
+- `split(s)` -- the words of `s`: split on runs of whitespace, with
+  leading/trailing whitespace ignored, so it never yields empty strings
+  (`split("  go  north ")` is `["go", "north"]`). `split(s, sep)` splits
+  on every occurrence of the non-empty string `sep`, keeping the empty
+  pieces between adjacent separators, so `join(split(s, sep), sep)` is
+  always `s` again. At most 32,768 pieces.
+- `join(list, sep)` -- the list's elements joined with `sep` between
+  them. Every element must be a string (use `str()` first; nothing is
+  converted for you).
+- `find(s, part)` -- the byte offset of the first occurrence of `part` in
+  `s`, or `-1`. `find(list, value)` -- the index of the first element
+  `== value`, or `-1`.
+- `contains(s, part)` / `contains(list, value)` -- `true` if `find` would
+  not return `-1`.
+- `replace(s, old, new)` -- `s` with every occurrence of the non-empty
+  string `old` replaced by `new`.
+- `upper(s)` / `lower(s)` -- ASCII letters converted; every other
+  character unchanged.
+- `trim(s)` -- `s` without leading and trailing whitespace.
+- `starts_with(s, part)` / `ends_with(s, part)` -- `bool`.
+- `chars(s)` -- a list of `s`'s characters, each a one-character string.
+- `repeat(s, n)` -- `s` repeated `n` times (`n >= 0`).
+- `chr(n)` -- the one-character string for Unicode code point `n`
+  (`chr(65)` is `"A"`). `ord(s)` -- the code point of a one-character
+  string (`ord("A")` is `65`). Runtime error for anything that is not
+  exactly one character / one valid code point.
+
+Lists (in place unless noted):
+
+- `insert(list, i, value)` -- `value` becomes element `i`; the elements
+  from `i` on move up one. `0 <= i <= len(list)` (`i == len(list)`
+  appends). Returns `nil`.
+- `remove(list, i)` -- takes element `i` out (`0 <= i < len(list)`) and
+  returns it; the elements after it move down one.
+- `sort(list)` -- ascending: ints numerically, strings in the order `<`
+  uses. Every element must be an int, or every element a string. Returns
+  `nil`.
+- `reverse(list)` -- reverses the order. Returns `nil`.
+- `range(n)` -- a new list `[0, 1, ..., n - 1]`; `range(a, b)` --
+  `[a, a + 1, ..., b - 1]`. Empty if the end is not past the start. At
+  most 32,768 elements.
+- `find`/`contains` -- see Strings above; both also search lists.
+
+Numbers and types:
+
+- `abs(n)` -- the absolute value of an int.
+- `min(a, b)` / `max(a, b)` -- the smaller/larger of two ints, or of two
+  strings (in the order `<` uses).
+- `type(v)` -- `"nil"`, `"bool"`, `"int"`, `"string"` or `"list"`.
+
 ## Graphics
 
 The first piece of v2 to land: seven builtins (`screen_width`,
@@ -439,8 +564,8 @@ Press **Esc** at any time to stop the running program. This works on both
 the PS/2 and USB keyboards, whatever the program is doing:
 
 - in a loop (including a pure compute loop with no I/O at all) -- the
-  interpreter checks before every `while` iteration and every function
-  call;
+  interpreter checks before every `while` and `for` iteration and every
+  function call;
 - inside `sleep_ms()` -- the sleep wakes within one 10 ms tick;
 - waiting in `input()` -- the half-typed line is discarded.
 
@@ -460,25 +585,55 @@ exception handling, by design, so stopping is always available.
 `esp/APPS/stopwatch.wisp` (a never-ending `sleep_ms()` loop) exist to be
 stopped this way.
 
-## What's not in v1
+## The interactive prompt
 
-Intentionally out of scope for the original release, to keep the
-interpreter small and solid before growing it. v2 is landing
-incrementally -- pixel/graphics primitives (see "Graphics" above) are the
-first piece; everything below is still missing as of this writing:
+Typing `wisp` at the shell's `>` prompt starts an interactive WISP
+session with its own `wisp>` prompt. Each line you type runs at once,
+against everything earlier lines defined:
+
+```
+wisp> let names = split("ada grace alan")
+wisp> sort(names)
+wisp> names
+["ada", "alan", "grace"]
+wisp> fn shout(s) { return upper(s) + "!"; }
+wisp> shout(names[0])
+"ADA!"
+```
+
+- A line that is just an expression shows its value (strings in quotes,
+  so `"1"` and `1` look different); `nil` shows nothing.
+- The final `;` may be left off.
+- A line that opens more `{`, `(` or `[` than it closes continues on the
+  next line, at a `...` prompt, until they balance -- so a `fn`, `if`,
+  `while` or `for` can be typed over several lines.
+- Unlike in a program file, `let` may re-declare a global and `fn` may
+  redefine a function an earlier line defined -- that is how you fix a
+  typo.
+- An error is reported in the usual form and the session carries on with
+  everything it had.
+- Esc stops a running line, as it stops a program. At the `wisp>`
+  prompt it clears a half-typed line, as at the shell prompt; at a `...`
+  continuation prompt it discards the whole unfinished input.
+- `vars` lists the session's globals and functions; `exit` (or `quit`)
+  ends the session, freeing everything it built.
+
+## What's still not in WISP
+
+Intentionally out of scope so far, to keep the interpreter small and
+solid while it grows:
 
 - No maps, sets, or user-defined structured types (see "Lists" for the
-  parallel-lists workaround).
-- No list slicing, `+` concatenation, sorting, or `map`/`filter`.
-- No closures or nested function definitions.
+  parallel-lists workaround; `find(keys, k)` gives the index to use in
+  the parallel list).
+- No closures, nested function definitions, or `map`/`filter`.
 - No floating point.
-- No string indexing/slicing, splitting, or formatting beyond `+`
-  concatenation and `str()`/`int()` conversion.
+- No string formatting beyond `+`, `str()`, `repeat()` and the string
+  builtins.
 - No file I/O from within a script (scripts can't read/write other files
   on the volume; only the shell's `run` command reads the script file
   itself).
 - No `import`/multi-file programs -- one `.wisp` file is one whole program.
 
 None of these are hard blockers for text adventures, quiz games, dice
-games, calculators, or similar small text-mode programs; they're the
-first things to reach for if you outgrow v1.
+games, calculators, or similar small text-mode programs.

@@ -173,6 +173,7 @@ impl<'t> Parser<'t> {
             Tok::Let => self.parse_let(),
             Tok::If => self.parse_if(),
             Tok::While => self.parse_while(),
+            Tok::For => self.parse_for(),
             Tok::Break => {
                 let line = self.peek_line();
                 self.advance();
@@ -242,10 +243,14 @@ impl<'t> Parser<'t> {
                     value,
                     line,
                 }),
+                Expr::Slice { .. } => Err(WispError::new(
+                    line,
+                    "cannot assign to a slice (assign one element at a time, or use insert()/remove())",
+                )),
                 // This function is only ever entered when the statement
                 // starts with `ident [`, so `parse_postfix` always
-                // produces an `Expr::Index` here.
-                _ => unreachable!("parse_index_assign_or_expr_stmt always parses an Expr::Index"),
+                // produces an `Expr::Index` or `Expr::Slice` here.
+                _ => unreachable!("parse_index_assign_or_expr_stmt always parses an Expr::Index or Expr::Slice"),
             };
         }
         self.expect(Tok::Semi)?;
@@ -282,6 +287,16 @@ impl<'t> Parser<'t> {
         let cond = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(Stmt::While { cond, body, line })
+    }
+
+    #[inline(never)]
+    fn parse_for(&mut self) -> Result<Stmt, WispError> {
+        let line = self.expect(Tok::For)?.line;
+        let var = self.expect_ident()?;
+        self.expect(Tok::In)?;
+        let iter = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::For { var, iter, body, line })
     }
 
     #[inline(never)]
@@ -359,10 +374,11 @@ impl<'t> Parser<'t> {
         self.parse_postfix()
     }
 
-    /// Wraps a primary expression in zero or more `[index]` reads, e.g.
-    /// `grid[y][x]` or `make_list()[0]`. Binds tighter than unary
-    /// `not`/`-` and looser than nothing (it's the tightest-binding
-    /// construct in the language, same as function calls).
+    /// Wraps a primary expression in zero or more `[index]` reads or
+    /// `[start:end]` slices, e.g. `grid[y][x]`, `make_list()[0]` or
+    /// `name[1:]`. Binds tighter than unary `not`/`-` and looser than
+    /// nothing (it's the tightest-binding construct in the language, same
+    /// as function calls).
     fn parse_postfix(&mut self) -> Result<Expr, WispError> {
         let base = self.depth;
         let mut expr = self.parse_primary()?;
@@ -370,13 +386,24 @@ impl<'t> Parser<'t> {
             let line = self.peek_line();
             self.advance();
             self.descend()?;
-            let index = self.parse_expr()?;
-            self.expect(Tok::RBracket)?;
-            expr = Expr::Index {
-                object: Box::new(expr),
-                index: Box::new(index),
-                line,
-            };
+            let first = if self.check(&Tok::Colon) { None } else { Some(Box::new(self.parse_expr()?)) };
+            if self.match_tok(&Tok::Colon) {
+                let end = if self.check(&Tok::RBracket) { None } else { Some(Box::new(self.parse_expr()?)) };
+                self.expect(Tok::RBracket)?;
+                expr = Expr::Slice {
+                    object: Box::new(expr),
+                    start: first,
+                    end,
+                    line,
+                };
+            } else {
+                self.expect(Tok::RBracket)?;
+                expr = Expr::Index {
+                    object: Box::new(expr),
+                    index: first.expect("an index expression was parsed: the token after '[' was not ':'"),
+                    line,
+                };
+            }
         }
         self.depth = base;
         Ok(expr)
@@ -466,6 +493,8 @@ fn describe(tok: &Tok) -> String {
         Tok::Elif => "'elif'".into(),
         Tok::Else => "'else'".into(),
         Tok::While => "'while'".into(),
+        Tok::For => "'for'".into(),
+        Tok::In => "'in'".into(),
         Tok::Fn => "'fn'".into(),
         Tok::Return => "'return'".into(),
         Tok::Break => "'break'".into(),
@@ -493,6 +522,7 @@ fn describe(tok: &Tok) -> String {
         Tok::RBracket => "']'".into(),
         Tok::Comma => "','".into(),
         Tok::Semi => "';'".into(),
+        Tok::Colon => "':'".into(),
         Tok::Eof => "end of input".into(),
     }
 }

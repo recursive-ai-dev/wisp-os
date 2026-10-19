@@ -43,7 +43,10 @@ To build and run from source:
 At the `>` prompt: `help` lists shell commands, `ls APPS` shows the
 bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
-`stopwatch`, `primes`) runs one. **Esc stops any running program.**
+`stopwatch`, `primes`, `calc`) runs one. `wisp` opens an interactive
+WISP prompt that runs each line as you type it -- the way to try the
+language, or write a quick program, on the machine itself.
+**Esc stops any running program.**
 `save`/`load` persist key/value pairs to the AHCI disk (after a one-time
 `format`, which names the disk and asks before erasing anything) -- each
 save is crash-atomic, and `keys`/`delete` list and remove them -- `uptime` reports
@@ -124,6 +127,7 @@ src/                  the kernel (no_std, no_main)
   shell.rs                      the `>` prompt and its commands
   libc_shims.rs                  freestanding `wcslen`
   wisp/                           lexer -> parser -> tree-walking interpreter
+                                   (one Session per program, or per `wisp` prompt)
 docs/
   WISP_LANGUAGE.md        the complete WISP language reference
   WISP_GRAPHICS.md         the pixel/graphics primitives
@@ -173,6 +177,11 @@ CHANGES.md                 engineering log: the specific decisions and why
   you press Esc (which wakes its `sleep_ms()` immediately).
 - **`primes.wisp`** -- prints primes as fast as it can, forever: a pure
   compute loop that only Esc can end.
+- **`calc.wisp`** -- an integer calculator with operator precedence and
+  parentheses (`2 + 3 * (4 + 6)` is 32), whose expression parser is
+  written in WISP itself: the worked example of `for` over a string,
+  string indexing, and the string builtins. Every bad expression is its
+  own message, and the calculator keeps running.
 
 ## Known rough edges (see CHANGES.md for the full story on each)
 

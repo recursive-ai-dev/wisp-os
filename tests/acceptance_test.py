@@ -25,6 +25,27 @@ KEY_NAMES = {
     "_": "shift-minus",
     ".": "dot",
     "/": "slash",
+    # Punctuation WISP source needs, as QEMU qcodes on a US layout -- the
+    # same keys keyboard.rs's scancode tables decode them from.
+    "=": "equal",
+    "+": "shift-equal",
+    "*": "shift-8",
+    "(": "shift-9",
+    ")": "shift-0",
+    "%": "shift-5",
+    "!": "shift-1",
+    "#": "shift-3",
+    ",": "comma",
+    "<": "shift-comma",
+    ">": "shift-dot",
+    ";": "semicolon",
+    ":": "shift-semicolon",
+    "'": "apostrophe",
+    '"': "shift-apostrophe",
+    "[": "bracket_left",
+    "]": "bracket_right",
+    "{": "shift-bracket_left",
+    "}": "shift-bracket_right",
 }
 
 
@@ -1174,6 +1195,102 @@ def main():
             must_not_contain=["leftover"],
         )
         print("step 19 (Esc at the prompt discards the typed line):", shot, "-- OCR verified")
+
+        # calc.wisp: an expression parser written in WISP, exercising the
+        # v2 language (for over a string, indexing, contains(), trim())
+        # on the real machine. A bad expression is calc's own message,
+        # and calc keeps running.
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("run calc")
+        mon.enter()
+        time.sleep(0.5)
+        # 32 with operator precedence, 50 without. (Not an answer like 11:
+        # tesseract reads "= 11" in this font as "- 1".)
+        mon.type_text("2 + 3 * (4 + 6)")
+        mon.enter()
+        time.sleep(0.5)
+        mon.type_text("10 / (5 - 5)")
+        mon.enter()
+        time.sleep(0.5)
+        shot = wait_for_text(mon, "20a_calc", "division by zero")
+        assert_ocr(shot, ["calc", "32", "division by zero"], "step 20a (run calc -- precedence and a caught error)")
+        print("step 20a (run calc -- 2 + 3 * (4 + 6) = 32, division by zero reported):", shot, "-- OCR verified")
+        mon.type_text("quit")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("echo calc_done")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("20b_calc_quit")
+        assert_ocr(shot, "calc_done", "step 20b (calc -- quit back to the shell prompt)")
+        print("step 20b (calc -- quit back to the shell prompt):", shot, "-- OCR verified")
+
+        # The interactive prompt: state carried between lines, a function
+        # typed over three lines, an error that leaves the session intact,
+        # Esc stopping a runaway line, `vars`, and `exit`.
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("wisp")
+        mon.enter()
+        time.sleep(0.3)
+        for line in [
+            'let names = split("ada grace alan")',
+            "sort(names)",
+            "names",
+            "fn shout(s) {",
+            '    return upper(s) + "!";',
+            "}",
+            'shout("hi")',
+            "nope + 1",
+        ]:
+            mon.type_text(line)
+            mon.enter()
+            time.sleep(0.3)
+        shot = wait_for_text(mon, "21a_wisp_prompt", "HI!")
+        text = assert_ocr(shot, ["HI!", "undefined variable"], "step 21a (wisp prompt -- definitions, multi-line fn, error)")
+        if not re.search(r"ada\W{0,8}alan\W{0,8}grace", text):
+            raise RuntimeError(f"step 21a: the sorted list was not echoed as ada, alan, grace.\nOCR text:\n{text}")
+        print("step 21a (wisp prompt -- sorted list echoed, 3-line fn defined and called, error reported):", shot, "-- OCR verified")
+
+        mon.type_text("clear()")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("while true { }")
+        mon.enter()
+        time.sleep(1.0)
+        mon.cmd("sendkey esc")
+        time.sleep(0.4)
+        assert_debug_log("[wisp] prompt input stopped by Esc at line 1", "step 21b (wisp prompt -- Esc stopped a runaway line)")
+        mon.type_text("vars")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("len(names) * 10")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("21b_wisp_vars")
+        assert_ocr(
+            shot,
+            # The stop is proven exactly by the debug-log line above; on
+            # screen only "stopped" is asserted, because tesseract reads
+            # this red "(Esc pressed)" as "{Ese pressed".
+            ["stopped", "globals: names", "functions: shout", "30"],
+            "step 21b (wisp prompt -- Esc, vars, session intact)",
+        )
+        print("step 21b (wisp prompt -- Esc stopped a runaway line, vars, session intact):", shot, "-- debug log + OCR verified")
+
+        mon.type_text("exit")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("echo prompt_done")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("21c_wisp_exit")
+        assert_ocr(shot, ["left the WISP prompt", "prompt_done"], "step 21c (wisp prompt -- exit back to the shell)")
+        assert_debug_log("[wisp] interactive prompt ended", "step 21c (wisp prompt -- exit back to the shell)")
+        print("step 21c (wisp prompt -- exit back to the shell):", shot, "-- debug log + OCR verified")
 
         mon.quit()
     finally:

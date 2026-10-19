@@ -62,11 +62,22 @@ pub enum Expr {
         items: Vec<Expr>,
         line: u32,
     },
-    /// `object[index]` -- a list read. `object` must evaluate to a list
-    /// and `index` to an in-bounds `int`; both are checked at runtime.
+    /// `object[index]` -- a list element, or the character starting at
+    /// byte offset `index` of a string. `object` must evaluate to a list
+    /// or a string and `index` to an in-bounds `int`; both are checked at
+    /// runtime.
     Index {
         object: Box<Expr>,
         index: Box<Expr>,
+        line: u32,
+    },
+    /// `object[start:end]`, either bound optional (`a[2:]`, `a[:3]`,
+    /// `a[:]`) -- a new list holding a copy of that run of elements, or the
+    /// substring between those byte offsets of a string.
+    Slice {
+        object: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
         line: u32,
     },
 }
@@ -83,7 +94,8 @@ impl Expr {
             | Expr::Binary { line, .. }
             | Expr::Call { line, .. }
             | Expr::ListLit { line, .. }
-            | Expr::Index { line, .. } => Some(*line),
+            | Expr::Index { line, .. }
+            | Expr::Slice { line, .. } => Some(*line),
             Expr::IntLit(_) | Expr::StrLit(_) | Expr::BoolLit(_) | Expr::NilLit => None,
         }
     }
@@ -126,6 +138,17 @@ pub enum Stmt {
     /// condition like `true` carries no line of its own.
     While {
         cond: Expr,
+        body: Vec<Stmt>,
+        line: u32,
+    },
+    /// `for var in iter { body }`. `iter` is evaluated once, before the
+    /// first pass; a list is looped over as it was at that moment (a
+    /// snapshot of its elements), a string one character at a time. Each
+    /// pass runs `body` in a fresh scope holding `var`. `line` is the
+    /// `for` keyword's, for the same reason as `While`'s.
+    For {
+        var: Rc<String>,
+        iter: Expr,
         body: Vec<Stmt>,
         line: u32,
     },

@@ -1,6 +1,6 @@
 //! The interactive command shell: prompt, line editing, and command
-//! dispatch for `help`, `clear`, `echo`, `ls`, `run`, `uptime`, `mem`,
-//! `version`, `save`, `load`, `keys`, `delete`, and `format`.
+//! dispatch for `help`, `clear`, `echo`, `ls`, `run`, `wisp`, `uptime`,
+//! `mem`, `version`, `save`, `load`, `keys`, `delete`, and `format`.
 //!
 //! Runs entirely on our own drivers (`keyboard.rs` for input, `clock.rs` for
 //! timing) -- there is no Boot Services left to lean on by the time this
@@ -255,6 +255,7 @@ impl Shell {
             "echo" => self.cmd_echo(rest, console),
             "ls" => self.cmd_ls(rest, console),
             "run" => self.cmd_run(console, rest),
+            "wisp" => self.cmd_wisp(console),
             "uptime" => self.cmd_uptime(console),
             "version" => self.cmd_version(console),
             "mem" => self.cmd_mem(console),
@@ -392,6 +393,7 @@ impl Shell {
              \x20\x20echo <text>   Print <text> back to the screen\n\
              \x20\x20ls [APPS]     List the in-memory APPS snapshot\n\
              \x20\x20run <name>    Run APPS/<name>.wisp (a WISP program)\n\
+             \x20\x20wisp          Interactive WISP prompt ('exit' to leave)\n\
              \x20\x20uptime        Show elapsed time since boot (timer ticks)\n\
              \x20\x20mem           Show heap and physical memory usage\n\
              \x20\x20version       Show the kernel version and protections\n\
@@ -662,6 +664,102 @@ impl Shell {
         }
     }
 
+    /// `wisp`: an interactive WISP session. Each line runs as soon as it
+    /// is complete -- brackets balanced, see `wisp::open_brackets` --
+    /// against one `Session` that keeps every global, function and list
+    /// the session has built until `exit`. See `docs/WISP_LANGUAGE.md`,
+    /// "The interactive prompt".
+    fn cmd_wisp(&mut self, console: &mut Console) {
+        console.write_str(
+            "WISP interactive prompt: each line runs as you enter it; an expression\n\
+             shows its value. 'vars' lists definitions, 'exit' leaves. Esc stops a line.\n",
+        );
+        crate::debugcon::write_str("[wisp] interactive prompt started\n");
+        let mut session = wisp::interp::Session::new();
+        let mut pending = String::new();
+        loop {
+            console.set_fg(gfx::ACCENT);
+            console.write_str(if pending.is_empty() { "wisp> " } else { "...   " });
+            console.set_fg(gfx::FOREGROUND);
+            keyboard::clear_stop_request();
+            // A first line reads like the shell's own prompt (Esc erases
+            // it); a continuation line returns on Esc, which abandons the
+            // whole unfinished input.
+            let mode = if pending.is_empty() { LineMode::Prompt } else { LineMode::Program };
+            let line = read_line(console, mode);
+            console.newline();
+            if mode == LineMode::Program && keyboard::stop_requested() {
+                keyboard::clear_stop_request();
+                pending.clear();
+                console.write_str("(unfinished input discarded)\n");
+                continue;
+            }
+            if pending.is_empty() {
+                match line.trim() {
+                    "" => continue,
+                    "exit" | "quit" => break,
+                    "vars" => {
+                        list_definitions(&session, console);
+                        continue;
+                    }
+                    _ => {}
+                }
+            } else {
+                pending.push('\n');
+            }
+            pending.push_str(&line);
+            if wisp::open_brackets(&pending) > 0 {
+                continue;
+            }
+            let source = core::mem::take(&mut pending);
+            self.run_prompt_line(&mut session, &source, console);
+        }
+        drop(session);
+        crate::debugcon::write_str("[wisp] interactive prompt ended\n");
+        console.write_str("left the WISP prompt\n");
+    }
+
+    /// Parse and run one complete piece of interactive input, then show
+    /// its value or its error.
+    fn run_prompt_line(&mut self, session: &mut wisp::interp::Session, source: &str, console: &mut Console) {
+        let result = wisp::parse_interactive(source).and_then(|program| {
+            keyboard::clear_stop_request();
+            let mut host = ShellHost {
+                console: &mut *console,
+                rng: &mut self.rng_state,
+                save_disk: self.save_disk.as_ref(),
+                last_usb_poll_tick: u64::MAX,
+            };
+            session.run_interactive(&mut host, &program)
+        });
+        keyboard::clear_stop_request();
+        match result {
+            Ok(Some(value)) if !matches!(value, Value::Nil) => {
+                let _ = write!(console, "{}\n", value.to_echo_string());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if e.message == wisp::interp::STOPPED_MESSAGE {
+                    let _ = crate::debugcon::write_fmt(format_args!(
+                        "[wisp] prompt input stopped by Esc at line {}\n",
+                        e.line
+                    ));
+                }
+                console.set_fg(gfx::ERROR);
+                let _ = write!(console, "{}\n", e.to_display_string());
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+        // Everything a session builds stays alive until `exit`, so a long
+        // session can fill the heap; every later line would then stop at
+        // once with "out of memory". Say what to do about it.
+        if allocator::free_bytes() < SCRIPT_HEAP_RESERVE {
+            console.set_fg(gfx::ERROR);
+            console.write_str("(this session holds most of the free heap -- 'exit' frees everything it built)\n");
+            console.set_fg(gfx::FOREGROUND);
+        }
+    }
+
     /// `version`: what this build is, and which hardware protections are
     /// live this boot -- the things a bug report needs first.
     fn cmd_version(&self, console: &mut Console) {
@@ -717,6 +815,22 @@ impl Shell {
 /// script built. Comfortably larger than any single allocation a script
 /// can request in one step (`wisp::value`'s string/list/display caps).
 const SCRIPT_HEAP_RESERVE: usize = 1536 * 1024;
+
+/// The interactive prompt's `vars`: the session's globals and functions.
+fn list_definitions(session: &wisp::interp::Session, console: &mut Console) {
+    let globals: alloc::vec::Vec<&str> = session.global_names().collect();
+    let functions: alloc::vec::Vec<&str> = session.function_names().collect();
+    if globals.is_empty() && functions.is_empty() {
+        console.write_str("(nothing defined yet)\n");
+        return;
+    }
+    if !globals.is_empty() {
+        let _ = write!(console, "globals: {}\n", globals.join(", "));
+    }
+    if !functions.is_empty() {
+        let _ = write!(console, "functions: {}\n", functions.join(", "));
+    }
+}
 
 /// `run <name>` always resolves against the `APPS` snapshot, auto-appending
 /// `.wisp` when `name` has no extension of its own, per

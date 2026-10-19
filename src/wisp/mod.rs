@@ -53,5 +53,61 @@ impl core::fmt::Display for WispError {
 pub fn run_source(source: &str, host: &mut dyn interp::Host) -> Result<(), WispError> {
     let tokens = lexer::lex(source)?;
     let program = parser::parse(&tokens)?;
-    interp::Interp::new(host).run(&program)
+    interp::Session::new().run(host, &program)
+}
+
+/// Lex and parse one piece of an interactive session (see
+/// `interp::Session::run_interactive`). A piece that is a single
+/// expression or statement missing only its final `;` is accepted as if
+/// the `;` were there -- at a prompt, `1 + 2` means what it says.
+pub fn parse_interactive(source: &str) -> Result<ast::Program, WispError> {
+    let tokens = lexer::lex(source)?;
+    match parser::parse(&tokens) {
+        Ok(program) => Ok(program),
+        Err(first) => {
+            let trimmed = source.trim_end();
+            if trimmed.ends_with(';') || trimmed.ends_with('}') {
+                return Err(first);
+            }
+            let mut patched = String::from(trimmed);
+            patched.push(';');
+            lexer::lex(&patched)
+                .and_then(|tokens| parser::parse(&tokens))
+                .map_err(|_| first)
+        }
+    }
+}
+
+/// How many more `(`, `[` and `{` than `)`, `]` and `}` `source` has,
+/// ignoring any inside string literals or comments. The interactive prompt
+/// keeps reading lines while this is positive, so a block can be typed over
+/// several lines. Never negative: a surplus of closers is an error the
+/// parser will report, not a reason to wait for more input.
+pub fn open_brackets(source: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+    for b in source.bytes() {
+        if in_comment {
+            in_comment = b != b'\n';
+        } else if in_string {
+            match (escaped, b) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                // A string literal cannot span lines; the lexer reports it.
+                (false, b'"') | (false, b'\n') => in_string = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'#' => in_comment = true,
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    depth
 }
