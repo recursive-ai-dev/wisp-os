@@ -30,6 +30,7 @@
 //! - **One port only** -- the first implemented port with a device
 //!   present. This driver has no use for more than one save disk.
 
+use core::cell::Cell;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::clock::{self, poll_until};
@@ -69,10 +70,12 @@ const PXCLB: usize = 0x00; // Command List Base Address (low 32 bits)
 const PXCLBU: usize = 0x04; // Command List Base Address (upper 32 bits)
 const PXFB: usize = 0x08; // FIS Base Address (low 32 bits)
 const PXFBU: usize = 0x0C; // FIS Base Address (upper 32 bits)
+const PXIS: usize = 0x10; // Interrupt Status (write-1-to-clear)
 const PXCMD: usize = 0x18; // Command and Status
 const PXTFD: usize = 0x20; // Task File Data (ATA status/error, shadow copy)
 const PXSIG: usize = 0x24; // Signature (device type, once known)
 const PXSSTS: usize = 0x28; // Serial ATA Status (device detection/Phy state)
+const PXSCTL: usize = 0x2C; // Serial ATA Control (COMRESET via DET)
 const PXSERR: usize = 0x30; // Serial ATA Error (write-1-to-clear)
 const PXCI: usize = 0x38; // Command Issue (one bit per command slot)
 
@@ -122,6 +125,11 @@ const DEVICE_DETECT_TIMEOUT_TICKS: u64 = 100;
 /// time even on slow media; 1 second is generous headroom so a genuinely
 /// wedged command produces a reported error instead of an infinite spin.
 const COMMAND_TIMEOUT_TICKS: u64 = 100;
+/// Bound for FLUSH CACHE (EXT). Unlike a single-sector transfer, a flush
+/// may have to write back the device's entire volatile cache, which ATA
+/// allows to take many seconds; 30 seconds is generous without being an
+/// effective hang.
+const FLUSH_TIMEOUT_TICKS: u64 = 3000;
 
 /// This driver's fixed logical sector size. QEMU's `ide-hd` backing a raw
 /// disk image (this kernel's only save-disk transport, see the module doc
@@ -137,6 +145,15 @@ const ATA_CMD_IDENTIFY_DEVICE: u8 = 0xEC;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
 /// ATA8-ACS command byte for WRITE DMA EXT (LBA48, 7.63).
 const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+/// ATA8-ACS command byte for FLUSH CACHE EXT (7.11).
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
+/// ATA8-ACS command byte for FLUSH CACHE (7.10), the 28-bit fallback.
+const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+
+/// `PxTFD.STS` bits (ATA Status register shadow).
+const TFD_STS_ERR: u32 = 1 << 0;
+const TFD_STS_DRQ: u32 = 1 << 3;
+const TFD_STS_BSY: u32 = 1 << 7;
 
 fn port_offset(port: u8) -> usize {
     PORT_REGS_BASE + (port as usize) * PORT_REG_STRIDE
@@ -155,10 +172,28 @@ unsafe fn write_reg32(abar: *mut u8, offset: usize, value: u32) {
     unsafe { core::ptr::write_volatile(abar.add(offset) as *mut u32, value) }
 }
 
+/// Whether the one port this driver owns may still be handed commands.
+///
+/// There is deliberately no "in flight" state visible outside
+/// [`Hba::issue`]: every command is submitted and either retired or
+/// recovered from before `issue` returns, so between calls the port is
+/// always either idle-and-usable or permanently out of service.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortState {
+    /// Idle: no command outstanding, DMA structures free to rewrite.
+    Ready,
+    /// A command failed and the port could not be proven quiescent
+    /// afterwards (AHCI 1.3.1, 6.2.2). The hardware may still own the
+    /// command list, command table, and data buffer, so they are never
+    /// touched again and the frames are never freed -- every later
+    /// request fails immediately without any MMIO or DMA-memory write.
+    Failed,
+}
+
 /// A live handle to one AHCI controller's memory-mapped registers, once
 /// [`init`] has found a controller and mapped its ABAR and brought up a
-/// port with a usable SATA disk attached. [`Hba::identify`]/[`Hba::read_sectors`]/
-/// [`Hba::write_sectors`] issue commands through it.
+/// port with a usable SATA disk attached. [`Hba::identify`]/[`Hba::read_sector`]/
+/// [`Hba::write_sector`]/[`Hba::flush_cache`] issue commands through it.
 pub struct Hba {
     /// Base of the mapped ABAR (identity-mapped: this is both the virtual
     /// and physical base address, matching `paging.rs`'s whole-kernel
@@ -189,6 +224,12 @@ pub struct Hba {
     /// needs (matches the "single-outstanding-command, no NCQ" scope this
     /// module's doc comment already commits to).
     data_buf_phys: u64,
+    /// See [`PortState`]. A `Cell` because commands are issued through
+    /// `&self` (the shell and the WISP host both hold shared borrows).
+    state: Cell<PortState>,
+    /// What IDENTIFY DEVICE reported, once [`Hba::identify`] has run.
+    /// [`Hba::flush_cache`] needs it to choose a supported flush command.
+    info: Option<DiskInfo>,
 }
 
 /// Everything [`bring_up_first_available_port`] learns about the one port
@@ -514,132 +555,311 @@ pub unsafe fn init() -> Result<Hba, &'static str> {
         fis_phys: port.fis_phys,
         cmd_table_phys: port.cmd_table_phys,
         data_buf_phys: port.data_buf_phys,
+        state: Cell::new(PortState::Ready),
+        info: None,
     })
 }
 
-/// Build a Register H2D FIS (SATA spec, FIS type 0x27, 20 bytes / 5
-/// DWORDs) for `command` directly into the command table's Command FIS
-/// area (AHCI 1.3.1, 5.3.6.1: offset 0x00), issue it through command slot
-/// 0 (the only slot this driver ever uses), and poll for completion with a
-/// bounded timeout.
-///
-/// `data_phys`/`data_len` describe an optional single data buffer (one
-/// PRDT entry, AHCI 1.3.1, 5.3.6.1: PRDT starts at command-table offset
-/// 0x80) for commands that transfer data -- pass `data_len: 0` for a
-/// command with no data phase. `write` selects transfer direction: `true`
-/// = host-to-device (a disk write), `false` = device-to-host (a disk read,
-/// or IDENTIFY DEVICE).
-///
-/// # Safety
-/// `abar` must be a valid, mapped, running (`PxCMD.ST`/`FRE` set) port at
-/// index `port`; `cmd_list_phys`/`cmd_table_phys` must be the frames that
-/// port's `PxCLB` / command-header-0 CTBA were set up to point at (see
-/// [`bring_up_first_available_port`]); if `data_len != 0`, `data_phys` must
-/// be a valid, exclusively-owned, `data_len`-byte physical buffer for the
-/// duration of the command.
-#[allow(clippy::too_many_arguments)]
-unsafe fn issue_ata_command(
-    abar: *mut u8,
-    port: u8,
-    cmd_list_phys: u64,
-    cmd_table_phys: u64,
-    command: u8,
-    lba: u64,
-    sector_count: u16,
-    data_phys: u64,
-    data_len: u32,
-    write: bool,
-) -> Result<(), &'static str> {
-    debug_assert!(
-        data_len as u64 <= paging::PAGE_SIZE,
-        "issue_ata_command: this driver's single PRDT entry never exceeds one scratch frame"
-    );
-
-    let base = port_offset(port);
-
-    // SAFETY: `cmd_table_phys` names this port's command table (caller's
-    // contract), whose Command FIS area (offset 0x00, 64 bytes reserved)
-    // is exclusively owned by this one-command-at-a-time driver between
-    // calls.
-    unsafe {
-        let cfis = cmd_table_phys as *mut u8;
-        core::ptr::write_bytes(cfis, 0, 20);
-        cfis.write_volatile(0x27); // FIS type: Register H2D.
-        cfis.add(1).write_volatile(0x80); // bit 7 (C): this is a command update, not a control one.
-        cfis.add(2).write_volatile(command);
-        cfis.add(4).write_volatile((lba & 0xFF) as u8);
-        cfis.add(5).write_volatile(((lba >> 8) & 0xFF) as u8);
-        cfis.add(6).write_volatile(((lba >> 16) & 0xFF) as u8);
-        cfis.add(7).write_volatile(0x40); // Device register: LBA mode.
-        cfis.add(8).write_volatile(((lba >> 24) & 0xFF) as u8);
-        cfis.add(9).write_volatile(((lba >> 32) & 0xFF) as u8);
-        cfis.add(10).write_volatile(((lba >> 40) & 0xFF) as u8);
-        cfis.add(12).write_volatile((sector_count & 0xFF) as u8);
-        cfis.add(13).write_volatile(((sector_count >> 8) & 0xFF) as u8);
-    }
-
-    if data_len != 0 {
-        // SAFETY: command-table offset 0x80 is this port's (only) PRDT,
-        // `data_phys`/`data_len` are the caller's contract.
-        unsafe {
-            let prdt = (cmd_table_phys + 0x80) as *mut u32;
-            prdt.write_volatile((data_phys & 0xFFFF_FFFF) as u32);
-            prdt.add(1).write_volatile((data_phys >> 32) as u32);
-            prdt.add(2).write_volatile(0);
-            // DBC (Data Byte Count) is zero-based (AHCI 1.3.1, 5.3.9); bit
-            // 31 (Interrupt on Completion) stays clear -- this driver polls
-            // PxCI, it never waits on the completion interrupt.
-            prdt.add(3).write_volatile((data_len - 1) & 0x3F_FFFF);
-        }
-    }
-
-    // Command header 0: CFL = 5 DWORDs (the 20-byte Register H2D FIS just
-    // written), W = transfer direction, PRDTL = 0 or 1 depending on
-    // whether this command has a data phase, PRDBC reset to 0.
-    let prdtl: u32 = u32::from(data_len != 0);
-    let w_bit: u32 = if write { 1 << 6 } else { 0 };
-    // SAFETY: `cmd_list_phys` names this port's command list (caller's
-    // contract); header 0 is exclusively owned the same way the command
-    // table is.
-    unsafe {
-        let hdr = cmd_list_phys as *mut u32;
-        hdr.write_volatile(5 | w_bit | (prdtl << 16));
-        hdr.add(1).write_volatile(0); // PRDBC, read-only to hardware -- reset before issue.
-    }
-
-    // Ring the doorbell: setting PxCI bit 0 (slot 0) hands the command to
-    // the HBA.
-    unsafe { write_reg32(abar, base + PXCI, 1) };
-
-    let deadline = clock::deadline_after_ticks(COMMAND_TIMEOUT_TICKS);
-    // SAFETY: `abar` is valid and mapped per this function's own contract.
-    let completed = poll_until(deadline, || unsafe { read_reg32(abar, base + PXCI) } & 1 == 0);
-    if !completed {
-        return Err("ahci: command did not complete within the bounded timeout (PxCI never cleared)");
-    }
-
-    // AHCI 1.3.1, 3.3.10: PxTFD is a live shadow of the ATA Status/Error
-    // registers from the most recent D2H/PIO-Setup FIS -- bit 0 of the
-    // Status byte (PxTFD bits 7:0) is ERR, set by the device when it
-    // failed the command. Checking this shadow register is simpler than
-    // decoding the FIS Receive area ourselves and gives the same answer.
-    let tfd = unsafe { read_reg32(abar, base + PXTFD) };
-    if tfd & 0x01 != 0 {
-        return Err("ahci: device reported an error completing the command (PxTFD.STS.ERR set)");
-    }
-
-    Ok(())
+/// Why a command failed, before [`Hba::issue`] turns it into a message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandFailure {
+    /// `PxCI` never cleared: the HBA may still own the command.
+    Timeout,
+    /// The command retired with `PxTFD.STS.ERR` set (a task-file error,
+    /// which AHCI 1.3.1, 6.2.2 also treats as needing port recovery).
+    DeviceError,
 }
 
-/// What [`Hba::identify`] learns about the attached disk: total addressable
-/// sectors (LBA48), each [`SECTOR_SIZE`] bytes.
+/// Decode an ATA IDENTIFY string field (`words` consecutive words, each
+/// holding two characters high byte first -- ATA8-ACS 3.2.8) into `out`.
+fn identify_string(words: &[u16], out: &mut [u8]) {
+    for (i, w) in words.iter().enumerate() {
+        out[i * 2] = (w >> 8) as u8;
+        out[i * 2 + 1] = (w & 0xFF) as u8;
+    }
+    for b in out.iter_mut() {
+        if !(0x20..0x7F).contains(b) {
+            *b = b'?';
+        }
+    }
+}
+
+/// What [`Hba::identify`] learns about the attached disk.
+#[derive(Clone, Copy)]
 pub struct DiskInfo {
+    /// Total addressable sectors (LBA48), each [`SECTOR_SIZE`] bytes.
     pub total_sectors: u64,
+    /// IDENTIFY words 27-46, space padded ASCII.
+    model: [u8; 40],
+    /// IDENTIFY words 10-19, space padded ASCII.
+    serial: [u8; 20],
+    /// The flush command this device supports, if any (FLUSH CACHE EXT
+    /// preferred over the 28-bit FLUSH CACHE).
+    flush_command: Option<u8>,
+    /// Whether IDENTIFY affirmatively reports the volatile write cache as
+    /// disabled. Only then is the absence of a flush command acceptable.
+    write_cache_disabled: bool,
+}
+
+impl DiskInfo {
+    /// The device's model string, trailing padding removed.
+    pub fn model(&self) -> &str {
+        trimmed_ascii(&self.model)
+    }
+
+    /// The device's serial number, padding removed.
+    pub fn serial(&self) -> &str {
+        trimmed_ascii(&self.serial)
+    }
+}
+
+fn trimmed_ascii(bytes: &[u8]) -> &str {
+    // `identify_string` replaced every byte outside printable ASCII.
+    core::str::from_utf8(bytes).unwrap_or("?").trim()
 }
 
 impl Hba {
+    /// Port index this driver owns, for identifying the device to a user.
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+
+    /// The IDENTIFY result, once [`Hba::identify`] has succeeded.
+    pub fn info(&self) -> Option<&DiskInfo> {
+        self.info.as_ref()
+    }
+
+    /// True once the port has been taken out of service after an
+    /// unrecoverable command failure.
+    pub fn is_failed(&self) -> bool {
+        self.state.get() == PortState::Failed
+    }
+
+    /// Build a Register H2D FIS (SATA spec, FIS type 0x27, 20 bytes / 5
+    /// DWORDs) for `command` directly into the command table's Command FIS
+    /// area (AHCI 1.3.1, 5.3.6.1: offset 0x00), issue it through command
+    /// slot 0 (the only slot this driver ever uses), and poll for
+    /// completion with a bounded timeout.
+    ///
+    /// `data_len` describes an optional transfer through this port's
+    /// single scratch buffer (one PRDT entry, AHCI 1.3.1, 5.3.6.1: PRDT
+    /// starts at command-table offset 0x80) -- pass `0` for a command with
+    /// no data phase. `write` selects transfer direction: `true` =
+    /// host-to-device (a disk write), `false` = device-to-host (a disk
+    /// read, or IDENTIFY DEVICE).
+    ///
+    /// On any failure the port is recovered before this returns (see
+    /// [`Hba::recover`]), so a returned error never leaves the HBA owning
+    /// the command table or data buffer while a later call rewrites them.
+    /// If recovery itself fails the port becomes [`PortState::Failed`]
+    /// and every later call fails here, before touching anything.
+    ///
+    /// # Safety
+    /// `self` must have been constructed by [`init`] (a live, running
+    /// port whose `PxCLB`/command-header-0 CTBA point at this struct's
+    /// frames).
+    unsafe fn issue(
+        &self,
+        command: u8,
+        lba: u64,
+        sector_count: u16,
+        data_len: u32,
+        write: bool,
+        timeout_ticks: u64,
+    ) -> Result<(), &'static str> {
+        if self.state.get() == PortState::Failed {
+            return Err("ahci: save disk port is offline after an unrecoverable error (reboot to retry)");
+        }
+        debug_assert!(
+            data_len as u64 <= paging::PAGE_SIZE,
+            "Hba::issue: this driver's single PRDT entry never exceeds one scratch frame"
+        );
+
+        let base = port_offset(self.port);
+
+        // SAFETY: `cmd_table_phys` names this port's command table, whose
+        // Command FIS area (offset 0x00, 64 bytes reserved) is exclusively
+        // owned by this driver while the port is `Ready` (no command
+        // outstanding -- see `PortState`).
+        unsafe {
+            let cfis = self.cmd_table_phys as *mut u8;
+            core::ptr::write_bytes(cfis, 0, 20);
+            cfis.write_volatile(0x27); // FIS type: Register H2D.
+            cfis.add(1).write_volatile(0x80); // bit 7 (C): this is a command update, not a control one.
+            cfis.add(2).write_volatile(command);
+            cfis.add(4).write_volatile((lba & 0xFF) as u8);
+            cfis.add(5).write_volatile(((lba >> 8) & 0xFF) as u8);
+            cfis.add(6).write_volatile(((lba >> 16) & 0xFF) as u8);
+            cfis.add(7).write_volatile(0x40); // Device register: LBA mode.
+            cfis.add(8).write_volatile(((lba >> 24) & 0xFF) as u8);
+            cfis.add(9).write_volatile(((lba >> 32) & 0xFF) as u8);
+            cfis.add(10).write_volatile(((lba >> 40) & 0xFF) as u8);
+            cfis.add(12).write_volatile((sector_count & 0xFF) as u8);
+            cfis.add(13).write_volatile(((sector_count >> 8) & 0xFF) as u8);
+        }
+
+        if data_len != 0 {
+            // SAFETY: command-table offset 0x80 is this port's (only)
+            // PRDT; `data_buf_phys` is this port's own scratch frame.
+            unsafe {
+                let prdt = (self.cmd_table_phys + 0x80) as *mut u32;
+                prdt.write_volatile((self.data_buf_phys & 0xFFFF_FFFF) as u32);
+                prdt.add(1).write_volatile((self.data_buf_phys >> 32) as u32);
+                prdt.add(2).write_volatile(0);
+                // DBC (Data Byte Count) is zero-based (AHCI 1.3.1, 5.3.9);
+                // bit 31 (Interrupt on Completion) stays clear -- this
+                // driver polls PxCI, it never waits on the interrupt.
+                prdt.add(3).write_volatile((data_len - 1) & 0x3F_FFFF);
+            }
+        }
+
+        // Command header 0: CFL = 5 DWORDs (the 20-byte Register H2D FIS
+        // just written), W = transfer direction, PRDTL = 0 or 1 depending
+        // on whether this command has a data phase, PRDBC reset to 0.
+        let prdtl: u32 = u32::from(data_len != 0);
+        let w_bit: u32 = if write { 1 << 6 } else { 0 };
+        // SAFETY: header 0 of this port's command list, owned the same way
+        // the command table is.
+        unsafe {
+            let hdr = self.cmd_list_phys as *mut u32;
+            hdr.write_volatile(5 | w_bit | (prdtl << 16));
+            hdr.add(1).write_volatile(0); // PRDBC -- reset before issue.
+        }
+
+        // Every descriptor write above must be visible before the
+        // doorbell hands them to the HBA.
+        compiler_fence(Ordering::SeqCst);
+        // Ring the doorbell: setting PxCI bit 0 (slot 0) hands the command
+        // to the HBA. From here until it clears (or `recover` stops the
+        // command engine) the HBA owns every structure written above.
+        unsafe { write_reg32(self.abar, base + PXCI, 1) };
+
+        let deadline = clock::deadline_after_ticks(timeout_ticks);
+        // SAFETY: `abar` is valid and mapped per this function's contract.
+        let completed = poll_until(deadline, || unsafe { read_reg32(self.abar, base + PXCI) } & 1 == 0);
+        compiler_fence(Ordering::SeqCst);
+
+        // AHCI 1.3.1, 3.3.10: PxTFD is a live shadow of the ATA
+        // Status/Error registers from the most recent D2H/PIO-Setup FIS --
+        // bit 0 of the Status byte is ERR, set by the device when it
+        // failed the command.
+        let failure = if !completed {
+            Some(CommandFailure::Timeout)
+        } else if unsafe { read_reg32(self.abar, base + PXTFD) } & TFD_STS_ERR != 0 {
+            Some(CommandFailure::DeviceError)
+        } else {
+            None
+        };
+        let Some(failure) = failure else {
+            return Ok(());
+        };
+
+        // SAFETY: same contract as this function's own.
+        let recovered = unsafe { self.recover() };
+        let _ = debugcon::write_fmt(format_args!(
+            "[ahci] command 0x{command:02x} lba={lba} failed ({}); port recovery {}\n",
+            if failure == CommandFailure::Timeout { "timeout" } else { "device error" },
+            if recovered { "succeeded" } else { "FAILED -- port taken offline" },
+        ));
+        Err(match (failure, recovered) {
+            (CommandFailure::Timeout, true) => {
+                "ahci: command timed out (port recovered; the command's effect on the disk is unknown)"
+            }
+            (CommandFailure::DeviceError, true) => {
+                "ahci: device reported an error completing the command (PxTFD.STS.ERR set)"
+            }
+            (_, false) => {
+                "ahci: command failed and the port could not be recovered -- save disk taken offline"
+            }
+        })
+    }
+
+    /// AHCI 1.3.1, 6.2.2.1 software error recovery for this driver's one
+    /// port: stop the command engine and *verify* it stopped (only then
+    /// has the HBA released the command list, command table, and data
+    /// buffer), clear error status, COMRESET the link if the device is
+    /// still busy, and restart the engine.
+    ///
+    /// Returns `true` if the port is idle and usable again. On `false`
+    /// the port is marked [`PortState::Failed`]; its DMA frames are left
+    /// allocated and untouched for the rest of the boot, because the HBA
+    /// may still be using them.
+    ///
+    /// # Safety
+    /// Same contract as [`Hba::issue`].
+    unsafe fn recover(&self) -> bool {
+        let ok = unsafe { self.try_recover() };
+        if !ok {
+            self.state.set(PortState::Failed);
+        }
+        ok
+    }
+
+    unsafe fn try_recover(&self) -> bool {
+        let abar = self.abar;
+        let base = port_offset(self.port);
+
+        // 1. Clear PxCMD.ST and wait for PxCMD.CR to drop. Clearing ST
+        //    also clears PxCI (AHCI 1.3.1, 3.3.14), retiring slot 0.
+        unsafe {
+            let cmd = read_reg32(abar, base + PXCMD);
+            write_reg32(abar, base + PXCMD, cmd & !PXCMD_ST);
+        }
+        let deadline = clock::deadline_after_ticks(PORT_ENGINE_TIMEOUT_TICKS);
+        if !poll_until(deadline, || unsafe { read_reg32(abar, base + PXCMD) } & PXCMD_CR == 0) {
+            return false;
+        }
+        if unsafe { read_reg32(abar, base + PXCI) } != 0 {
+            return false;
+        }
+
+        // 2. Clear latched error and interrupt status (both RW1C).
+        unsafe {
+            write_reg32(abar, base + PXSERR, 0xFFFF_FFFF);
+            write_reg32(abar, base + PXIS, 0xFFFF_FFFF);
+        }
+
+        // 3. A device still showing BSY or DRQ will not accept another
+        //    command; only a COMRESET (PxSCTL.DET = 1, then 0) clears
+        //    that (AHCI 1.3.1, 10.4.2). ST is already clear, as required.
+        let tfd = unsafe { read_reg32(abar, base + PXTFD) };
+        if tfd & (TFD_STS_BSY | TFD_STS_DRQ) != 0 {
+            unsafe {
+                let sctl = read_reg32(abar, base + PXSCTL);
+                write_reg32(abar, base + PXSCTL, (sctl & !0xF) | 1);
+            }
+            // DET=1 must be held for at least 1 ms; one tick is 10 ms.
+            let hold = clock::deadline_after_ticks(1);
+            let _ = poll_until(hold, || false);
+            unsafe {
+                let sctl = read_reg32(abar, base + PXSCTL);
+                write_reg32(abar, base + PXSCTL, sctl & !0xF);
+            }
+            let deadline = clock::deadline_after_ticks(DEVICE_DETECT_TIMEOUT_TICKS);
+            if !poll_until(deadline, || unsafe { read_reg32(abar, base + PXSSTS) } & 0xF == 3) {
+                return false;
+            }
+            let deadline = clock::deadline_after_ticks(DEVICE_DETECT_TIMEOUT_TICKS);
+            if !poll_until(deadline, || {
+                (unsafe { read_reg32(abar, base + PXTFD) }) & (TFD_STS_BSY | TFD_STS_DRQ) == 0
+            }) {
+                return false;
+            }
+            unsafe { write_reg32(abar, base + PXSERR, 0xFFFF_FFFF) };
+        }
+
+        // 4. Restart the command engine (FRE was never cleared).
+        unsafe {
+            let cmd = read_reg32(abar, base + PXCMD);
+            write_reg32(abar, base + PXCMD, cmd | PXCMD_ST);
+        }
+        let deadline = clock::deadline_after_ticks(PORT_ENGINE_TIMEOUT_TICKS);
+        poll_until(deadline, || unsafe { read_reg32(abar, base + PXCMD) } & PXCMD_CR != 0)
+    }
+
     /// Issue IDENTIFY DEVICE (ATA8-ACS, 7.9) and decode the disk's total
-    /// LBA48 sector count -- Build Order Step 5 of the Phase 2 plan.
+    /// LBA48 sector count, identity strings, and cache/flush support --
+    /// remembered on `self` for [`Hba::flush_cache`].
     ///
     /// Returns `Err` (never panics) if the device doesn't support LBA48
     /// addressing, or reports (via a validity-checked IDENTIFY word) a
@@ -649,103 +869,96 @@ impl Hba {
     ///
     /// # Safety
     /// Must be called on an `Hba` returned by [`init`] (i.e. with a live,
-    /// running port) and not concurrently with any other command on this
-    /// `Hba` -- this driver has exactly one command slot.
-    pub unsafe fn identify(&self) -> Result<DiskInfo, &'static str> {
-        // SAFETY: `self` was constructed by `init`, which guarantees every
-        // field here names a live, running port and its command
-        // structures; `self.data_buf_phys` is a whole free 4 KiB frame,
-        // comfortably large enough for IDENTIFY DEVICE's fixed 512-byte
-        // response.
-        unsafe {
-            issue_ata_command(
-                self.abar,
-                self.port,
-                self.cmd_list_phys,
-                self.cmd_table_phys,
-                ATA_CMD_IDENTIFY_DEVICE,
-                0,
-                0,
-                self.data_buf_phys,
-                SECTOR_SIZE,
-                false,
-            )?;
-        }
+    /// running port).
+    pub unsafe fn identify(&mut self) -> Result<DiskInfo, &'static str> {
+        // SAFETY: `self` was constructed by `init`; `data_buf_phys` is a
+        // whole 4 KiB frame, comfortably large enough for IDENTIFY
+        // DEVICE's fixed 512-byte response.
+        unsafe { self.issue(ATA_CMD_IDENTIFY_DEVICE, 0, 0, SECTOR_SIZE, false, COMMAND_TIMEOUT_TICKS)? };
 
-        let words = self.data_buf_phys as *const u16;
-        // SAFETY: `issue_ata_command` above returned `Ok`, meaning the HBA
-        // DMA'd exactly 512 bytes (256 words) of IDENTIFY DEVICE data into
-        // `self.data_buf_phys` before clearing `PxCI` -- every word index
-        // read below (83, 100-103, 106) is within that range.
-        let word = |i: usize| unsafe { core::ptr::read_volatile(words.add(i)) };
+        let mut words = [0u16; 256];
+        // SAFETY: `issue` returned `Ok`, so the HBA DMA'd exactly 512
+        // bytes of IDENTIFY DEVICE data into `data_buf_phys` and has
+        // retired the command; `words` is exactly 512 bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.data_buf_phys as *const u16, words.as_mut_ptr(), 256);
+        }
+        let word_valid = |w: u16| w & 0xC000 == 0x4000;
 
         // Word 83: "Command sets supported." Valid only when bits 15:14
-        // read 0b01 (ATA8-ACS's own validity convention for this word);
-        // bit 10 is "48-bit Address feature set supported."
-        let word83 = word(83);
-        if word83 & 0xC000 != 0x4000 || word83 & (1 << 10) == 0 {
+        // read 0b01; bit 10 is "48-bit Address feature set supported."
+        let word83 = words[83];
+        if !word_valid(word83) || word83 & (1 << 10) == 0 {
             return Err("ahci: attached disk does not support LBA48 addressing -- unsupported by this driver");
         }
 
         // Word 106: "Physical/Logical Sector size." Same 0b01 validity
         // convention; bit 12 set means the logical sector is larger than
-        // 256 words (512 bytes) -- this driver only supports the 512-byte
-        // default, so treat that as an explicit error rather than silently
-        // mis-sizing every future read/write.
-        let word106 = word(106);
-        if word106 & 0xC000 == 0x4000 && word106 & (1 << 12) != 0 {
+        // 256 words (512 bytes).
+        let word106 = words[106];
+        if word_valid(word106) && word106 & (1 << 12) != 0 {
             return Err("ahci: attached disk reports a logical sector size other than 512 bytes -- unsupported by this driver");
         }
 
-        let total_sectors = u64::from(word(100))
-            | (u64::from(word(101)) << 16)
-            | (u64::from(word(102)) << 32)
-            | (u64::from(word(103)) << 48);
+        let total_sectors = u64::from(words[100])
+            | (u64::from(words[101]) << 16)
+            | (u64::from(words[102]) << 32)
+            | (u64::from(words[103]) << 48);
+
+        // Word 83 bit 13: FLUSH CACHE EXT supported; bit 12: FLUSH CACHE
+        // supported. Words 82/85 bit 5: volatile write cache supported /
+        // enabled, with word 85 valid only when word 87 reads 0b01.
+        let flush_command = if word83 & (1 << 13) != 0 {
+            Some(ATA_CMD_FLUSH_CACHE_EXT)
+        } else if word83 & (1 << 12) != 0 {
+            Some(ATA_CMD_FLUSH_CACHE)
+        } else {
+            None
+        };
+        let word82 = words[82];
+        let word85_valid = word_valid(words[87]);
+        let write_cache_disabled = word_valid(word83)
+            && (word82 & (1 << 5) == 0 || (word85_valid && words[85] & (1 << 5) == 0));
+
+        let mut model = [0u8; 40];
+        identify_string(&words[27..47], &mut model);
+        let mut serial = [0u8; 20];
+        identify_string(&words[10..20], &mut serial);
+
+        let info = DiskInfo {
+            total_sectors,
+            model,
+            serial,
+            flush_command,
+            write_cache_disabled,
+        };
         let total_bytes = total_sectors * u64::from(SECTOR_SIZE);
-
         let _ = debugcon::write_fmt(format_args!(
-            "[ahci] identify: total_sectors={total_sectors} ({SECTOR_SIZE}-byte sectors) = {total_bytes} bytes\n",
+            "[ahci] identify: model='{}' serial='{}' total_sectors={total_sectors} ({SECTOR_SIZE}-byte sectors) \
+             = {total_bytes} bytes flush=0x{:02x} write_cache_disabled={write_cache_disabled}\n",
+            info.model(),
+            info.serial(),
+            flush_command.unwrap_or(0),
         ));
-
-        Ok(DiskInfo { total_sectors })
+        self.info = Some(info);
+        Ok(info)
     }
 
     /// Read exactly one [`SECTOR_SIZE`]-byte logical sector at LBA `lba`
-    /// into `out` via READ DMA EXT (ATA8-ACS, 7.24) -- Build Order Step 6
-    /// of the Phase 2 plan. `save_format.rs` (landed in a later step) is
-    /// this primitive's first real multi-sector consumer.
+    /// into `out` via READ DMA EXT (ATA8-ACS, 7.24).
     ///
     /// # Safety
     /// Same contract as [`Hba::identify`]. `lba` must be within the disk's
-    /// addressable range (see [`Hba::identify`]'s [`DiskInfo::total_sectors`])
-    /// -- an out-of-range LBA is a device-reported error (caught via
-    /// `PxTFD.STS.ERR` inside [`issue_ata_command`], not undefined
-    /// behavior), but is still the caller's responsibility to avoid.
+    /// addressable range -- an out-of-range LBA is a device-reported error
+    /// (caught via `PxTFD.STS.ERR`, not undefined behavior), but is still
+    /// the caller's responsibility to avoid.
     pub unsafe fn read_sector(&self, lba: u64, out: &mut [u8; SECTOR_SIZE as usize]) -> Result<(), &'static str> {
-        // SAFETY: `self` was constructed by `init`, guaranteeing every
-        // field here names a live, running port and its command
-        // structures; `self.data_buf_phys` is a whole free 4 KiB frame,
-        // comfortably large enough for one `SECTOR_SIZE`-byte transfer.
-        unsafe {
-            issue_ata_command(
-                self.abar,
-                self.port,
-                self.cmd_list_phys,
-                self.cmd_table_phys,
-                ATA_CMD_READ_DMA_EXT,
-                lba,
-                1,
-                self.data_buf_phys,
-                SECTOR_SIZE,
-                false,
-            )?;
-        }
-        // SAFETY: `issue_ata_command` above returned `Ok`, meaning the HBA
-        // DMA'd exactly `SECTOR_SIZE` bytes into `self.data_buf_phys`
-        // before clearing `PxCI`; `out` is `SECTOR_SIZE` bytes by its own
-        // type, so this copy is in-bounds on both sides and the two
-        // buffers (a stack array and a separately-allocated DMA frame)
-        // cannot overlap.
+        // SAFETY: `self` was constructed by `init`.
+        unsafe { self.issue(ATA_CMD_READ_DMA_EXT, lba, 1, SECTOR_SIZE, false, COMMAND_TIMEOUT_TICKS)? };
+        // SAFETY: `issue` returned `Ok`, meaning the HBA DMA'd exactly
+        // `SECTOR_SIZE` bytes into `data_buf_phys` and retired the
+        // command; `out` is `SECTOR_SIZE` bytes by its own type, and a
+        // stack array cannot overlap the separately-allocated DMA frame.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 self.data_buf_phys as *const u8,
@@ -757,102 +970,50 @@ impl Hba {
     }
 
     /// Write exactly one [`SECTOR_SIZE`]-byte logical sector at LBA `lba`
-    /// from `data` via WRITE DMA EXT (ATA8-ACS, 7.63) -- Build Order Step 7
-    /// of the Phase 2 plan, this driver's first-ever write path to real
-    /// persistent storage.
+    /// from `data` via WRITE DMA EXT (ATA8-ACS, 7.63).
+    ///
+    /// Completion means the device accepted the data, which may still be
+    /// only in its volatile write cache -- call [`Hba::flush_cache`] at a
+    /// commit point before reporting anything as durably saved.
     ///
     /// # Safety
     /// Same contract as [`Hba::read_sector`].
     pub unsafe fn write_sector(&self, lba: u64, data: &[u8; SECTOR_SIZE as usize]) -> Result<(), &'static str> {
-        // SAFETY: `self.data_buf_phys` is a whole free 4 KiB frame,
-        // exclusively owned by this driver between commands (single-
-        // outstanding-command mode) -- copying the caller's data into it
-        // before issuing a host-to-device command is exactly what it's
-        // for.
+        if self.state.get() == PortState::Failed {
+            // Checked here as well as in `issue`: the scratch buffer may
+            // still belong to the HBA, so it must not even be filled.
+            return Err("ahci: save disk port is offline after an unrecoverable error (reboot to retry)");
+        }
+        // SAFETY: the port is `Ready`, so no command owns
+        // `data_buf_phys`; filling it before a host-to-device command is
+        // exactly what it is for.
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.data_buf_phys as *mut u8, SECTOR_SIZE as usize);
         }
-        // SAFETY: `self` was constructed by `init`, guaranteeing every
-        // field here names a live, running port and its command
-        // structures.
-        unsafe {
-            issue_ata_command(
-                self.abar,
-                self.port,
-                self.cmd_list_phys,
-                self.cmd_table_phys,
-                ATA_CMD_WRITE_DMA_EXT,
-                lba,
-                1,
-                self.data_buf_phys,
-                SECTOR_SIZE,
-                true,
-            )
-        }
+        // SAFETY: `self` was constructed by `init`.
+        unsafe { self.issue(ATA_CMD_WRITE_DMA_EXT, lba, 1, SECTOR_SIZE, true, COMMAND_TIMEOUT_TICKS) }
     }
 
-    /// Exercise `write_sector`/`read_sector` against real hardware -- the
-    /// same "prove it, don't just build it and hope" standard
-    /// `pmm::self_test` already established for the frame allocator (this
-    /// kernel's other, older, hardware-facing self-test). Build Order
-    /// Step 7's own verification requirement ("single-sector write +
-    /// immediate readback, byte-for-byte verified") landed as permanent,
-    /// every-boot regression coverage rather than a one-off manual check.
+    /// Make every write this device has completed so far durable, via
+    /// FLUSH CACHE EXT (or FLUSH CACHE). This is the durability barrier
+    /// `save_format.rs` places at each commit point.
     ///
-    /// Uses the disk's very last LBA as scratch space -- safely outside
-    /// `save_format.rs`'s superblock-plus-slots region, which starts at
-    /// LBA 0 (see the Phase 2 plan) -- and is non-destructive: whatever
-    /// was already there is read and remembered first, and restored
-    /// (write-back, then read-back-verified) once the pattern round-trip
-    /// is confirmed. Safe to call unconditionally on every boot, including
-    /// against a real save disk that already holds real save data.
+    /// Returns `Err` -- rather than silently succeeding -- if the device
+    /// supports neither flush command and IDENTIFY did not show its
+    /// volatile write cache as disabled: there is then no way to know the
+    /// data reached nonvolatile media.
     ///
     /// # Safety
-    /// Same contract as [`Hba::read_sector`]/[`Hba::write_sector`].
-    /// `total_sectors` should be the value [`Hba::identify`] returned for
-    /// this same `Hba` -- it is only ever used to pick the last LBA, so an
-    /// under-reported value would merely pick an earlier, still-in-range
-    /// scratch sector, never an out-of-range one.
-    pub unsafe fn self_test(&self, total_sectors: u64) -> Result<(), &'static str> {
-        if total_sectors == 0 {
-            return Err("ahci: self-test: disk reports zero total sectors");
+    /// Same contract as [`Hba::read_sector`]; [`Hba::identify`] must have
+    /// succeeded first.
+    pub unsafe fn flush_cache(&self) -> Result<(), &'static str> {
+        let info = self.info.as_ref().ok_or("ahci: flush requested before IDENTIFY")?;
+        match info.flush_command {
+            // SAFETY: `self` was constructed by `init`.
+            Some(cmd) => unsafe { self.issue(cmd, 0, 0, 0, false, FLUSH_TIMEOUT_TICKS) },
+            None if info.write_cache_disabled => Ok(()),
+            None => Err("ahci: device has a write cache but supports no FLUSH CACHE command -- durability cannot be guaranteed"),
         }
-        let scratch_lba = total_sectors - 1;
-
-        let mut original = [0u8; SECTOR_SIZE as usize];
-        unsafe { self.read_sector(scratch_lba, &mut original)? };
-
-        let mut pattern = [0u8; SECTOR_SIZE as usize];
-        for (i, b) in pattern.iter_mut().enumerate() {
-            *b = (i as u32 ^ 0xA5) as u8;
-        }
-        // Guard against the vanishingly unlikely case where the disk's
-        // last sector already happens to hold exactly this pattern --
-        // without this, a driver bug that left `write_sector` a total
-        // no-op could still pass the readback check purely by coincidence.
-        if original == pattern {
-            pattern[0] ^= 0xFF;
-        }
-
-        unsafe { self.write_sector(scratch_lba, &pattern)? };
-        let mut readback = [0u8; SECTOR_SIZE as usize];
-        unsafe { self.read_sector(scratch_lba, &mut readback)? };
-        if readback != pattern {
-            return Err("ahci: self-test: readback after write did not match what was written");
-        }
-
-        // Restore the sector's original contents so this self-test never
-        // permanently disturbs real data that happened to live there --
-        // and verify the restore itself, the same rigor applied to the
-        // write it's undoing.
-        unsafe { self.write_sector(scratch_lba, &original)? };
-        let mut restored = [0u8; SECTOR_SIZE as usize];
-        unsafe { self.read_sector(scratch_lba, &mut restored)? };
-        if restored != original {
-            return Err("ahci: self-test: restoring the scratch sector's original contents failed verification");
-        }
-
-        Ok(())
     }
 }
 

@@ -187,33 +187,60 @@ unsafe fn write_entry_raw(base: u64, entry: u32, value: u64) {
     }
 }
 
-/// Route the legacy ISA IRQ `irq` to `vector` on this CPU, honoring any
-/// MADT Interrupt Source Override for it (both the GSI translation and
-/// the polarity/trigger flags).
+/// One redirection entry programmed by [`stage_isa_irq`] but not yet
+/// delivering: the complete entry value is in place with only the mask
+/// bit set, so [`StagedRoute::activate`] is a single register write.
+#[derive(Clone, Copy)]
+pub struct StagedRoute {
+    base: u64,
+    entry: u32,
+    value: u64,
+}
+
+impl StagedRoute {
+    /// Unmask the entry: interrupts on this line are delivered to the
+    /// Local APIC from now on.
+    ///
+    /// # Safety
+    /// Only once the Local APIC owns EOIs (`lapic::enter_apic_mode`), and
+    /// with interrupts disabled across that switch and this call -- an
+    /// I/O APIC interrupt acknowledged at the 8259 is never retired.
+    pub unsafe fn activate(&self) {
+        unsafe { write_entry_raw(self.base, self.entry, self.value) };
+    }
+
+    /// Re-mask the entry, undoing [`stage_isa_irq`] or [`Self::activate`].
+    ///
+    /// # Safety
+    /// The I/O APIC must still be mapped (always true after [`init`]).
+    pub unsafe fn mask(&self) {
+        unsafe { write_entry_raw(self.base, self.entry, self.value | REDIR_MASKED) };
+    }
+}
+
+/// Program the route for legacy ISA IRQ `irq` to `vector` on this CPU,
+/// honoring any MADT Interrupt Source Override for it (both the GSI
+/// translation and the polarity/trigger flags) -- but leave the entry
+/// **masked**. Nothing is delivered through it until
+/// [`StagedRoute::activate`], which `main.rs` calls in the same
+/// interrupts-disabled section that moves EOI ownership to the Local
+/// APIC. Programming a live route while the 8259 still owns EOIs would
+/// let an interrupt be acknowledged at the wrong controller and stay in
+/// service at the LAPIC forever.
 ///
-/// This is the one function that turns "this kernel expects the keyboard
-/// on IRQ1" into a real, programmed hardware path, and every part of the
-/// translation it performs is read from the firmware's tables rather than
-/// assumed -- see this module's doc comment for what goes wrong when any
-/// piece of it is guessed instead.
+/// Every part of the translation this performs is read from the
+/// firmware's tables rather than assumed -- see this module's doc comment
+/// for what goes wrong when any piece of it is guessed instead.
 ///
 /// # Safety
 /// Must be called after [`init`] and `lapic::init` (the entry's
 /// destination field is this CPU's Local APIC ID, which only means
 /// anything once the LAPIC is enabled).
-pub unsafe fn route_isa_irq(info: &AcpiInfo, irq: u8, vector: u8) -> Result<(), &'static str> {
+pub unsafe fn stage_isa_irq(info: &AcpiInfo, irq: u8, vector: u8) -> Result<StagedRoute, &'static str> {
     let (gsi, flags) = info.resolve_isa_irq(irq);
     let Some((io, entry)) = info.io_apic_for_gsi(gsi, |io| unsafe { redirection_entry_count(io) }) else {
         return Err("ioapic: no I/O APIC covers the GSI this ISA IRQ maps to");
     };
-
-    // MPS INTI flags (ACPI 6.5, 5.2.12.5, Table 5-25): bits 1:0 are
-    // polarity -- 00 "conforms to bus specification" (for ISA: active
-    // high), 01 active high, 11 active low -- and bits 3:2 are trigger
-    // mode -- 00 conforms (for ISA: edge), 01 edge, 11 level. "Conforms"
-    // is resolved to the ISA defaults here rather than passed through,
-    // because the I/O APIC register has no "conforms" encoding: every
-    // bit has to be a concrete choice by the time it's written.
     let polarity = flags & 0b11;
     let trigger = (flags >> 2) & 0b11;
     let mut value = u64::from(vector);
@@ -223,26 +250,17 @@ pub unsafe fn route_isa_irq(info: &AcpiInfo, irq: u8, vector: u8) -> Result<(), 
     if trigger == 0b11 {
         value |= REDIR_LEVEL_TRIGGERED;
     }
-    // Destination: this CPU's Local APIC ID, in the entry's top byte.
-    // Delivery mode (bits 10:8) and destination mode (bit 11) are both
-    // left zero -- "fixed delivery, physical destination" -- which is
-    // exactly what a single-CPU kernel wants (see the module doc
-    // comment). Mask bit left clear: this entry goes live immediately.
     value |= u64::from(lapic::id()) << 56;
-
-    // SAFETY: `io` came from the MADT and was mapped by `init`; `entry`
-    // was bounds-checked against that controller's own reported entry
-    // count by `io_apic_for_gsi`.
-    unsafe { write_entry_raw(io.address, entry, value) };
-
+    let route = StagedRoute { base: io.address, entry, value };
+    unsafe { route.mask() };
     let _ = debugcon::write_fmt(format_args!(
         "[ioapic] routed ISA IRQ{irq} -> GSI {gsi} (io_apic id={} entry {entry}) -> vector 0x{vector:02x} \
-         polarity={} trigger={}\n",
+         polarity={} trigger={} (masked until handover)\n",
         io.id,
         if value & REDIR_ACTIVE_LOW != 0 { "low" } else { "high" },
         if value & REDIR_LEVEL_TRIGGERED != 0 { "level" } else { "edge" },
     ));
-    Ok(())
+    Ok(route)
 }
 
 /// Mask the redirection entry serving legacy ISA IRQ `irq`, so it stops
@@ -253,7 +271,7 @@ pub unsafe fn route_isa_irq(info: &AcpiInfo, irq: u8, vector: u8) -> Result<(), 
 /// claims.
 ///
 /// # Safety
-/// Same contract as [`route_isa_irq`].
+/// Same contract as [`stage_isa_irq`].
 pub unsafe fn mask_isa_irq(info: &AcpiInfo, irq: u8) -> Result<(), &'static str> {
     let (gsi, _flags) = info.resolve_isa_irq(irq);
     let Some((io, entry)) = info.io_apic_for_gsi(gsi, |io| unsafe { redirection_entry_count(io) }) else {

@@ -86,12 +86,16 @@ pub fn double_fault_stack_guard_range() -> (u64, u64) {
 /// Size, in bytes, of the dedicated mainline kernel stack -- the stack the
 /// shell and every WISP script run on for the rest of this program's life,
 /// once `main.rs`'s one-way stack switch (Build Order Step 4) lands on it.
-/// Generous relative to this kernel's actual call depth (the interpreter's
-/// own recursion is bounded by `value.rs`'s `MAX_VALUE_DEPTH`, and nothing
-/// in this codebase approaches even a fraction of this), matching the same
-/// "headroom, not a tight budget" reasoning as `DOUBLE_FAULT_STACK_SIZE`.
-/// Must be a multiple of 16 -- see [`mainline_stack_top`]'s doc comment.
-const MAINLINE_STACK_SIZE: usize = 256 * 1024;
+///
+/// Sized for the interpreter, the only deep recursion in the kernel. The
+/// tree-walker's native depth is bounded by `wisp::interp::MAX_NESTING`
+/// and the parser's by `wisp::parser::MAX_SYNTAX_DEPTH`, and those bounds
+/// were chosen from measured release-build frame sizes on this target so
+/// that their worst case (~770 KiB) fits here with margin. (It was 256
+/// KiB, which measurement showed a 256-deep WISP recursion alone would
+/// overrun: each nested call costs ~1.9 KiB of native stack.) Must be a
+/// multiple of 16 -- see [`mainline_stack_top`]'s doc comment.
+const MAINLINE_STACK_SIZE: usize = 1024 * 1024;
 
 /// Guard-paged for the identical reason as `DOUBLE_FAULT_STACK`, but this
 /// one matters far more in practice: this is the stack the shell and every

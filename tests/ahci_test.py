@@ -11,7 +11,7 @@ build/ESP/target-dir pattern (never touches the project's real `./esp` or
 the same way `tests/manual_save_load_check.py` already proved out
 manually.
 
-Three independent scenarios, each its own fresh boot (the AHCI driver, like
+Four independent scenarios, each its own fresh boot (the AHCI driver, like
 the fault handler in `fault_test.py`, is only ever exercised once per boot
 here -- no scenario depends on any other having run first):
 
@@ -47,10 +47,13 @@ here -- no scenario depends on any other having run first):
          disk image before boot -- reconstructed from `ahci::
          debug_dump_sector`'s hex-dump log lines, the same rigor
          `pmm::self_test`'s pattern write/read-back already established.
-       - The permanent write/read-back/restore self-test
-         (`Hba::self_test`) reports success.
-       - `save_format::ensure_formatted` reports success, and the on-disk
-         superblock this test then reads directly from the save-image file
+       - Boot leaves the (foreign-looking) disk untouched and unmounted;
+         `save` refuses it; a cancelled `format` writes nothing; `format`
+         + `ERASE` provisions it. No boot-time write self-test runs, and
+         the disk's last sector and everything past LBA 512 are verified
+         unchanged afterward (CODEBASE_AUDIT.md AUD-01/AUD-03).
+       - The on-disk superblock this test then reads directly from the
+         save-image file
          (magic/version/slot-count/slot-size) matches `save_format.rs`'s
          own constants exactly -- proof of the actual bytes on "disk," not
          just that the call returned `Ok`.
@@ -62,9 +65,13 @@ here -- no scenario depends on any other having run first):
          FNV-1a/32 checksum, and the type-tagged encoded payload -- matches
          `save_format.rs`'s documented on-disk layout exactly, not just
          what the shell happened to print.
+  4. `foreign_disk_untouched` -- a disk with an MBR signature and data
+     across the whole save region and its last sector. Boot plus save/load
+     attempts must leave the image's SHA-256 unchanged (AUD-01).
 
 Usage: tests/ahci_test.py [output_dir]
 """
+import hashlib
 import os
 import re
 import shutil
@@ -380,13 +387,50 @@ def scenario_full_stack():
     # and not the self-test's own i^0xA5 pattern, so a correct byte-for-
     # byte match against this specific pattern is real proof read_sector()
     # returns exactly what's on "disk," not a coincidence. bring_up_save_
-    # disk() reads and hex-dumps LBA 0 *before* ensure_formatted ever
-    # touches it, so this exact pattern is what the dump must show.
+    # disk() reads and hex-dumps LBA 0 at boot, and boot never writes,
+    # so this exact pattern is what the dump must show.
     known_pattern = bytes((i * 31 + 7) & 0xFF for i in range(SECTOR_SIZE))
+    last_sector_pattern = bytes((i * 17 + 3) & 0xFF for i in range(SECTOR_SIZE))
     with open(save_img, "r+b") as f:
         f.write(known_pattern)
+        f.seek(-SECTOR_SIZE, os.SEEK_END)
+        f.write(last_sector_pattern)
 
     def interact(mon):
+        # The seeded LBA 0 is not a WISP superblock, so boot must have left
+        # the disk unmounted: save refuses until it is explicitly formatted.
+        mon.type_text("save greeting too early")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("01_save_before_format"),
+            "not formatted",
+            f"{scenario} (save refuses an unformatted disk)",
+        )
+        # A cancelled format writes nothing.
+        mon.type_text("format")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("no")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("01_format_cancelled"),
+            "cancelled",
+            f"{scenario} (format can be cancelled)",
+        )
+        mon.type_text("format")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("ERASE")
+        mon.enter()
+        time.sleep(1.0)
+        acceptance_test.assert_ocr(
+            mon.screendump("01_format_done"),
+            "save disk formatted",
+            f"{scenario} (explicit format)",
+        )
+
         # The AHCI status lines main.rs prints to the console (controller
         # found, disk identified, self-test OK, save disk formatted) are
         # NOT re-checked here via OCR: by the time the shell banner scrolls
@@ -456,7 +500,7 @@ def scenario_full_stack():
         raise RuntimeError(f"[{scenario}] expected PxSIG=0x00000101 (SIG_ATA), found 0x{sig:08x}")
 
     # --- IDENTIFY DEVICE: exact sector count for a 64 MiB image ------------
-    m = re.search(r"\[ahci\] identify: total_sectors=(\d+) \(512-byte sectors\) = (\d+) bytes", log)
+    m = re.search(r"\[ahci\] identify: model='[^']*' serial='[^']*' total_sectors=(\d+) \(512-byte sectors\) = (\d+) bytes", log)
     if not m:
         raise RuntimeError(f"[{scenario}] expected an '[ahci] identify: total_sectors=...' line in the debug log")
     total_sectors, total_bytes = int(m.group(1)), int(m.group(2))
@@ -479,13 +523,13 @@ def scenario_full_stack():
             f"dumped=0x{dumped[first_diff]:02x} expected=0x{known_pattern[first_diff]:02x}"
         )
 
-    # --- Write/read-back/restore self-test ---------------------------------
-    assert_log_contains(
-        log, "[ahci] self-test OK (write/read-back/restore against the disk's last sector)", scenario
-    )
-
-    # --- save_format.rs formatted the disk ----------------------------------
-    assert_log_contains(log, "[save_format] disk formatted and ready", scenario)
+    # --- Boot left the foreign disk alone; `format` provisioned it ---------
+    # (CODEBASE_AUDIT.md AUD-01/AUD-03: no automatic format, no boot-time
+    # write self-test.)
+    assert_log_contains(log, "[save_format] disk holds foreign data; left untouched (not mounted)", scenario)
+    assert_log_contains(log, "[save_format] disk provisioned by explicit 'format' command", scenario)
+    if "[ahci] self-test" in log:
+        raise RuntimeError(f"[{scenario}] boot ran a disk self-test; boot must not write to the save disk")
 
     # --- Direct, host-side verification of the actual on-disk bytes --------
     # (QEMU has already been cleanly `quit`+terminated by run_and_capture,
@@ -506,6 +550,13 @@ def scenario_full_stack():
         raise RuntimeError(f"[{scenario}] on-disk slot_count {slot_count} != expected {SAVE_SLOT_COUNT}")
     if slot_size != SAVE_SLOT_SIZE:
         raise RuntimeError(f"[{scenario}] on-disk slot_size {slot_size} != expected {SAVE_SLOT_SIZE}")
+
+    # Nothing outside the save region may have been written: in particular
+    # the disk's last sector, which the old boot self-test used to clobber.
+    if raw[-SECTOR_SIZE:] != last_sector_pattern:
+        raise RuntimeError(f"[{scenario}] the disk's last sector was modified; only LBA 0-512 belong to WISP")
+    if any(raw[513 * SECTOR_SIZE:-SECTOR_SIZE]):
+        raise RuntimeError(f"[{scenario}] bytes beyond the save region (LBA 512) were written")
 
     # slot 0 must hold the "greeting" -> "hello world" save issued above --
     # the first (and only) key saved this boot, so it must have landed in
@@ -545,6 +596,48 @@ def scenario_full_stack():
     )
 
 
+def scenario_foreign_disk_untouched():
+    """CODEBASE_AUDIT.md AUD-01 regression: a disk that does not carry a
+    WISP save store -- here, an MBR partition table plus filesystem-like
+    data across the whole region WISP would use, and the final sector --
+    must come out of a boot, and of save/load attempts, byte-for-byte
+    identical."""
+    scenario = "foreign_disk_untouched"
+    scenario_dir = os.path.join(OUT_DIR, scenario)
+    os.makedirs(scenario_dir, exist_ok=True)
+    save_img = os.path.join(scenario_dir, "save.img")
+    subprocess.run(["qemu-img", "create", "-f", "raw", save_img, "64M"], check=True, capture_output=True)
+    with open(save_img, "r+b") as f:
+        for lba in range(520):
+            f.write(bytes(((lba * 7 + i) | 1) & 0xFF for i in range(SECTOR_SIZE)))
+        f.seek(510)
+        f.write(b"\x55\xaa")
+        f.seek(-SECTOR_SIZE, os.SEEK_END)
+        f.write(b"\xee" * SECTOR_SIZE)
+    with open(save_img, "rb") as f:
+        before = hashlib.sha256(f.read()).hexdigest()
+
+    def interact(mon):
+        mon.type_text("save x y")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("save_refused"), "not formatted", f"{scenario} (save refuses a foreign disk)"
+        )
+        mon.type_text("load x")
+        mon.enter()
+        time.sleep(0.3)
+
+    log, _ = run_and_capture(scenario, scenario_dir, save_img=save_img, interact=interact)
+    assert_boot_markers_once(log, scenario)
+    assert_log_contains(log, "[save_format] disk holds foreign data; left untouched (not mounted)", scenario)
+    with open(save_img, "rb") as f:
+        after = hashlib.sha256(f.read()).hexdigest()
+    if after != before:
+        raise RuntimeError(f"[{scenario}] the foreign disk was modified (sha256 {before} -> {after})")
+    print(f"==> PASS [{scenario}]: foreign disk byte-identical after boot and save/load attempts")
+
+
 def main():
     shutil.rmtree(OUT_DIR, ignore_errors=True)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -554,6 +647,7 @@ def main():
     scenario_no_controller()
     scenario_controller_no_disk()
     scenario_full_stack()
+    scenario_foreign_disk_untouched()
 
     print("==> ALL AHCI SCENARIOS PASSED")
     print(f"    artifacts under: {OUT_DIR}")

@@ -39,6 +39,25 @@
 //! adequate at this scale (64 slots), no index needed. See
 //! `docs/SAVE_FORMAT.md` for the full spec this module implements.
 //!
+//! # Ownership: probe at boot, provision only on request
+//!
+//! Boot only ever *reads* LBA 0 ([`probe`]). A disk is used for saves
+//! only if it already carries a complete, valid superblock. A blank or
+//! foreign disk is left byte-for-byte untouched and persistence stays
+//! unavailable until the user explicitly runs the shell's `format`
+//! command, which shows the device's identity and the exact sector range
+//! it will overwrite and asks for confirmation before calling
+//! [`provision`]. Every sector access goes through [`region_lba`], which
+//! rejects anything outside the `REGION_SECTORS` this format owns.
+//!
+//! # Durability
+//!
+//! [`save`] reports success only after its sector writes *and* a device
+//! cache flush ([`Hba::flush_cache`]) have completed. [`provision`]
+//! publishes the superblock last, after the cleared slots are flushed, so
+//! an interrupted format leaves a disk [`probe`] rejects rather than one
+//! it accepts with stale slot contents.
+//!
 //! # Value encoding
 //!
 //! A minimal type-tagged binary format: one tag byte, then a type-specific
@@ -48,21 +67,23 @@
 //! -- the same recursion guard the interpreter itself already uses for
 //! nested-list equality/display, not a separately-invented limit. [`save`]
 //! returns an explicit error (never silently truncates) if a value's
-//! encoded form is longer than [`VALUE_MAX_LEN`] bytes.
+//! encoded form is longer than [`VALUE_MAX_LEN`] bytes -- checked before
+//! every append, so a small but heavily shared list graph is rejected
+//! after at most `VALUE_MAX_LEN` bytes of work instead of being expanded
+//! in full first.
 
 use alloc::rc::Rc;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 use crate::ahci::Hba;
-use crate::wisp::value::{Value, MAX_VALUE_DEPTH};
+use crate::wisp::value::{ListCell, Value, MAX_VALUE_DEPTH};
 
 /// On-disk magic identifying a disk formatted for this store.
 pub const MAGIC: &[u8; 9] = b"WISPSAVE1";
 /// Bumped only if the on-disk layout ever changes incompatibly; a disk
 /// whose superblock reports a different version is treated as unreadable
-/// (see [`ensure_formatted`]) rather than misinterpreted.
+/// (see [`probe`]) rather than misinterpreted.
 const FORMAT_VERSION: u8 = 1;
 /// Number of fixed-size slots -- deliberately small and fixed rather than
 /// derived from disk size: 64 key/value pairs is far more than any WISP
@@ -86,6 +107,9 @@ pub const VALUE_MAX_LEN: usize = SLOT_SIZE as usize - SLOT_HEADER_LEN;
 
 const SUPERBLOCK_LBA: u64 = 0;
 const SLOTS_START_LBA: u64 = 1;
+/// Every sector this format owns: the superblock plus all slots
+/// (LBA 0 ..= 512). Nothing outside this range is ever read or written.
+pub const REGION_SECTORS: u64 = SLOTS_START_LBA + SLOT_COUNT as u64 * SECTORS_PER_SLOT as u64;
 
 const TAG_NIL: u8 = 0;
 const TAG_BOOL: u8 = 1;
@@ -95,6 +119,24 @@ const TAG_LIST: u8 = 4;
 
 fn slot_lba(slot_index: u16) -> u64 {
     SLOTS_START_LBA + (slot_index as u64) * (SECTORS_PER_SLOT as u64)
+}
+
+/// The single gate every sector access in this module passes through:
+/// `lba` must fall inside the region this format owns.
+fn region_lba(lba: u64) -> Result<u64, &'static str> {
+    if lba < REGION_SECTORS {
+        Ok(lba)
+    } else {
+        Err("save_format: internal error -- sector outside the save region")
+    }
+}
+
+unsafe fn read_region_sector(hba: &Hba, lba: u64, out: &mut [u8; crate::ahci::SECTOR_SIZE as usize]) -> Result<(), &'static str> {
+    unsafe { hba.read_sector(region_lba(lba)?, out) }
+}
+
+unsafe fn write_region_sector(hba: &Hba, lba: u64, data: &[u8; crate::ahci::SECTOR_SIZE as usize]) -> Result<(), &'static str> {
+    unsafe { hba.write_sector(region_lba(lba)?, data) }
 }
 
 /// Read one whole slot ([`SECTORS_PER_SLOT`] sectors) into a single
@@ -107,7 +149,7 @@ unsafe fn read_slot_raw(hba: &Hba, slot_index: u16) -> Result<[u8; SLOT_SIZE as 
     let base_lba = slot_lba(slot_index);
     for i in 0..SECTORS_PER_SLOT {
         let mut sector = [0u8; crate::ahci::SECTOR_SIZE as usize];
-        unsafe { hba.read_sector(base_lba + u64::from(i), &mut sector)? };
+        unsafe { read_region_sector(hba, base_lba + u64::from(i), &mut sector)? };
         let off = (i as usize) * crate::ahci::SECTOR_SIZE as usize;
         buf[off..off + crate::ahci::SECTOR_SIZE as usize].copy_from_slice(&sector);
     }
@@ -124,7 +166,7 @@ unsafe fn write_slot_raw(hba: &Hba, slot_index: u16, data: &[u8; SLOT_SIZE as us
         let off = (i as usize) * crate::ahci::SECTOR_SIZE as usize;
         let mut sector = [0u8; crate::ahci::SECTOR_SIZE as usize];
         sector.copy_from_slice(&data[off..off + crate::ahci::SECTOR_SIZE as usize]);
-        unsafe { hba.write_sector(base_lba + u64::from(i), &sector)? };
+        unsafe { write_region_sector(hba, base_lba + u64::from(i), &sector)? };
     }
     Ok(())
 }
@@ -160,45 +202,66 @@ fn fnv1a32(data: &[u8]) -> u32 {
     hash
 }
 
+/// Append `bytes` to `out`, or fail if that would take the encoding past
+/// [`VALUE_MAX_LEN`]. Checked *before* appending, so no encoding ever
+/// grows beyond one slot's capacity no matter how large the value's
+/// expansion would be.
+fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() > VALUE_MAX_LEN - out.len() {
+        return Err("save_format: serialized value is too large to fit in one slot");
+    }
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 /// Serialize `value` into `out` using the type-tagged binary format this
 /// module's doc comment describes. `depth` guards against unbounded
 /// recursion on a self-referential or pathologically deep list, mirroring
 /// `wisp::value::Value`'s own `MAX_VALUE_DEPTH`-bounded structural
-/// operations.
+/// operations; [`put`] bounds total work by the output budget, which a
+/// depth limit alone cannot (a shallow graph can share sublists
+/// exponentially).
 fn serialize_value(value: &Value, depth: u32, out: &mut Vec<u8>) -> Result<(), &'static str> {
     if depth >= MAX_VALUE_DEPTH {
         return Err("save_format: value nesting is too deep to serialize");
     }
     match value {
-        Value::Nil => out.push(TAG_NIL),
-        Value::Bool(b) => {
-            out.push(TAG_BOOL);
-            out.push(u8::from(*b));
-        }
+        Value::Nil => put(out, &[TAG_NIL])?,
+        Value::Bool(b) => put(out, &[TAG_BOOL, u8::from(*b)])?,
         Value::Int(i) => {
-            out.push(TAG_INT);
-            out.extend_from_slice(&i.to_le_bytes());
+            put(out, &[TAG_INT])?;
+            put(out, &i.to_le_bytes())?;
         }
         Value::Str(s) => {
-            out.push(TAG_STR);
             let bytes = s.as_bytes();
             let len =
                 u32::try_from(bytes.len()).map_err(|_| "save_format: string is too long to serialize")?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(bytes);
+            put(out, &[TAG_STR])?;
+            put(out, &len.to_le_bytes())?;
+            put(out, bytes)?;
         }
         Value::List(items) => {
-            out.push(TAG_LIST);
             let items = items.borrow();
             let count =
                 u32::try_from(items.len()).map_err(|_| "save_format: list is too long to serialize")?;
-            out.extend_from_slice(&count.to_le_bytes());
+            put(out, &[TAG_LIST])?;
+            put(out, &count.to_le_bytes())?;
             for item in items.iter() {
                 serialize_value(item, depth + 1, out)?;
             }
         }
     }
     Ok(())
+}
+
+/// Encode `value` for storage, failing (without allocating beyond one
+/// slot's worth) if it does not fit in [`VALUE_MAX_LEN`] bytes.
+pub fn encode(value: &Value) -> Result<Vec<u8>, &'static str> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(VALUE_MAX_LEN)
+        .map_err(|_| "save_format: out of memory preparing the value for saving")?;
+    serialize_value(value, 0, &mut out)?;
+    Ok(out)
 }
 
 /// Decode one value from the front of `bytes`, returning it along with the
@@ -260,54 +323,90 @@ fn deserialize_value(bytes: &[u8], depth: u32) -> Result<(Value, usize), &'stati
                 items.push(item);
                 consumed += item_len;
             }
-            Ok((Value::List(Rc::new(RefCell::new(items))), consumed))
+            Ok((Value::List(Rc::new(ListCell::new(items))), consumed))
         }
         _ => Err("save_format: unrecognized value type tag -- corrupt data"),
     }
 }
 
-/// Confirm `hba`'s disk already has a valid save-format superblock (magic
-/// and version both match), or -- on a disk that's never been formatted
-/// for this purpose (a fresh/zeroed disk, or any disk whose LBA 0 simply
-/// doesn't start with [`MAGIC`]) -- write a fresh superblock and zero every
-/// slot's in-use byte, so leftover bytes from whatever the disk previously
-/// held can never be mistaken for a real save slot.
-///
-/// Idempotent: calling this again against an already-formatted disk is a
-/// cheap no-op (one sector read, no writes). Must be called once before
-/// [`save`]/[`load`] against a given `Hba`.
+/// What [`probe`] found at LBA 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// A complete superblock this driver understands: save/load may use
+    /// the disk.
+    Formatted,
+    /// LBA 0 is all zeros: nothing recognizable, including an interrupted
+    /// earlier `format` (the superblock is written last).
+    Blank,
+    /// LBA 0 holds data that is not a WISP superblock (a partition table,
+    /// another filesystem, ...). Never touched without explicit consent.
+    Foreign,
+    /// A WISP superblock whose version or geometry this driver does not
+    /// understand.
+    Unsupported,
+}
+
+/// Read-only check of whether `hba`'s disk already carries a valid,
+/// complete save-format superblock. Issues exactly one sector read and no
+/// writes, whatever it finds -- boot calls this, never [`provision`].
 ///
 /// # Safety
-/// Same contract as [`Hba::read_sector`]/[`Hba::write_sector`].
-pub unsafe fn ensure_formatted(hba: &Hba, total_sectors: u64) -> Result<(), &'static str> {
-    let required_sectors = SLOTS_START_LBA + u64::from(SLOT_COUNT) * u64::from(SECTORS_PER_SLOT);
-    if total_sectors < required_sectors {
+/// Same contract as [`Hba::read_sector`].
+pub unsafe fn probe(hba: &Hba, total_sectors: u64) -> Result<Probe, &'static str> {
+    if total_sectors < REGION_SECTORS {
         return Err("save_format: disk is too small to hold the save-format region");
     }
-
     let mut sb = [0u8; crate::ahci::SECTOR_SIZE as usize];
-    unsafe { hba.read_sector(SUPERBLOCK_LBA, &mut sb)? };
+    unsafe { read_region_sector(hba, SUPERBLOCK_LBA, &mut sb)? };
 
-    if &sb[0..9] == MAGIC {
-        let version = sb[9];
-        if version != FORMAT_VERSION {
-            return Err("save_format: on-disk superblock version is not one this driver understands");
-        }
-        return Ok(());
+    if &sb[0..9] != MAGIC {
+        return Ok(if sb.iter().all(|&b| b == 0) { Probe::Blank } else { Probe::Foreign });
     }
+    let slot_count = u16::from_le_bytes([sb[10], sb[11]]);
+    let slot_size = u32::from_le_bytes([sb[12], sb[13], sb[14], sb[15]]);
+    if sb[9] != FORMAT_VERSION || slot_count != SLOT_COUNT || slot_size != SLOT_SIZE {
+        return Ok(Probe::Unsupported);
+    }
+    Ok(Probe::Formatted)
+}
+
+/// Format `hba`'s disk for save/load use, destroying LBA 0 ..
+/// [`REGION_SECTORS`] - 1. Only ever called after the user explicitly
+/// confirmed it (the shell's `format` command) -- never from boot.
+///
+/// Ordered so that an interruption at any point leaves a disk [`probe`]
+/// does not accept as formatted:
+/// 1. invalidate any existing superblock and flush,
+/// 2. clear every slot and flush,
+/// 3. publish the new superblock and flush.
+///
+/// # Safety
+/// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
+pub unsafe fn provision(hba: &Hba, total_sectors: u64) -> Result<(), &'static str> {
+    if total_sectors < REGION_SECTORS {
+        return Err("save_format: disk is too small to hold the save-format region");
+    }
+    let zero = [0u8; crate::ahci::SECTOR_SIZE as usize];
+    unsafe {
+        write_region_sector(hba, SUPERBLOCK_LBA, &zero)?;
+        hba.flush_cache()?;
+    }
+
+    let empty_slot = [0u8; SLOT_SIZE as usize]; // byte 0 (in-use flag) is 0 = free.
+    for slot_index in 0..SLOT_COUNT {
+        unsafe { write_slot_raw(hba, slot_index, &empty_slot)? };
+    }
+    unsafe { hba.flush_cache()? };
 
     let mut new_sb = [0u8; crate::ahci::SECTOR_SIZE as usize];
     new_sb[0..9].copy_from_slice(MAGIC);
     new_sb[9] = FORMAT_VERSION;
     new_sb[10..12].copy_from_slice(&SLOT_COUNT.to_le_bytes());
     new_sb[12..16].copy_from_slice(&SLOT_SIZE.to_le_bytes());
-    unsafe { hba.write_sector(SUPERBLOCK_LBA, &new_sb)? };
-
-    let empty_slot = [0u8; SLOT_SIZE as usize]; // byte 0 (in-use flag) is 0 = free.
-    for slot_index in 0..SLOT_COUNT {
-        unsafe { write_slot_raw(hba, slot_index, &empty_slot)? };
+    unsafe {
+        write_region_sector(hba, SUPERBLOCK_LBA, &new_sb)?;
+        hba.flush_cache()?;
     }
-
     Ok(())
 }
 
@@ -325,8 +424,13 @@ fn write_value_into_slot(
     let checksum = fnv1a32(encoded);
     raw[1 + KEY_MAX_LEN + 4..SLOT_HEADER_LEN].copy_from_slice(&checksum.to_le_bytes());
     raw[SLOT_HEADER_LEN..SLOT_HEADER_LEN + encoded.len()].copy_from_slice(encoded);
-    // SAFETY: same contract as this module's own `write_slot_raw`.
-    unsafe { write_slot_raw(hba, slot_index, &raw) }
+    // SAFETY: same contract as this module's own `write_slot_raw` and
+    // `Hba::flush_cache`. The flush is the commit point: without it a
+    // completed write may still sit only in the device's volatile cache.
+    unsafe {
+        write_slot_raw(hba, slot_index, &raw)?;
+        hba.flush_cache()
+    }
 }
 
 /// Store `value` under `key`, overwriting any existing value already saved
@@ -339,19 +443,15 @@ fn write_value_into_slot(
 /// Returns `Err` -- never silently truncates -- if `key` is empty or
 /// longer than 32 bytes, `value`'s serialized encoding is longer than
 /// [`VALUE_MAX_LEN`] bytes, or every slot is already occupied by a
-/// different key.
+/// different key. `Ok` means the slot was written *and* flushed.
 ///
 /// # Safety
 /// Same contract as [`Hba::read_sector`]/[`Hba::write_sector`]. The caller
-/// must have already called [`ensure_formatted`] on this same `Hba`.
+/// must have confirmed [`probe`] returned [`Probe::Formatted`] (or run
+/// [`provision`]) on this same `Hba`.
 pub unsafe fn save(hba: &Hba, key: &str, value: &Value) -> Result<(), &'static str> {
     validate_key(key)?;
-
-    let mut encoded = Vec::new();
-    serialize_value(value, 0, &mut encoded)?;
-    if encoded.len() > VALUE_MAX_LEN {
-        return Err("save_format: serialized value is too large to fit in one slot");
-    }
+    let encoded = encode(value)?;
 
     let wanted_key = key_field(key);
     let mut free_slot: Option<u16> = None;
@@ -387,7 +487,8 @@ pub unsafe fn save(hba: &Hba, key: &str, value: &Value) -> Result<(), &'static s
 ///
 /// # Safety
 /// Same contract as [`Hba::read_sector`]. The caller must have already
-/// called [`ensure_formatted`] on this same `Hba`.
+/// confirmed [`probe`] returned [`Probe::Formatted`] (or run
+/// [`provision`]) on this same `Hba`.
 pub unsafe fn load(hba: &Hba, key: &str) -> Result<Option<Value>, &'static str> {
     validate_key(key)?;
     let wanted_key = key_field(key);
@@ -426,4 +527,72 @@ pub unsafe fn load(hba: &Hba, key: &str) -> Result<Option<Value>, &'static str> 
     }
 
     Ok(None)
+}
+
+/// The save disk as the shell sees it: the AHCI device, its size, and
+/// whether it currently carries a valid store. Owning all three together
+/// is what lets `save`/`load` refuse an unformatted disk, and lets the
+/// `format` command mount the disk the moment provisioning succeeds.
+pub struct SaveDisk {
+    hba: Hba,
+    total_sectors: u64,
+    mounted: bool,
+}
+
+impl SaveDisk {
+    /// Wrap an identified `hba`. `mounted` must be `true` only if [`probe`]
+    /// returned [`Probe::Formatted`] for it.
+    pub fn new(hba: Hba, total_sectors: u64, mounted: bool) -> Self {
+        Self { hba, total_sectors, mounted }
+    }
+
+    pub fn hba(&self) -> &Hba {
+        &self.hba
+    }
+
+    pub fn total_sectors(&self) -> u64 {
+        self.total_sectors
+    }
+
+    pub fn is_mounted(&self) -> bool {
+        self.mounted
+    }
+
+    fn usable(&self) -> Result<(), &'static str> {
+        if self.hba.is_failed() {
+            Err("the save disk was taken offline after an unrecoverable error (reboot to retry)")
+        } else if !self.mounted {
+            Err("the save disk is not formatted for WISP -- run 'format' at the shell prompt to set it up")
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`save`] against this disk, if it is mounted.
+    pub fn save(&self, key: &str, value: &Value) -> Result<(), &'static str> {
+        self.usable()?;
+        // SAFETY: `hba` came from `ahci::init` and was identified, and
+        // `mounted` proves a valid superblock -- `save`'s contract.
+        unsafe { save(&self.hba, key, value) }
+    }
+
+    /// [`load`] against this disk, if it is mounted.
+    pub fn load(&self, key: &str) -> Result<Option<Value>, &'static str> {
+        self.usable()?;
+        // SAFETY: same reasoning as `SaveDisk::save`.
+        unsafe { load(&self.hba, key) }
+    }
+
+    /// [`provision`] this disk and mount it on success. The caller is
+    /// responsible for having obtained the user's explicit consent.
+    pub fn format(&mut self) -> Result<(), &'static str> {
+        if self.hba.is_failed() {
+            return Err("the save disk was taken offline after an unrecoverable error (reboot to retry)");
+        }
+        self.mounted = false;
+        // SAFETY: `hba` came from `ahci::init` and was identified.
+        unsafe { provision(&self.hba, self.total_sectors)? };
+        self.mounted = true;
+        Ok(())
+    }
 }

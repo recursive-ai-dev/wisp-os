@@ -2031,3 +2031,131 @@ directory -- the PDB was never shipped or used). Two builds of the same
 tree in different directories are now byte-identical, so anyone can
 check the prebuilt binary in a release against their own build. All four
 suites were re-run against the binary built this way.
+
+## Audit remediation (CODEBASE_AUDIT.md, AUD-01 to AUD-13)
+
+An external audit of the v1.0.0 snapshot reported 13 findings. All are
+addressed below. The QEMU suites were updated to match but could not be
+run in this environment (no QEMU); everything marked *tested* was checked
+by the new host-side suite, `tests/host` (`cargo test --release`, 28
+tests), which compiles `src/wisp` and `src/save_format.rs` unmodified
+against an in-memory disk with a volatile write cache.
+
+### Storage: boot never writes; explicit, ordered, durable provisioning
+
+- **AUD-01.** Boot no longer formats a disk. `save_format::probe` reads
+  LBA 0 and mounts only a complete, valid superblock (magic, version,
+  slot count, slot size); blank, foreign and unsupported disks are left
+  untouched and reported. The new shell command `format` shows the AHCI
+  port, model and serial (decoded from IDENTIFY), size, and the exact
+  destructive range, and proceeds only on typed `ERASE`. Every sector
+  access goes through `save_format::region_lba`, which rejects anything
+  outside LBA 0-512. *Tested:* probe issues no writes; provisioning
+  touches nothing outside the region. New QEMU scenario
+  `foreign_disk_untouched` hashes the whole image before and after boot.
+- **AUD-02.** `Hba::issue` now owns the whole command lifecycle. On a
+  timeout or task-file error it runs AHCI 1.3.1 6.2.2.1 recovery: clear
+  `PxCMD.ST`, wait for `PxCMD.CR` to drop and verify `PxCI` is clear
+  (only then has the HBA released the command table and data buffer),
+  clear `PxSERR`/`PxIS`, COMRESET if the device is still BSY/DRQ, and
+  restart. If quiescence cannot be proven the port is marked failed:
+  every later request fails before touching MMIO or DMA memory, and the
+  frames stay allocated.
+- **AUD-03.** The write/read-back/restore boot self-test is gone. The
+  shell `save`/`load` round trip on a disposable test image covers the
+  write path in `tests/ahci_test.py`, which now also checks the disk's
+  last sector is unchanged.
+- **AUD-04.** `Hba::flush_cache` issues FLUSH CACHE EXT (or FLUSH CACHE),
+  chosen from IDENTIFY words 82/83/85/87. `save` succeeds only after the
+  slot write *and* the flush; a device with a write cache and no flush
+  command makes `save` fail rather than report unbacked success.
+  *Tested:* a successful save survives simulated power loss; a failed
+  flush is reported.
+- **AUD-12.** `provision` invalidates LBA 0 and flushes, clears the slots
+  and flushes, then publishes the superblock and flushes. *Tested:* a
+  failure injected at every write, followed by power loss, never yields
+  a disk `probe` accepts unless nothing durable changed (and a mutation
+  that restores the old superblock-first order fails the test).
+
+### Interrupts and USB
+
+- **AUD-05.** `ioapic::stage_isa_irq` programs a redirection entry fully
+  but masked. `main.rs` stages IRQ1 and IRQ0 (re-masking IRQ1 if IRQ0
+  fails), then in one interrupts-disabled section masks the 8259, moves
+  EOI ownership to the LAPIC, unmasks both routes, and drains any PS/2
+  byte that arrived during the switch (IRQ1 is edge-triggered; an
+  unread byte would otherwise suppress every later edge).
+- **AUD-06.** `next_event` reads the cycle-bit dword first and the
+  payload only after ownership is established.
+- **AUD-11.** Keyboard transfers request the 8-byte boot report, not
+  `wMaxPacketSize`. Success and Short Packet completions are both
+  decoded when the transferred length (request minus residual) is a full
+  report, and only for the event matching the outstanding TRB, slot and
+  endpoint.
+
+### Memory
+
+- **AUD-07.** `fs::snapshot_apps` checks each file's advertised size
+  against a per-file (256 KiB) and remaining aggregate (1 MiB) budget
+  before allocating, allocates fallibly, rejects truncated reads, caps
+  file count (64) and name length, and logs every skipped file by name.
+  `run` borrows the source instead of cloning it.
+- **AUD-08.** Serialization checks the 4055-byte slot budget before every
+  append. Display stops at 16 KiB with `...(truncated)`; `str()` of a
+  longer value is an error; `print` streams each argument instead of
+  concatenating them. Equality memoizes list-identity pairs (linear on
+  shared graphs; bisimulation for cycles) under a 100,000-step budget.
+  *Tested:* the audit's 23-list graph prints, fails `str()` and `save()`
+  cleanly, and leaks nothing; two 41-list graphs compare instantly.
+- **AUD-09.** Lists are now `Rc<ListCell>`. The interpreter records a
+  weak handle to every list a run creates (and to lists `load` returns)
+  and empties all of them when the run ends, which breaks every cycle.
+  `ListCell`'s `Drop` is iterative, so a 200,000-deep chain frees without
+  recursion. Strings are capped at 256 KiB and lists at 32,768
+  elements, both allocated fallibly, and the shell stops a script with
+  "out of memory" when free heap falls below a 1.5 MiB reserve (a new
+  O(1) `allocator::free_bytes` counter, checked by the heap self-test).
+  *Tested:* repeated runs creating 10,000 cyclic lists return to the
+  same live-byte count.
+- **AUD-13.** The lexer decodes non-ASCII characters inside string
+  literals as UTF-8 instead of casting bytes to `char`. *Tested:* `é`,
+  CJK and emoji keep their bytes and lengths through `len` and `save`.
+
+### Native stack depth (AUD-10)
+
+Measured, not assumed. Frame sizes were read from the UEFI-target
+assembly (`cargo rustc --release -- --emit=asm`, prologue `push`/`sub
+rsp`) and cross-checked by running scripts on bounded host threads:
+
+- Before: `eval_expr` and `exec_stmt` were 480 bytes each, `parse_stmt`
+  1088, and every parser precedence level about 300. One nested WISP
+  call cost ~1.9 KiB, so the documented 256-call limit needed ~470 KiB
+  against a **256 KiB** stack; one parenthesis level cost ~2 KiB.
+- The recursive match arms are now separate never-inlined functions
+  (`eval_expr` 160 bytes) and the parser uses precedence climbing (one
+  frame per sub-expression instead of six): a parenthesis level is now
+  ~1 KiB.
+- New limits: `parser::MAX_SYNTAX_DEPTH` = 128 (blocks, sub-expressions,
+  unary operators, indexing and each operator in a chain all count, so
+  a flat `1 + 1 + ...` is bounded too), and `interp::MAX_NESTING` = 1024
+  units shared by statements, expressions and calls. The costliest unit
+  is ~750 bytes, so the worst case is ~770 KiB.
+- The guard-paged mainline stack is now 1 MiB (zero-fill; the binary
+  size is unchanged).
+- Function bodies are shared (`Rc<FuncDecl>`) instead of deep-cloned.
+
+*Tested* on a 640 KiB host stack: 250-deep recursion succeeds;
+runaway recursion, 50 nested `while` bodies per call, 50-level
+expressions per call, 20,000 parentheses, 50,000-term chains and 5,000
+nested blocks all end in a WISP error.
+
+### Not addressed
+
+- The save store still owns the whole disk's first 513 sectors rather
+  than a WISP partition; `format` makes that explicit and confirmed.
+- Slot updates are still not atomic (documented in SAVE_FORMAT.md);
+  flushing makes them durable, not crash-atomic.
+- The audit's "possible firmware-memory overlap" (verification gap 6) was
+  not investigated.
+- `SHA256SUMS` in the repository root describes the v1.0.0 release and
+  is regenerated by `scripts/make_release.sh`.

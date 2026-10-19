@@ -176,6 +176,12 @@ const TRB_IDT: u32 = 1 << 6;
 /// command or transfer is a real failure this driver reports rather
 /// than proceeds past.
 const COMPLETION_SUCCESS: u32 = 1;
+/// Completion code 13: Short Packet -- the transfer completed with fewer
+/// bytes than requested; the event's residual length says how many.
+const COMPLETION_SHORT_PACKET: u32 = 13;
+/// A HID boot-protocol keyboard input report is exactly 8 bytes
+/// (HID 1.11, Appendix B.1).
+const BOOT_REPORT_LEN: u32 = 8;
 
 /// TRBs per ring. One page holds 256 16-byte TRBs; the last is reserved
 /// for the Link TRB that closes the ring, leaving 255 usable.
@@ -357,6 +363,9 @@ struct Event {
     /// Dword 2's low 24 bits: for a Transfer Event, the residual
     /// untransferred byte count.
     transfer_length: u32,
+    /// Dword 3 bits 20:16: for a Transfer Event, the Device Context
+    /// Index of the endpoint that generated it.
+    endpoint_id: u8,
     /// Dword 3 bits 31:24: the slot ID this event belongs to (or, for
     /// Enable Slot, the slot just assigned).
     slot_id: u8,
@@ -414,9 +423,15 @@ struct Keyboard {
     /// Physical address of the 8-byte report buffer the controller DMAs
     /// each report into.
     report_phys: u64,
-    /// Bytes per report, from the endpoint descriptor's `wMaxPacketSize`
-    /// (8 for a boot keyboard, but read rather than assumed).
+    /// Bytes requested per transfer: always [`BOOT_REPORT_LEN`]. This is
+    /// the HID boot report size, *not* the endpoint's `wMaxPacketSize`,
+    /// which is only a transport limit -- a keyboard advertising 16 or 64
+    /// still sends 8-byte reports, and requesting the larger size turns
+    /// every report into a Short Packet completion.
     report_len: u32,
+    /// Physical address of the Normal TRB currently queued, so its
+    /// Transfer Event can be matched to it (valid while `armed`).
+    pending_trb: u64,
     /// True while a Normal TRB is queued and awaiting its Transfer
     /// Event. Exactly one is ever outstanding: this driver re-arms only
     /// after consuming the previous report, which keeps the transfer
@@ -728,18 +743,31 @@ impl Xhci {
         let index = self.event_ring.dequeue;
         // SAFETY: `event_ring.phys` is an owned, identity-mapped frame
         // and `index` is always < TRBS_PER_RING.
-        let (d0, d1, d2, d3) = unsafe {
-            let trb = (self.event_ring.phys as *const u32).add(index * 4);
+        let trb = unsafe { (self.event_ring.phys as *const u32).add(index * 4) };
+
+        // Ownership first: dword 3 carries the cycle bit, and until it
+        // matches this consumer's cycle state the controller has not
+        // published this TRB -- dwords 0-2 may be stale. Reading the
+        // payload before the cycle bit would allow an event published
+        // between the two reads to be accepted with the *previous*
+        // occupant's payload (xHCI 1.2, 4.9.4).
+        // SAFETY: as above.
+        let d3 = unsafe { trb.add(3).read_volatile() };
+        if (d3 & TRB_CYCLE) != self.event_ring.cycle {
+            return None;
+        }
+        // Order the payload reads after the ownership read. x86 does not
+        // reorder loads with other loads, and the controller writes the
+        // cycle dword last, so a compiler barrier is all this needs here.
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: as above.
+        let (d0, d1, d2) = unsafe {
             (
                 trb.read_volatile(),
                 trb.add(1).read_volatile(),
                 trb.add(2).read_volatile(),
-                trb.add(3).read_volatile(),
             )
         };
-        if (d3 & TRB_CYCLE) != self.event_ring.cycle {
-            return None;
-        }
         // Every field must be read before the dequeue pointer is
         // advanced and published: once ERDP names a later TRB, the
         // controller is free to overwrite this one.
@@ -750,6 +778,7 @@ impl Xhci {
             completion_code: (d2 >> 24) & 0xFF,
             pointer: u64::from(d0) | (u64::from(d1) << 32),
             transfer_length: d2 & 0x00FF_FFFF,
+            endpoint_id: ((d3 >> 16) & 0x1F) as u8,
             slot_id: ((d3 >> 24) & 0xFF) as u8,
         };
 
@@ -1380,16 +1409,18 @@ impl Xhci {
             );
             ctx_write(input_ctx, cs, ep_index, 2, (kbd_ring.phys as u32) | 1);
             ctx_write(input_ctx, cs, ep_index, 3, (kbd_ring.phys >> 32) as u32);
-            // Average TRB Length and Max ESIT Payload: both the report
-            // size for a keyboard. These are scheduling hints, but a
-            // zero Average TRB Length is rejected outright by some
-            // controllers rather than treated as "unknown."
+            // Average TRB Length (the boot report size every TRB on this
+            // ring requests) and Max ESIT Payload (the most the endpoint
+            // can move per service interval: one max-size packet). These
+            // are scheduling hints, but a zero Average TRB Length is
+            // rejected outright by some controllers rather than treated
+            // as "unknown."
             ctx_write(
                 input_ctx,
                 cs,
                 ep_index,
                 4,
-                u32::from(iface.max_packet_size) | (u32::from(iface.max_packet_size) << 16),
+                BOOT_REPORT_LEN | (u32::from(iface.max_packet_size) << 16),
             );
 
             self.run_command(
@@ -1429,7 +1460,8 @@ impl Xhci {
             endpoint_dci: dci,
             transfer_ring: kbd_ring,
             report_phys: report_buf,
-            report_len: u32::from(iface.max_packet_size),
+            report_len: BOOT_REPORT_LEN,
+            pending_trb: 0,
             armed: false,
         });
         unsafe { self.arm_report_transfer() };
@@ -1451,14 +1483,14 @@ impl Xhci {
         if kbd.armed {
             return;
         }
-        unsafe {
+        kbd.pending_trb = unsafe {
             kbd.transfer_ring.push(
                 kbd.report_phys as u32,
                 (kbd.report_phys >> 32) as u32,
                 kbd.report_len,
                 (TRB_TYPE_NORMAL << 10) | TRB_IOC,
-            );
-        }
+            )
+        };
         kbd.armed = true;
         self.keyboard = Some(kbd);
         compiler_fence(Ordering::SeqCst);
@@ -1480,7 +1512,17 @@ impl Xhci {
             match event.trb_type {
                 TRB_TYPE_TRANSFER_EVENT => {
                     let Some(kbd) = self.keyboard else { continue };
-                    if event.slot_id != kbd.slot_id {
+                    // Only the keyboard's own outstanding transfer retires
+                    // it: same slot, same endpoint, same TRB.
+                    if !kbd.armed
+                        || event.slot_id != kbd.slot_id
+                        || u32::from(event.endpoint_id) != kbd.endpoint_dci
+                        || event.pointer != kbd.pending_trb
+                    {
+                        let _ = debugcon::write_fmt(format_args!(
+                            "[xhci] ignoring transfer event for slot {} ep {} trb 0x{:x} (code {})\n",
+                            event.slot_id, event.endpoint_id, event.pointer, event.completion_code,
+                        ));
                         continue;
                     }
                     // A Transfer Event retires the TRB it names, so the
@@ -1489,29 +1531,42 @@ impl Xhci {
                     if let Some(k) = self.keyboard.as_mut() {
                         k.armed = false;
                     }
-                    if event.completion_code == COMPLETION_SUCCESS {
-                        let mut report = [0u8; 8];
-                        // SAFETY: `report_phys` is an owned, identity-
-                        // mapped frame the controller just DMA'd this
-                        // report into; only the first 8 bytes are read,
-                        // and a boot-protocol report is exactly 8.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                kbd.report_phys as *const u8,
-                                report.as_mut_ptr(),
-                                8,
-                            );
+                    match event.completion_code {
+                        COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET => {
+                            // The event's length field is the residual
+                            // (untransferred) byte count; it can never
+                            // legitimately exceed what was requested.
+                            let transferred = kbd.report_len.checked_sub(event.transfer_length);
+                            match transferred {
+                                Some(n) if n >= BOOT_REPORT_LEN => {
+                                    let mut report = [0u8; 8];
+                                    // SAFETY: `report_phys` is an owned,
+                                    // identity-mapped frame the controller
+                                    // just DMA'd at least 8 bytes into.
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            kbd.report_phys as *const u8,
+                                            report.as_mut_ptr(),
+                                            8,
+                                        );
+                                    }
+                                    on_report(&report);
+                                }
+                                _ => {
+                                    // A truncated report: decoding it would
+                                    // read stale bytes from the last one.
+                                    let _ = debugcon::write_fmt(format_args!(
+                                        "[xhci] keyboard report rejected: residual {} of {} requested bytes\n",
+                                        event.transfer_length, kbd.report_len,
+                                    ));
+                                }
+                            }
                         }
-                        on_report(&report);
-                    } else if event.completion_code != 13 {
-                        // Completion code 13 is Short Packet, which for
-                        // an interrupt endpoint is entirely normal and
-                        // not worth a log line every time nothing is
-                        // pressed. Anything else is a real anomaly.
-                        let _ = debugcon::write_fmt(format_args!(
-                            "[xhci] keyboard transfer completed with code {}\n",
-                            event.completion_code,
-                        ));
+                        code => {
+                            let _ = debugcon::write_fmt(format_args!(
+                                "[xhci] keyboard transfer completed with code {code}\n",
+                            ));
+                        }
                     }
                     unsafe { self.arm_report_transfer() };
                 }

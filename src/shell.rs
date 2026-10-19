@@ -189,19 +189,19 @@ pub struct Shell {
     /// `Shell::new`); never re-seeded, so successive `run` invocations of
     /// different scripts don't repeat the same sequence.
     rng_state: u64,
-    /// The AHCI save disk, already formatted and ready for
-    /// `save_format::save`/`load` -- `None` if `main.rs`'s
-    /// `bring_up_save_disk` couldn't get one working this boot (see its
-    /// own doc comment for the first-class failure modes that lead here).
+    /// The AHCI save disk -- `None` if `main.rs`'s `bring_up_save_disk`
+    /// found no usable disk this boot (see its own doc comment for the
+    /// first-class failure modes that lead here). A present disk may still
+    /// be unmounted (blank or foreign) until `format` provisions it.
     /// Owned here, not dropped after boot, specifically so `save`/`load`
     /// (this module's own commands below, and the WISP builtins that will
     /// route through them in a later Build Order step) can issue commands
     /// at any later point in the shell's lifetime.
-    save_disk: Option<ahci::Hba>,
+    save_disk: Option<save_format::SaveDisk>,
 }
 
 impl Shell {
-    pub fn new(apps: alloc::vec::Vec<(String, String)>, save_disk: Option<ahci::Hba>) -> Self {
+    pub fn new(apps: alloc::vec::Vec<(String, String)>, save_disk: Option<save_format::SaveDisk>) -> Self {
         Self {
             apps,
             rng_state: seed_rng(),
@@ -260,6 +260,7 @@ impl Shell {
             "mem" => self.cmd_mem(console),
             "save" => self.cmd_save(rest, console),
             "load" => self.cmd_load(rest, console),
+            "format" => self.cmd_format(console),
             // Hidden, feature-gated, never listed in `cmd_help`: exists
             // purely so `tests/fault_test.py` can prove the GDT/IDT/
             // fault-screen path built in this phase actually catches and
@@ -394,6 +395,7 @@ impl Shell {
              \x20\x20version       Show the kernel version and protections\n\
              \x20\x20save <k> <v>  Save <v> under key <k> on the AHCI save disk\n\
              \x20\x20load <k>      Print the value saved under key <k>\n\
+             \x20\x20format        Set up the AHCI disk for save/load (ERASES it; asks first)\n\
              Press Esc to stop a running program.\n",
         );
     }
@@ -420,17 +422,14 @@ impl Shell {
             console.set_fg(gfx::FOREGROUND);
             return;
         }
-        let Some(hba) = self.save_disk.as_ref() else {
+        let Some(disk) = self.save_disk.as_ref() else {
             console.set_fg(gfx::ERROR);
             console.write_str("save: no AHCI save disk available this boot\n");
             console.set_fg(gfx::FOREGROUND);
             return;
         };
         let value = Value::Str(Rc::new(value_text.to_string()));
-        // SAFETY: `hba` came from `main.rs`'s `bring_up_save_disk`, which
-        // already called `save_format::ensure_formatted` on it before
-        // handing it to this shell -- `save_format::save`'s own contract.
-        match unsafe { save_format::save(hba, key, &value) } {
+        match disk.save(key, &value) {
             Ok(()) => {
                 let _ = write!(console, "saved '{key}'\n");
             }
@@ -452,14 +451,13 @@ impl Shell {
             console.set_fg(gfx::FOREGROUND);
             return;
         }
-        let Some(hba) = self.save_disk.as_ref() else {
+        let Some(disk) = self.save_disk.as_ref() else {
             console.set_fg(gfx::ERROR);
             console.write_str("load: no AHCI save disk available this boot\n");
             console.set_fg(gfx::FOREGROUND);
             return;
         };
-        // SAFETY: same reasoning as `cmd_save`.
-        match unsafe { save_format::load(hba, key) } {
+        match disk.load(key) {
             Ok(Some(value)) => {
                 let _ = write!(console, "{}\n", value.to_display_string());
             }
@@ -469,6 +467,60 @@ impl Shell {
             Err(msg) => {
                 console.set_fg(gfx::ERROR);
                 let _ = write!(console, "load: {msg}\n");
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+    }
+
+    /// `format`: provision the AHCI disk as a WISP save store. This is the
+    /// only path that ever writes outside an existing store, so it names
+    /// the exact device and the exact destructive range, and proceeds
+    /// only if the user types the confirmation word in full.
+    fn cmd_format(&mut self, console: &mut Console) {
+        let Some(disk) = self.save_disk.as_mut() else {
+            console.set_fg(gfx::ERROR);
+            console.write_str("format: no AHCI save disk available this boot\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        };
+        let (model, serial) = match disk.hba().info() {
+            Some(info) => (info.model(), info.serial()),
+            None => ("?", "?"),
+        };
+        let total = disk.total_sectors();
+        console.set_fg(gfx::ERROR);
+        let _ = write!(
+            console,
+            "format: this ERASES sectors 0-{} ({} KiB, including any partition table) of:\n\
+             \x20 AHCI port {}  model '{model}'  serial '{serial}'  {} MiB\n\
+             {}\
+             Type ERASE to continue, anything else to cancel: ",
+            save_format::REGION_SECTORS - 1,
+            save_format::REGION_SECTORS * u64::from(ahci::SECTOR_SIZE) / 1024,
+            disk.hba().port(),
+            total * u64::from(ahci::SECTOR_SIZE) / (1024 * 1024),
+            if disk.is_mounted() {
+                "It currently holds a WISP save store; every saved value will be lost.\n"
+            } else {
+                ""
+            },
+        );
+        console.set_fg(gfx::FOREGROUND);
+        let answer = read_line(console, LineMode::Program);
+        console.newline();
+        keyboard::clear_stop_request();
+        if answer.trim() != "ERASE" {
+            console.write_str("format: cancelled, nothing was written\n");
+            return;
+        }
+        match disk.format() {
+            Ok(()) => {
+                console.write_str("format: save disk formatted (save/load available)\n");
+                crate::debugcon::write_str("[save_format] disk provisioned by explicit 'format' command\n");
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = write!(console, "format: {msg} (save/load unavailable)\n");
                 console.set_fg(gfx::FOREGROUND);
             }
         }
@@ -511,8 +563,10 @@ impl Shell {
         }
 
         let filename = resolve_program_filename(name);
+        // Borrowed, not cloned: a second full copy of the source would
+        // double its heap residency for the whole run.
         let source = match self.apps.iter().find(|(n, _)| n.eq_ignore_ascii_case(&filename)) {
-            Some((_, s)) => s.clone(),
+            Some((_, s)) => s.as_str(),
             None => {
                 console.set_fg(gfx::ERROR);
                 let _ = write!(console, "run: '{filename}' not found in the APPS snapshot\n");
@@ -530,7 +584,7 @@ impl Shell {
             save_disk: self.save_disk.as_ref(),
             last_usb_poll_tick: u64::MAX,
         };
-        let result = wisp::run_source(&source, &mut host);
+        let result = wisp::run_source(source, &mut host);
         // And a clean exit: keys typed into the program (including the Esc
         // that stopped it) never spill into the shell prompt.
         keyboard::clear_stop_request();
@@ -598,6 +652,13 @@ impl Shell {
         );
     }
 }
+
+/// Free heap a running script may not dip below: when it does, the
+/// interpreter stops the script (see `wisp::interp::Host::memory_low`)
+/// while there is still room to report the error and reclaim what the
+/// script built. Comfortably larger than any single allocation a script
+/// can request in one step (`wisp::value`'s string/list/display caps).
+const SCRIPT_HEAP_RESERVE: usize = 1536 * 1024;
 
 /// `run <name>` always resolves against the `APPS` snapshot, auto-appending
 /// `.wisp` when `name` has no extension of its own, per
@@ -690,7 +751,7 @@ fn next_rand_u64(state: &mut u64) -> u64 {
 struct ShellHost<'a> {
     console: &'a mut Console,
     rng: &'a mut u64,
-    save_disk: Option<&'a ahci::Hba>,
+    save_disk: Option<&'a save_format::SaveDisk>,
     /// The tick at which the USB keyboard was last polled for Esc by
     /// [`wisp::interp::Host::stop_requested`]; see that method.
     last_usb_poll_tick: u64,
@@ -736,6 +797,10 @@ impl wisp::interp::Host for ShellHost<'_> {
         keyboard::stop_requested()
     }
 
+    fn memory_low(&mut self) -> bool {
+        allocator::free_bytes() < SCRIPT_HEAP_RESERVE
+    }
+
     fn time_ms(&mut self) -> u64 {
         clock::uptime_ms()
     }
@@ -745,17 +810,11 @@ impl wisp::interp::Host for ShellHost<'_> {
     }
 
     fn save(&mut self, key: &str, value: &Value) -> Result<(), &'static str> {
-        let hba = self.save_disk.ok_or("no AHCI save disk available this boot")?;
-        // SAFETY: `hba` came from `main.rs`'s `bring_up_save_disk`, which
-        // already called `save_format::ensure_formatted` on it before
-        // handing it to this shell -- `save_format::save`'s own contract.
-        unsafe { save_format::save(hba, key, value) }
+        self.save_disk.ok_or("no AHCI save disk available this boot")?.save(key, value)
     }
 
     fn load(&mut self, key: &str) -> Result<Option<Value>, &'static str> {
-        let hba = self.save_disk.ok_or("no AHCI save disk available this boot")?;
-        // SAFETY: same reasoning as `save` above.
-        unsafe { save_format::load(hba, key) }
+        self.save_disk.ok_or("no AHCI save disk available this boot")?.load(key)
     }
 
     // ---- WISP v2: pixel/graphics primitives ----------------------------

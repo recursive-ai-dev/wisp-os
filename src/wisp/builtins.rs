@@ -7,8 +7,8 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::interp::{Host, STOPPED_MESSAGE};
-use super::value::Value;
+use super::interp::{Host, OUT_OF_MEMORY_MESSAGE, STOPPED_MESSAGE};
+use super::value::{Value, MAX_DISPLAY_LEN, MAX_LIST_LEN};
 use super::WispError;
 
 pub fn is_builtin(name: &str) -> bool {
@@ -37,6 +37,9 @@ pub fn is_builtin(name: &str) -> bool {
     )
 }
 
+// Never inlined into the interpreter: its frame (every builtin's locals)
+// would otherwise be paid at every level of WISP function recursion.
+#[inline(never)]
 pub fn call(
     host: &mut dyn Host,
     name: &str,
@@ -152,15 +155,19 @@ fn expect_color(v: &Value, fn_name: &str, line: u32) -> Result<u32, WispError> {
 }
 
 fn builtin_print(host: &mut dyn Host, args: &[Value]) {
-    let mut out = String::new();
+    // Each argument is rendered (bounded -- see `Value::to_display_string`)
+    // and handed to the host on its own, rather than first concatenated
+    // into one more full-size copy of all of them.
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
-            out.push(' ');
+            host.print(" ");
         }
-        out.push_str(&a.to_display_string());
+        match a {
+            Value::Str(s) => host.print(s),
+            other => host.print(&other.to_display_string()),
+        }
     }
-    out.push('\n');
-    host.print(&out);
+    host.print("\n");
 }
 
 fn builtin_input(host: &mut dyn Host, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
@@ -206,7 +213,17 @@ fn builtin_push(args: &[Value], line: u32) -> Result<Value, WispError> {
     expect_arity(args, 2, "push", line)?;
     match &args[0] {
         Value::List(l) => {
-            l.borrow_mut().push(args[1].clone());
+            let mut items = l.borrow_mut();
+            if items.len() >= MAX_LIST_LEN {
+                return Err(WispError::new(
+                    line,
+                    format!("push(): list is full ({MAX_LIST_LEN} elements is the limit)"),
+                ));
+            }
+            items
+                .try_reserve(1)
+                .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+            items.push(args[1].clone());
             Ok(Value::Nil)
         }
         other => Err(WispError::new(
@@ -238,7 +255,12 @@ fn builtin_str(args: &[Value], line: u32) -> Result<Value, WispError> {
     match &args[0] {
         // Already a string: share the buffer instead of reallocating.
         Value::Str(s) => Ok(Value::Str(s.clone())),
-        other => Ok(Value::Str(Rc::new(other.to_display_string()))),
+        other => other.try_display_string().map(|s| Value::Str(Rc::new(s))).ok_or_else(|| {
+            WispError::new(
+                line,
+                format!("str(): the result would be longer than {MAX_DISPLAY_LEN} bytes"),
+            )
+        }),
     }
 }
 

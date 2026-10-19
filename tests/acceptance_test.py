@@ -837,9 +837,33 @@ def main():
         assert_ocr(shot, "xor_brain done", "step 12b (run xor_brain -- quit back to the shell prompt)")
         print("step 12b (run xor_brain -- quit back to the shell prompt):", shot, "-- OCR verified")
 
+        # The fresh save.img is blank, and boot never formats a disk on
+        # its own (CODEBASE_AUDIT.md AUD-01): it must have been probed
+        # read-only and left unmounted. Provision it explicitly with the
+        # shell's `format` command, which asks for confirmation first.
+        assert_debug_log(
+            "[save_format] disk is blank; left untouched (not mounted)",
+            "step 13 (blank save disk left untouched at boot)",
+        )
+        mon.type_text("format")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("13_format_prompt")
+        assert_ocr(shot, ["ERASES", "Type ERASE"], "step 13 (format names the device and asks first)")
+        mon.type_text("ERASE")
+        mon.enter()
+        time.sleep(1.0)
+        shot = mon.screendump("13_format_done")
+        assert_ocr(shot, "save disk formatted", "step 13 (format provisions the save disk)")
+        assert_debug_log(
+            "[save_format] disk provisioned by explicit 'format' command",
+            "step 13 (format provisions the save disk)",
+        )
+        print("step 13 (explicit format of the blank save disk):", shot, "-- OCR verified")
+
         # counter.wisp, first half of the cross-boot persistence proof
-        # (Phase 2, Part B, Build Order Step 11): against the fresh
-        # save.img this run just created, the very first call to load()
+        # (Phase 2, Part B, Build Order Step 11): against the save.img this
+        # run just created and formatted, the very first call to load()
         # must see nothing saved yet -- the first-run branch -- and the
         # count it then saves must read back as exactly 1. The second half
         # (a genuinely separate boot, reusing this same, unmodified
@@ -1167,6 +1191,9 @@ def main():
         mon2 = Monitor(monitor_sock_2)
         shot = wait_for_boot(mon2, timeout=40.0)
         print("step 13b (second boot, same save.img, banner + prompt):", shot)
+        with open(debug_log_2, "r", errors="replace") as f:
+            if "[save_format] existing save store mounted (read-only probe, no writes)" not in f.read():
+                raise RuntimeError("step 13b: second boot did not mount the save store formatted by the first boot")
 
         mon2.type_text("run counter")
         mon2.enter()

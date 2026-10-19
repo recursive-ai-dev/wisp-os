@@ -57,13 +57,35 @@ calculation: slot `i`'s first sector is `LBA (1 + i * 8)`.
 | 12 | 4 bytes | slot size | `u32`, little-endian; currently `4096` |
 | 16 | 496 bytes | reserved | zeroed |
 
-A disk whose first 9 bytes don't match the magic is treated as
-"never formatted" -- `ensure_formatted` writes a fresh superblock and
-zeroes every slot's in-use byte (this is the very first thing that
-happens to a brand-new, blank `save.img`; it is a no-op on a disk
-that's already formatted, checked every boot). A disk whose magic
-matches but whose version byte doesn't is treated as an error, never
-silently reinterpreted -- see "Versioning" below.
+At boot the kernel only *reads* LBA 0 (`save_format::probe`). A disk is
+mounted for `save`/`load` only if its superblock matches completely:
+magic, version, slot count and slot size. Anything else is left
+byte-for-byte untouched and persistence stays unavailable for that boot:
+
+- all zeros -- a blank disk, or an interrupted `format` (see below);
+- any other bytes -- a partition table, another filesystem, a damaged
+  superblock: treated as someone else's data;
+- the WISP magic with a different version or geometry -- see
+  "Versioning" below; never silently reinterpreted.
+
+### Provisioning (`format`)
+
+The shell's `format` command is the only thing that ever writes outside
+an existing store. It prints the device (AHCI port, model, serial,
+size) and the exact range it will overwrite -- LBA 0-512, 256.5 KiB,
+including any partition table -- and proceeds only if the user types
+`ERASE`. `save_format::provision` then:
+
+1. zeroes LBA 0 (invalidating any previous store) and flushes;
+2. zeroes all 64 slots and flushes;
+3. writes the superblock and flushes.
+
+The superblock is published last, so a power loss or write error at any
+earlier point leaves a disk that `probe` reports as blank or foreign --
+never one it accepts with stale slot contents.
+
+Everything outside LBA 0-512 is never read or written; every sector
+access goes through a range check against that region.
 
 ### Slot (4096 bytes = 8 sectors)
 
@@ -146,9 +168,10 @@ checksummed and what `value length` at offset 33 records -- not the
 ## Versioning
 
 `FORMAT_VERSION` (currently `1`) is bumped only if this on-disk layout
-ever changes in a way that isn't backward-compatible. `ensure_formatted`
-treats a superblock whose magic matches but whose version doesn't as an
-error -- an unreadable disk it refuses to guess about -- rather than
+ever changes in a way that isn't backward-compatible. `probe` treats a
+superblock whose magic matches but whose version (or slot geometry)
+doesn't as unsupported -- a disk it refuses to guess about, and never
+writes to -- rather than
 attempting to reinterpret old-format bytes under new-format rules,
 which risks silently misreading real data as something else. There is
 currently only one version; this section exists so a future version
@@ -159,6 +182,11 @@ bump has an obvious place to record what changed and why.
 - **No wear leveling, no fragmentation handling, no garbage
   collection.** 64 fixed slots, always in the same 64 fixed locations,
   is the entire allocation story.
+- **Durability, not atomicity.** `save()` reports success only after
+  the slot's sectors are written *and* the device's write cache has been
+  flushed (FLUSH CACHE EXT, or FLUSH CACHE). A device that has a write
+  cache but supports neither command makes `save()` fail rather than
+  report a success it cannot back.
 - **No transactions or atomicity across multiple keys.** Each `save()`
   call writes one slot's 8 sectors in a simple sequential loop
   (`src/ahci.rs`'s `write_sector`, one at a time, no batching) -- a

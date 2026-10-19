@@ -27,11 +27,9 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
-
 use super::ast::{BinaryOp, Expr, FuncDecl, Program, Stmt, TopItem, UnaryOp};
 use super::builtins;
-use super::value::Value;
+use super::value::{self, List, ListRegistry, Value};
 use super::WispError;
 
 /// Recursion guard: a user function calling itself (directly or via a
@@ -40,6 +38,26 @@ use super::WispError;
 /// since this is a tree-walker, backs every WISP call with a real Rust
 /// stack frame) and taking the whole firmware shell down with it.
 const MAX_CALL_DEPTH: usize = 256;
+
+/// Budget for *all* native recursion the tree-walker performs -- every
+/// nested statement, expression, and function call counts one unit. The
+/// call-depth limit above only counts WISP function calls; on its own it
+/// would let 256 calls each sit under a deeply nested expression, or a
+/// single call-free expression nest arbitrarily deep, and run the kernel
+/// stack out. The parser separately caps one expression/block's syntactic
+/// depth (`parser::MAX_SYNTAX_DEPTH`); this caps the product.
+///
+/// Sized from the release build's actual frames on the UEFI target (see
+/// `CHANGES.md`): the costliest chain of native frames between two
+/// consecutive units is ~750 bytes (a nested `if`/`while` body), so 1024
+/// units stay under ~770 KiB of the 1 MiB mainline stack (`gdt.rs`). A
+/// simple recursive function uses 4-5 units per call, so plain recursion
+/// still reaches 200-256 calls deep.
+pub const MAX_NESTING: usize = 1024;
+
+/// Message for the error raised when the host reports the heap is down to
+/// its reserve. The script stops; anything it built is reclaimed.
+pub const OUT_OF_MEMORY_MESSAGE: &str = "out of memory (the script used up the heap reserve and was stopped)";
 
 /// A stack of block-local scope frames, innermost last. See the module
 /// doc comment above for the full scoping model.
@@ -80,6 +98,16 @@ pub trait Host {
     /// (`input`, `sleep_ms`) after they return. Must be cheap: it is on
     /// the hot path of every loop.
     fn stop_requested(&mut self) -> bool;
+
+    /// Whether free heap has fallen to the host's safety reserve. Polled
+    /// at the same points as `stop_requested`; a `true` stops the script
+    /// with [`OUT_OF_MEMORY_MESSAGE`] while there is still memory left to
+    /// report it and clean up, rather than letting an infallible
+    /// allocation exhaust the heap and halt the kernel. Defaults to
+    /// "never", for hosts without a shared fixed-size heap.
+    fn memory_low(&mut self) -> bool {
+        false
+    }
 
     /// Milliseconds since boot, from the kernel's monotonic clock. Backs
     /// the `time_ms()` builtin.
@@ -154,6 +182,11 @@ pub struct Interp<'h> {
     globals: BTreeMap<String, Value>,
     functions: BTreeMap<String, Rc<FuncDecl>>,
     call_depth: usize,
+    /// See [`MAX_NESTING`].
+    nesting: usize,
+    /// Every list this run creates; emptied when the interpreter is
+    /// dropped, which is what frees cyclic lists. See [`ListRegistry`].
+    lists: ListRegistry,
 }
 
 impl<'h> Interp<'h> {
@@ -163,6 +196,8 @@ impl<'h> Interp<'h> {
             globals: BTreeMap::new(),
             functions: BTreeMap::new(),
             call_depth: 0,
+            nesting: 0,
+            lists: ListRegistry::new(),
         }
     }
 
@@ -184,8 +219,7 @@ impl<'h> Interp<'h> {
                         format!("function '{}' is already defined", f.name),
                     ));
                 }
-                self.functions
-                    .insert((*f.name).clone(), Rc::new(f.clone()));
+                self.functions.insert((*f.name).clone(), f.clone());
             }
         }
 
@@ -227,6 +261,7 @@ impl<'h> Interp<'h> {
         self.globals.get(name).cloned()
     }
 
+    #[inline(never)]
     fn declare_var(
         &mut self,
         stack: &mut ScopeStack,
@@ -248,6 +283,7 @@ impl<'h> Interp<'h> {
         Ok(())
     }
 
+    #[inline(never)]
     fn assign_var(
         &mut self,
         stack: &mut ScopeStack,
@@ -300,7 +336,27 @@ impl<'h> Interp<'h> {
         result
     }
 
+    /// Count one unit of native recursion against [`MAX_NESTING`].
+    fn enter(&mut self, line: u32) -> Result<(), WispError> {
+        if self.nesting >= MAX_NESTING {
+            return Err(WispError::new(
+                line,
+                "stack overflow: program nests too deeply (expressions, blocks and calls combined)",
+            ));
+        }
+        self.nesting += 1;
+        Ok(())
+    }
+
     fn exec_stmt(&mut self, stmt: &Stmt, stack: &mut ScopeStack) -> Result<Flow, WispError> {
+        self.enter(stmt_line(stmt))?;
+        let result = self.exec_stmt_inner(stmt, stack);
+        self.nesting -= 1;
+        result
+    }
+
+    // Arms outlined for the same stack-frame reason as `eval_expr_inner`.
+    fn exec_stmt_inner(&mut self, stmt: &Stmt, stack: &mut ScopeStack) -> Result<Flow, WispError> {
         match stmt {
             Stmt::Let { name, expr, line } => {
                 let v = self.eval_expr(expr, stack)?;
@@ -316,46 +372,14 @@ impl<'h> Interp<'h> {
                 self.eval_expr(expr, stack)?;
                 Ok(Flow::Normal)
             }
-            Stmt::If { branches, else_body } => {
-                for (cond, body) in branches {
-                    if self.eval_bool(cond, stack)? {
-                        return self.exec_block_scoped(body, stack);
-                    }
-                }
-                if let Some(body) = else_body {
-                    return self.exec_block_scoped(body, stack);
-                }
-                Ok(Flow::Normal)
-            }
-            Stmt::While { cond, body, line } => {
-                loop {
-                    if self.host.stop_requested() {
-                        return Err(WispError::new(*line, STOPPED_MESSAGE));
-                    }
-                    if !self.eval_bool(cond, stack)? {
-                        break;
-                    }
-                    match self.exec_block_scoped(body, stack)? {
-                        Flow::Break(_) => break,
-                        Flow::Continue(_) | Flow::Normal => {}
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                    }
-                }
-                Ok(Flow::Normal)
-            }
+            Stmt::If { branches, else_body } => self.exec_if(branches, else_body.as_deref(), stack),
+            Stmt::While { cond, body, line } => self.exec_while(cond, body, *line, stack),
             Stmt::IndexAssign {
                 object,
                 index,
                 value,
                 line,
-            } => {
-                let obj = self.eval_expr(object, stack)?;
-                let idx = self.eval_expr(index, stack)?;
-                let v = self.eval_expr(value, stack)?;
-                let (list, i) = index_target(&obj, &idx, *line)?;
-                list.borrow_mut()[i] = v;
-                Ok(Flow::Normal)
-            }
+            } => self.exec_index_assign(object, index, value, *line, stack),
             Stmt::Break { line } => Ok(Flow::Break(*line)),
             Stmt::Continue { line } => Ok(Flow::Continue(*line)),
             Stmt::Return { expr } => {
@@ -368,8 +392,60 @@ impl<'h> Interp<'h> {
         }
     }
 
+    #[inline(never)]
+    fn exec_if(
+        &mut self,
+        branches: &[(Expr, Vec<Stmt>)],
+        else_body: Option<&[Stmt]>,
+        stack: &mut ScopeStack,
+    ) -> Result<Flow, WispError> {
+        for (cond, body) in branches {
+            if self.eval_bool(cond, stack)? {
+                return self.exec_block_scoped(body, stack);
+            }
+        }
+        if let Some(body) = else_body {
+            return self.exec_block_scoped(body, stack);
+        }
+        Ok(Flow::Normal)
+    }
+
+    #[inline(never)]
+    fn exec_while(&mut self, cond: &Expr, body: &[Stmt], line: u32, stack: &mut ScopeStack) -> Result<Flow, WispError> {
+        loop {
+            self.check_interrupts(line)?;
+            if !self.eval_bool(cond, stack)? {
+                break;
+            }
+            match self.exec_block_scoped(body, stack)? {
+                Flow::Break(_) => break,
+                Flow::Continue(_) | Flow::Normal => {}
+                Flow::Return(v) => return Ok(Flow::Return(v)),
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    #[inline(never)]
+    fn exec_index_assign(
+        &mut self,
+        object: &Expr,
+        index: &Expr,
+        value: &Expr,
+        line: u32,
+        stack: &mut ScopeStack,
+    ) -> Result<Flow, WispError> {
+        let obj = self.eval_expr(object, stack)?;
+        let idx = self.eval_expr(index, stack)?;
+        let v = self.eval_expr(value, stack)?;
+        let (list, i) = index_target(&obj, &idx, line)?;
+        list.borrow_mut()[i] = v;
+        Ok(Flow::Normal)
+    }
+
     // ---- expressions ----
 
+    #[inline(never)]
     fn eval_bool(&mut self, expr: &Expr, stack: &ScopeStack) -> Result<bool, WispError> {
         let line = expr.line().unwrap_or(0);
         match self.eval_expr(expr, stack)? {
@@ -386,60 +462,89 @@ impl<'h> Interp<'h> {
     }
 
     fn eval_expr(&mut self, expr: &Expr, stack: &ScopeStack) -> Result<Value, WispError> {
+        self.enter(expr.line().unwrap_or(0))?;
+        let result = self.eval_expr_inner(expr, stack);
+        self.nesting -= 1;
+        result
+    }
+
+    // Every arm that recurses lives in its own never-inlined function.
+    // The tree-walker's native stack use per nesting level is the frame
+    // of `eval_expr` plus the frame of whichever arm is active; inlined,
+    // every level would pay for the *union* of all arms' locals (measured
+    // at roughly 2.5x the outlined cost on the UEFI target).
+    fn eval_expr_inner(&mut self, expr: &Expr, stack: &ScopeStack) -> Result<Value, WispError> {
         match expr {
             Expr::IntLit(v) => Ok(Value::Int(*v)),
             Expr::StrLit(s) => Ok(Value::Str(s.clone())),
             Expr::BoolLit(b) => Ok(Value::Bool(*b)),
             Expr::NilLit => Ok(Value::Nil),
-            Expr::Var { name, line } => self.get_var(stack, name).ok_or_else(|| {
-                WispError::new(
-                    *line,
-                    format!("undefined variable '{name}' (did you forget 'let'?)"),
-                )
-            }),
-            Expr::Unary { op, expr, line } => {
-                let v = self.eval_expr(expr, stack)?;
-                match (op, &v) {
-                    (UnaryOp::Neg, Value::Int(i)) => i
-                        .checked_neg()
-                        .map(Value::Int)
-                        .ok_or_else(|| WispError::new(*line, "integer overflow negating i64::MIN")),
-                    (UnaryOp::Neg, other) => Err(WispError::new(
-                        *line,
-                        format!("unary '-' expects int, found {}", other.type_name()),
-                    )),
-                    (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnaryOp::Not, other) => Err(WispError::new(
-                        *line,
-                        format!("'not' expects bool, found {}", other.type_name()),
-                    )),
-                }
-            }
+            Expr::Var { name, line } => match self.get_var(stack, name) {
+                Some(v) => Ok(v),
+                None => Err(undefined_variable(name, *line)),
+            },
+            Expr::Unary { op, expr, line } => self.eval_unary(*op, expr, *line, stack),
             Expr::Binary { op, lhs, rhs, line } => self.eval_binary(*op, lhs, rhs, *line, stack),
-            Expr::Call { name, args, line } => {
-                let mut values = Vec::with_capacity(args.len());
-                for a in args {
-                    values.push(self.eval_expr(a, stack)?);
-                }
-                self.call_named(name, values, *line)
-            }
-            Expr::ListLit { items, .. } => {
-                let mut values = Vec::with_capacity(items.len());
-                for it in items {
-                    values.push(self.eval_expr(it, stack)?);
-                }
-                Ok(Value::List(Rc::new(RefCell::new(values))))
-            }
-            Expr::Index { object, index, line } => {
-                let obj = self.eval_expr(object, stack)?;
-                let idx = self.eval_expr(index, stack)?;
-                let (list, i) = index_target(&obj, &idx, *line)?;
-                let v = list.borrow()[i].clone();
-                Ok(v)
-            }
+            Expr::Call { name, args, line } => self.eval_call(name, args, *line, stack),
+            Expr::ListLit { items, line } => self.eval_list(items, *line, stack),
+            Expr::Index { object, index, line } => self.eval_index(object, index, *line, stack),
         }
     }
 
+    #[inline(never)]
+    fn eval_unary(&mut self, op: UnaryOp, expr: &Expr, line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
+        let v = self.eval_expr(expr, stack)?;
+        match (op, &v) {
+            (UnaryOp::Neg, Value::Int(i)) => i
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or_else(|| WispError::new(line, "integer overflow negating i64::MIN")),
+            (UnaryOp::Neg, other) => Err(WispError::new(
+                line,
+                format!("unary '-' expects int, found {}", other.type_name()),
+            )),
+            (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+            (UnaryOp::Not, other) => Err(WispError::new(
+                line,
+                format!("'not' expects bool, found {}", other.type_name()),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn eval_call(&mut self, name: &str, args: &[Expr], line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            values.push(self.eval_expr(a, stack)?);
+        }
+        self.call_named(name, values, line)
+    }
+
+    #[inline(never)]
+    fn eval_list(&mut self, items: &[Expr], line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
+        if items.len() > value::MAX_LIST_LEN {
+            return Err(WispError::new(
+                line,
+                format!("list literal is too long (over {} elements)", value::MAX_LIST_LEN),
+            ));
+        }
+        let mut values = Vec::with_capacity(items.len());
+        for it in items {
+            values.push(self.eval_expr(it, stack)?);
+        }
+        Ok(self.lists.new_list(values))
+    }
+
+    #[inline(never)]
+    fn eval_index(&mut self, object: &Expr, index: &Expr, line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
+        let obj = self.eval_expr(object, stack)?;
+        let idx = self.eval_expr(index, stack)?;
+        let (list, i) = index_target(&obj, &idx, line)?;
+        let v = list.borrow()[i].clone();
+        Ok(v)
+    }
+
+    #[inline(never)]
     fn eval_binary(
         &mut self,
         op: BinaryOp,
@@ -490,7 +595,7 @@ impl<'h> Interp<'h> {
                     .checked_add(*b)
                     .map(Value::Int)
                     .ok_or_else(|| WispError::new(line, format!("integer overflow in '{a} + {b}'"))),
-                (Value::Str(a), Value::Str(b)) => Ok(Value::Str(Rc::new(format!("{a}{b}")))),
+                (Value::Str(a), Value::Str(b)) => concat(a, b, line),
                 _ => Err(WispError::new(
                     line,
                     format!(
@@ -514,8 +619,10 @@ impl<'h> Interp<'h> {
                 }
                 checked_int_binop(lhs, rhs, line, "%", i64::checked_rem)
             }
-            BinaryOp::Eq => Ok(Value::Bool(lhs == rhs)),
-            BinaryOp::Ne => Ok(Value::Bool(lhs != rhs)),
+            BinaryOp::Eq | BinaryOp::Ne => {
+                let equal = value::try_equal(&lhs, &rhs).map_err(|msg| WispError::new(line, msg))?;
+                Ok(Value::Bool(equal == (op == BinaryOp::Eq)))
+            }
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                 compare(op, lhs, rhs, line)
             }
@@ -523,9 +630,28 @@ impl<'h> Interp<'h> {
         }
     }
 
+    /// The cooperative checks run before every loop iteration and function
+    /// call: the user's Esc, and the host's heap reserve.
+    fn check_interrupts(&mut self, line: u32) -> Result<(), WispError> {
+        if self.host.stop_requested() {
+            return Err(WispError::new(line, STOPPED_MESSAGE));
+        }
+        if self.host.memory_low() {
+            return Err(WispError::new(line, OUT_OF_MEMORY_MESSAGE));
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
     fn call_named(&mut self, name: &str, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
         if builtins::is_builtin(name) {
-            return builtins::call(&mut *self.host, name, args, line);
+            let result = builtins::call(&mut *self.host, name, args, line)?;
+            if name == "load" {
+                // A list that arrives from the save disk becomes part of
+                // this run's object graph like any other.
+                self.lists.adopt(&result);
+            }
+            return Ok(result);
         }
         match self.functions.get(name).cloned() {
             Some(f) => self.call_function(&f, args, line),
@@ -533,15 +659,14 @@ impl<'h> Interp<'h> {
         }
     }
 
+    #[inline(never)]
     fn call_function(
         &mut self,
         func: &FuncDecl,
         args: Vec<Value>,
         line: u32,
     ) -> Result<Value, WispError> {
-        if self.host.stop_requested() {
-            return Err(WispError::new(line, STOPPED_MESSAGE));
-        }
+        self.check_interrupts(line)?;
         if args.len() != func.params.len() {
             return Err(WispError::new(
                 line,
@@ -572,7 +697,14 @@ impl<'h> Interp<'h> {
         }
         let mut stack: ScopeStack = vec![frame];
 
-        let result = self.exec_block(&func.body, &mut stack);
+        let result = match self.enter(line) {
+            Ok(()) => {
+                let r = self.exec_block(&func.body, &mut stack);
+                self.nesting -= 1;
+                r
+            }
+            Err(e) => Err(e),
+        };
         self.call_depth -= 1;
 
         match result? {
@@ -593,7 +725,7 @@ fn index_target(
     obj: &Value,
     idx: &Value,
     line: u32,
-) -> Result<(Rc<RefCell<Vec<Value>>>, usize), WispError> {
+) -> Result<(List, usize), WispError> {
     let list = match obj {
         Value::List(l) => l.clone(),
         other => {
@@ -667,4 +799,44 @@ fn compare(op: BinaryOp, lhs: Value, rhs: Value, line: u32) -> Result<Value, Wis
         _ => unreachable!("compare() only called for Lt/Le/Gt/Ge"),
     };
     Ok(Value::Bool(result))
+}
+
+/// The source line a statement reports errors at, where it has one.
+fn stmt_line(stmt: &Stmt) -> u32 {
+    match stmt {
+        Stmt::Let { line, .. }
+        | Stmt::Assign { line, .. }
+        | Stmt::IndexAssign { line, .. }
+        | Stmt::While { line, .. }
+        | Stmt::Break { line }
+        | Stmt::Continue { line } => *line,
+        Stmt::ExprStmt(e) | Stmt::Return { expr: Some(e) } => e.line().unwrap_or(0),
+        Stmt::If { branches, .. } => branches.first().and_then(|(c, _)| c.line()).unwrap_or(0),
+        Stmt::Return { expr: None } => 0,
+    }
+}
+
+/// String `+`, refusing results over [`value::MAX_STR_LEN`] bytes and
+/// reporting allocation failure as a script error rather than a kernel
+/// halt.
+fn concat(a: &str, b: &str, line: u32) -> Result<Value, WispError> {
+    let len = a.len() + b.len();
+    if len > value::MAX_STR_LEN {
+        return Err(WispError::new(
+            line,
+            format!("string is too long ({len} bytes; the limit is {})", value::MAX_STR_LEN),
+        ));
+    }
+    let mut out = String::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    out.push_str(a);
+    out.push_str(b);
+    Ok(Value::Str(Rc::new(out)))
+}
+
+#[cold]
+#[inline(never)]
+fn undefined_variable(name: &str, line: u32) -> WispError {
+    WispError::new(line, format!("undefined variable '{name}' (did you forget 'let'?)"))
 }

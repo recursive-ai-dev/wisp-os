@@ -476,16 +476,16 @@ extern "C" fn continue_boot_on_new_stack(ctx: *mut BootContinuation) -> ! {
     pci::dump_devices(&pci_devices);
 
     // Phase 2, Part B, Build Order Steps 3-8: find the AHCI controller,
-    // bring it up, and format it for save/load use. Every failure along
-    // this chain ("no AHCI controller present," "no usable disk on any
-    // port," "disk doesn't support what this driver needs," "self-test
-    // failed," "save-format init failed") is a first-class, expected
-    // outcome, not a reason to stop booting -- `bring_up_save_disk` logs
-    // whichever one happens and returns `None`, and `save`/`load` (shell
-    // commands today, WISP builtins in a later step) report "unavailable."
+    // bring it up, and mount an existing save store on it -- read-only;
+    // boot never formats or otherwise writes to the disk. Every failure
+    // along this chain ("no AHCI controller present," "no usable disk on
+    // any port," "disk doesn't support what this driver needs," "disk is
+    // not formatted for WISP") is a first-class, expected outcome, not a
+    // reason to stop booting -- `bring_up_save_disk` logs whichever one
+    // happens, and `save`/`load` report "unavailable."
     //
     // On success the returned `Hba` is handed to the shell rather than
-    // dropped: unlike `identify`/the Step 6-7 self-tests (every command
+    // dropped: unlike `identify`/the boot-time probe (every command
     // issued through it up to this point has already completed before
     // `bring_up_save_disk` returns), `save`/`load` issue commands *later*,
     // from inside the shell's command loop -- something must keep owning
@@ -574,31 +574,50 @@ fn bring_up_apic(console: &mut Console, info: &acpi::AcpiInfo) {
         }
     };
 
-    // Step 3b: map and quiesce every I/O APIC, then program the two
-    // lines this kernel actually needs. Both are routed *before* the
-    // 8259 is masked, so there is never a window in which neither
-    // controller can deliver the keyboard or the timer.
+    // Step 3b: map and quiesce every I/O APIC, then stage the two lines
+    // this kernel actually needs -- fully programmed but still *masked*.
+    // An unmasked route here would be live while `lapic::is_active()` is
+    // still false, so an interrupt arriving before Step 4 would be
+    // acknowledged at the 8259 and stay in service at the LAPIC forever,
+    // blocking every later interrupt at its priority. A failure staging
+    // either line re-masks whatever was staged before falling back, so
+    // the 8259 path is left exactly as it was.
     if let Err(msg) = unsafe { ioapic::init(info) } {
         report_apic_fallback(console, msg);
         return;
     }
-    if let Err(msg) = unsafe { ioapic::route_isa_irq(info, 1, 0x21) } {
-        report_apic_fallback(console, msg);
-        return;
-    }
-    if let Err(msg) = unsafe { ioapic::route_isa_irq(info, 0, 0x20) } {
-        report_apic_fallback(console, msg);
-        return;
-    }
+    let keyboard_route = match unsafe { ioapic::stage_isa_irq(info, 1, 0x21) } {
+        Ok(route) => route,
+        Err(msg) => {
+            report_apic_fallback(console, msg);
+            return;
+        }
+    };
+    let timer_route = match unsafe { ioapic::stage_isa_irq(info, 0, 0x20) } {
+        Ok(route) => route,
+        Err(msg) => {
+            unsafe { keyboard_route.mask() };
+            report_apic_fallback(console, msg);
+            return;
+        }
+    };
 
-    // Step 4: the switch itself. Interrupts are disabled across it
-    // because it changes, in two separate register writes, which
-    // controller owns every interrupt in the machine -- an interrupt
-    // arriving partway through would be acknowledged at whichever one
-    // `lapic::is_active()` happened to name at that instant, which is
-    // precisely the mismatch `idt::end_of_interrupt`'s doc comment
-    // describes as silently fatal.
-    sync::without_interrupts(|| unsafe { lapic::enter_apic_mode(info.pcat_compat) });
+    // Step 4: the switch itself, as one interrupts-disabled commit:
+    // silence the 8259, move EOI ownership to the Local APIC, and only
+    // then unmask the staged I/O APIC routes. With interrupts off
+    // throughout, no handler runs while the two controllers disagree,
+    // and no I/O APIC interrupt can exist before the LAPIC owns its EOI.
+    //
+    // The keyboard line is edge-triggered: a key pressed during the
+    // switch raised its edge while both paths were masked, and the 8042
+    // will not raise another until that byte is read. Draining it here
+    // re-arms the edge instead of leaving the keyboard silent.
+    sync::without_interrupts(|| unsafe {
+        lapic::enter_apic_mode(info.pcat_compat);
+        keyboard_route.activate();
+        timer_route.activate();
+        keyboard::drain_pending();
+    });
 
     // Step 5: hand the tick over to the Local APIC timer, if it
     // calibrated. Arming it *before* masking the PIT's line -- rather
@@ -663,18 +682,25 @@ fn report_apic_fallback(console: &mut Console, msg: &'static str) {
 
 /// Find the AHCI controller (if any), reset and enable it, map its ABAR,
 /// bring up the first port with a usable SATA disk attached, IDENTIFY it,
-/// prove the raw read/write path works (Build Order Steps 6-7's boot-time
-/// diagnostics/self-test), and format it for `save_format.rs` use (Build
-/// Order Step 8). Every step's own doc comment explains what's a
-/// first-class expected failure versus a real bug; this function's whole
-/// job is turning "did every step succeed" into a single `Option`, logging
+/// and *probe* -- read-only -- whether it already carries a WISP save
+/// store. Every step's own doc comment explains what's a first-class
+/// expected failure versus a real bug; this function's whole job is
+/// turning "did every step succeed" into a single `Option`, logging
 /// exactly where the chain stopped either way.
 ///
-/// Returns `None` if any step fails -- callers must treat that as
-/// "persistent storage is unavailable this boot," never as a reason to
-/// stop booting.
-fn bring_up_save_disk(console: &mut Console) -> Option<ahci::Hba> {
-    let hba = match unsafe { ahci::init() } {
+/// Boot never writes to the disk. A blank or foreign disk is reported and
+/// left untouched; the shell's `format` command is the only way to
+/// provision one, and it asks first. (Earlier versions formatted any
+/// unrecognized disk automatically and ran a write/read-back/restore
+/// self-test against its last sector -- both destroyed data that did not
+/// belong to WISP.)
+///
+/// Returns `None` if no usable disk was found -- callers must treat that
+/// as "persistent storage is unavailable this boot," never as a reason to
+/// stop booting. `Some` with an unmounted disk means a disk exists but is
+/// not (yet) formatted for WISP.
+fn bring_up_save_disk(console: &mut Console) -> Option<save_format::SaveDisk> {
+    let mut hba = match unsafe { ahci::init() } {
         Ok(hba) => {
             console.write_str("AHCI controller found and ABAR mapped.\n");
             hba
@@ -693,7 +719,9 @@ fn bring_up_save_disk(console: &mut Console) -> Option<ahci::Hba> {
             let _ = core::fmt::Write::write_fmt(
                 console,
                 format_args!(
-                    "AHCI disk identified: {} sectors ({} MiB).\n",
+                    "AHCI disk identified: '{}' on port {}, {} sectors ({} MiB).\n",
+                    disk.model(),
+                    hba.port(),
                     disk.total_sectors,
                     (disk.total_sectors * u64::from(ahci::SECTOR_SIZE)) / (1024 * 1024),
                 ),
@@ -709,12 +737,9 @@ fn bring_up_save_disk(console: &mut Console) -> Option<ahci::Hba> {
         }
     };
 
-    // Build Order Step 6: prove raw sector reads actually work by reading
-    // LBA 0 and dumping it byte-for-byte to debugcon. A failure here is
-    // reported but not fatal to the rest of this chain -- IDENTIFY already
-    // succeeded, so this is "the disk is there but a read failed," a real
-    // (if unlikely) hardware condition; the self-test right below will
-    // catch it for real if the read path is genuinely broken.
+    // Read-only proof that the read path works: LBA 0, dumped byte for
+    // byte to debugcon. `probe` below reads the same sector again; the
+    // dump is diagnostics only.
     let mut sector0 = [0u8; ahci::SECTOR_SIZE as usize];
     match unsafe { hba.read_sector(0, &mut sector0) } {
         Ok(()) => ahci::debug_dump_sector(&sector0),
@@ -725,48 +750,44 @@ fn bring_up_save_disk(console: &mut Console) -> Option<ahci::Hba> {
         }
     }
 
-    // Build Order Step 7: prove the write path works too, every boot, the
-    // same standard `pmm::self_test` already set for the frame allocator --
-    // write/read-back/restore against the disk's own last sector, never
-    // sector 0 (reserved for `save_format.rs`'s superblock). Unlike the
-    // read-only proof above, a failure here means this driver cannot be
-    // trusted to write real save data -- fall back to "unavailable" rather
-    // than press on into `ensure_formatted`, which itself needs a working
-    // write path.
-    match unsafe { hba.self_test(disk.total_sectors) } {
-        Ok(()) => {
-            console.write_str("AHCI self-test (write/read-back/restore): OK\n");
-            debugcon::write_str("[ahci] self-test OK (write/read-back/restore against the disk's last sector)\n");
-        }
+    let probe = unsafe { save_format::probe(&hba, disk.total_sectors) };
+    let mounted = matches!(probe, Ok(save_format::Probe::Formatted));
+    let (line, log): (&str, &str) = match probe {
+        Ok(save_format::Probe::Formatted) => (
+            "AHCI save disk mounted (save/load available).",
+            "[save_format] existing save store mounted (read-only probe, no writes)",
+        ),
+        Ok(save_format::Probe::Blank) => (
+            "AHCI disk is blank -- not formatted for WISP. Left untouched; run 'format' to use it for save/load.",
+            "[save_format] disk is blank; left untouched (not mounted)",
+        ),
+        Ok(save_format::Probe::Foreign) => (
+            "AHCI disk holds non-WISP data. Left untouched; save/load unavailable ('format' would ERASE it).",
+            "[save_format] disk holds foreign data; left untouched (not mounted)",
+        ),
+        Ok(save_format::Probe::Unsupported) => (
+            "AHCI disk has a WISP save store this version does not understand. Left untouched.",
+            "[save_format] unsupported save-store version/geometry; left untouched (not mounted)",
+        ),
         Err(msg) => {
             console.set_fg(gfx::ERROR);
-            let _ = core::fmt::Write::write_fmt(console, format_args!("AHCI self-test FAILED: {msg} (persistent storage unavailable)\n"));
+            let _ = core::fmt::Write::write_fmt(console, format_args!("AHCI save-disk probe FAILED: {msg} (save/load unavailable)\n"));
             console.set_fg(gfx::FOREGROUND);
-            debugcon::write_str("[ahci] self-test FAILED: ");
+            debugcon::write_str("[save_format] probe FAILED: ");
             debugcon::write_str(msg);
             debugcon::write_str("\n");
-            return None;
+            return Some(save_format::SaveDisk::new(hba, disk.total_sectors, false));
         }
+    };
+    if !mounted {
+        console.set_fg(gfx::ERROR);
     }
-
-    // Build Order Step 8: format the disk for save/load use (a no-op if
-    // it's already formatted from an earlier boot).
-    match unsafe { save_format::ensure_formatted(&hba, disk.total_sectors) } {
-        Ok(()) => {
-            console.write_str("AHCI save disk formatted and ready (save/load available).\n");
-            debugcon::write_str("[save_format] disk formatted and ready\n");
-            Some(hba)
-        }
-        Err(msg) => {
-            console.set_fg(gfx::ERROR);
-            let _ = core::fmt::Write::write_fmt(console, format_args!("AHCI save-format init FAILED: {msg} (save/load unavailable)\n"));
-            console.set_fg(gfx::FOREGROUND);
-            debugcon::write_str("[save_format] init FAILED: ");
-            debugcon::write_str(msg);
-            debugcon::write_str("\n");
-            None
-        }
-    }
+    console.write_str(line);
+    console.write_str("\n");
+    console.set_fg(gfx::FOREGROUND);
+    debugcon::write_str(log);
+    debugcon::write_str("\n");
+    Some(save_format::SaveDisk::new(hba, disk.total_sectors, mounted))
 }
 
 /// The running image's base address and size, from the firmware's

@@ -7,7 +7,6 @@
 
 use alloc::format;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use uefi::proto::media::file::{Directory, File, FileAttribute, FileInfo, FileMode, RegularFile};
@@ -15,6 +14,22 @@ use uefi::table::boot::BootServices;
 use uefi::{CString16, Error, Handle, Result, Status};
 
 use crate::debugcon;
+
+/// Largest single `.wisp` source admitted into the snapshot. Comfortably
+/// above any real program (the bundled ones are a few KiB) and small
+/// enough that one file can never take a meaningful share of the 8 MiB
+/// kernel heap, which the parser and interpreter need far more of.
+pub const MAX_APP_SOURCE_BYTES: usize = 256 * 1024;
+/// Combined budget for every snapshotted source plus its filename,
+/// checked before each allocation: the snapshot stays resident for the
+/// whole boot, so this is headroom permanently taken from the heap.
+pub const MAX_APPS_TOTAL_BYTES: usize = 1024 * 1024;
+/// Most `.wisp` files listed or snapshotted; further entries are skipped
+/// (and logged) rather than collected without bound.
+pub const MAX_APP_COUNT: usize = 64;
+/// Longest filename kept (bytes of UTF-8). FAT long names go up to 255
+/// characters; nothing a user types at `run` needs more than this.
+const MAX_APP_NAME_BYTES: usize = 64;
 
 /// Turn a user-typed path (which may use `/` out of habit) into the
 /// backslash-separated, null-terminated UCS-2 form
@@ -31,12 +46,13 @@ fn make_path(path: &str) -> Result<CString16> {
 /// is relative to the volume root (e.g. `"APPS\\hello.wisp"` or, thanks to
 /// `make_path`'s normalization, `"APPS/hello.wisp"`).
 ///
-/// Fails cleanly (never panics) if the path doesn't exist, names a
-/// directory instead of a file, or isn't valid UTF-8 -- WISP scripts are
-/// plain ASCII/UTF-8 text by construction, so a decode failure here means
-/// the file isn't actually a script, and the caller should see that as an
-/// ordinary error rather than garbled output.
-pub fn read_file_to_string(bs: &BootServices, image: Handle, path: &str) -> Result<String> {
+/// Fails cleanly (never panics, never allocates more than `max_bytes`) if
+/// the path doesn't exist, names a directory instead of a file, is larger
+/// than `max_bytes` (`BAD_BUFFER_SIZE`), cannot be allocated
+/// (`OUT_OF_RESOURCES`), ends before its advertised size (`END_OF_FILE`
+/// -- a truncated program is not silently run as if complete), or isn't
+/// valid UTF-8 (`COMPROMISED_DATA`).
+pub fn read_file_to_string(bs: &BootServices, image: Handle, path: &str, max_bytes: usize) -> Result<String> {
     let mut fs = bs.get_image_file_system(image)?;
     let mut root: Directory = fs.open_volume()?;
     let cpath = make_path(path)?;
@@ -47,21 +63,26 @@ pub fn read_file_to_string(bs: &BootServices, image: Handle, path: &str) -> Resu
         .ok_or_else(|| Error::new(Status::NOT_FOUND, ()))?;
 
     let info = file.get_boxed_info::<FileInfo>()?;
-    let size = info.file_size() as usize;
+    // The advertised size is checked before it is used as an allocation
+    // size: a file is admitted by budget, not by trust.
+    let size = usize::try_from(info.file_size())
+        .ok()
+        .filter(|&n| n <= max_bytes)
+        .ok_or_else(|| Error::new(Status::BAD_BUFFER_SIZE, ()))?;
 
-    let mut buf = vec![0u8; size];
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(size)
+        .map_err(|_| Error::new(Status::OUT_OF_RESOURCES, ()))?;
+    buf.resize(size, 0);
     let mut total = 0usize;
     while total < size {
         let n = file.read(&mut buf[total..])?;
         if n == 0 {
-            // Fewer bytes on disk than FileInfo reported (shouldn't
-            // happen on a well-formed FAT32 volume, but don't spin
-            // forever or read out of bounds if it does).
-            break;
+            // Fewer bytes on disk than FileInfo reported.
+            return Err(Error::new(Status::END_OF_FILE, ()));
         }
         total += n;
     }
-    buf.truncate(total);
 
     String::from_utf8(buf).map_err(|_| Error::new(Status::COMPROMISED_DATA, ()))
 }
@@ -73,9 +94,11 @@ pub fn read_file_to_string(bs: &BootServices, image: Handle, path: &str) -> Resu
 /// program.
 ///
 /// Never panics: any failure (missing `APPS` directory, an unreadable
-/// entry, a non-UTF-8 file) is logged to the debug port and that one entry
-/// is skipped, so a single bad file can't prevent every other program from
-/// still being available to `run`. Returns an empty `Vec` (not an error)
+/// entry, a non-UTF-8 file, a file over [`MAX_APP_SOURCE_BYTES`] or one
+/// that would take the snapshot past [`MAX_APPS_TOTAL_BYTES`]) is logged
+/// to the debug port with the filename and that one entry is skipped, so
+/// a single bad file can't prevent every other program from still being
+/// available to `run` -- or exhaust the heap before the shell exists. Returns an empty `Vec` (not an error)
 /// if `APPS` itself can't be opened at all, since a shell with no
 /// installed programs is still a working shell.
 pub fn snapshot_apps(bs: &BootServices, image: Handle) -> Vec<(String, String)> {
@@ -92,11 +115,27 @@ pub fn snapshot_apps(bs: &BootServices, image: Handle) -> Vec<(String, String)> 
     let names = list_wisp_filenames(bs, image);
 
     let mut apps = Vec::with_capacity(names.len());
+    let mut used = 0usize;
     for name in names {
+        let remaining = MAX_APPS_TOTAL_BYTES.saturating_sub(used + name.len());
+        let limit = remaining.min(MAX_APP_SOURCE_BYTES);
         let path = format!("APPS/{name}");
-        match read_file_to_string(bs, image, &path) {
-            Ok(source) => apps.push((name, source)),
-            Err(e) => log_snapshot_error("read_file_to_string", e.status()),
+        match read_file_to_string(bs, image, &path, limit) {
+            Ok(source) => {
+                used += name.len() + source.len();
+                apps.push((name, source));
+            }
+            Err(e) => {
+                let _ = debugcon::write_fmt(format_args!(
+                    "\n[fs] snapshot_apps: skipping APPS/{name}: {:?}{}\n",
+                    e.status(),
+                    if e.status() == Status::BAD_BUFFER_SIZE {
+                        " (larger than the per-file or remaining snapshot budget)"
+                    } else {
+                        ""
+                    },
+                ));
+            }
         }
     }
     apps
@@ -158,9 +197,23 @@ fn list_wisp_filenames(bs: &BootServices, image: Handle) -> Vec<String> {
             continue;
         }
         let name = format!("{}", entry.file_name());
-        if name.to_ascii_lowercase().ends_with(".wisp") {
-            names.push(name);
+        if !name.to_ascii_lowercase().ends_with(".wisp") {
+            continue;
         }
+        if name.len() > MAX_APP_NAME_BYTES {
+            let _ = debugcon::write_fmt(format_args!(
+                "\n[fs] snapshot_apps: skipping a .wisp file with a {}-byte name (limit {MAX_APP_NAME_BYTES})\n",
+                name.len(),
+            ));
+            continue;
+        }
+        if names.len() >= MAX_APP_COUNT {
+            let _ = debugcon::write_fmt(format_args!(
+                "\n[fs] snapshot_apps: more than {MAX_APP_COUNT} .wisp files; skipping {name} and any later ones\n",
+            ));
+            break;
+        }
+        names.push(name);
     }
 
     names

@@ -92,6 +92,10 @@ pub struct FreeListAllocator {
     /// First free block (lowest address), or null if the heap is full.
     head: *mut FreeBlock,
     total: usize,
+    /// Running sum of every free block's size, kept in step by
+    /// `insert_free`/`allocate` so [`free_bytes`] is O(1) -- the
+    /// interpreter polls it on every loop iteration.
+    free: usize,
 }
 
 // SAFETY: the raw pointers here only ever refer into the private static
@@ -104,6 +108,7 @@ impl FreeListAllocator {
         FreeListAllocator {
             head: ptr::null_mut(),
             total: 0,
+            free: 0,
         }
     }
 
@@ -159,6 +164,8 @@ impl FreeListAllocator {
         }
 
         // Merge forward into `next` if adjacent.
+        self.free += size;
+
         let (block_size, after) = if !next.is_null() && end == next as usize {
             (size + unsafe { (*next).size }, unsafe { (*next).next })
         } else {
@@ -204,6 +211,7 @@ impl FreeListAllocator {
                 // `prev`/`cur.next` -- no coalescing with anything else is
                 // possible, since `cur` was itself maximal.
                 let after = unsafe { (*cur).next };
+                self.free -= block_size;
                 if prev.is_null() {
                     self.head = after;
                 } else {
@@ -324,6 +332,13 @@ pub unsafe fn init() {
     ALLOCATOR.with(|allocator| unsafe { allocator.init(heap_start, HEAP_SIZE) });
 }
 
+/// Bytes currently free, in O(1) (unlike [`stats`], which walks the free
+/// list). Total, not contiguous: fragmentation can make the largest
+/// single allocation that would succeed smaller than this.
+pub fn free_bytes() -> usize {
+    ALLOCATOR.with(|allocator| allocator.free)
+}
+
 /// Current heap occupancy and fragmentation.
 pub fn stats() -> HeapStats {
     ALLOCATOR.with(|allocator| allocator.stats())
@@ -382,6 +397,9 @@ pub fn self_test() -> Result<(), &'static str> {
     let after = stats();
     if after.free != before.free {
         return Err("self-test: free byte count changed across alloc/free (leak)");
+    }
+    if free_bytes() != after.free {
+        return Err("self-test: running free-byte counter disagrees with the free list");
     }
     if after.free_blocks != before.free_blocks {
         return Err("self-test: free list did not coalesce back to its original shape");

@@ -1,0 +1,127 @@
+{
+  "scope": "Static source checks plus independent bounded Python algorithm/interleaving models. No Rust or QEMU execution.",
+  "archive_sha256": "92b324800b8ab196768bb2d8a3d97d1f7b73ca45494ee36730fb78f8cf9cf84a",
+  "source_files": 67,
+  "source_hashes_unchanged": true,
+  "tools": {
+    "rustc": null,
+    "cargo": null,
+    "rustup": null,
+    "qemu-system-x86_64": null
+  },
+  "syntax": [
+    {
+      "file": "build.sh",
+      "check": "bash -n",
+      "result": "pass"
+    },
+    {
+      "file": "run.sh",
+      "check": "bash -n",
+      "result": "pass"
+    },
+    {
+      "file": "scripts/install_usb_linux.sh",
+      "check": "bash -n",
+      "result": "pass"
+    },
+    {
+      "file": "scripts/install_usb_macos.sh",
+      "check": "bash -n",
+      "result": "pass"
+    },
+    {
+      "file": "scripts/make_release.sh",
+      "check": "bash -n",
+      "result": "pass"
+    },
+    {
+      "file": "tests/acceptance_test.py",
+      "check": "Python ast.parse (not execution)",
+      "result": "pass"
+    },
+    {
+      "file": "tests/ahci_test.py",
+      "check": "Python ast.parse (not execution)",
+      "result": "pass"
+    },
+    {
+      "file": "tests/fault_test.py",
+      "check": "Python ast.parse (not execution)",
+      "result": "pass"
+    },
+    {
+      "file": "tests/usb_test.py",
+      "check": "Python ast.parse (not execution)",
+      "result": "pass"
+    },
+    {
+      "file": "tools/train_tiny_nn.py",
+      "check": "Python ast.parse (not execution)",
+      "result": "pass"
+    }
+  ],
+  "models": [
+    {
+      "name": "foreign-disk formatting order",
+      "outcome": "513 sectors replaced without ownership/blankness test",
+      "first_lba": 0,
+      "last_lba": 512,
+      "bytes_replaced": 262656
+    },
+    {
+      "name": "interrupted-format remount",
+      "outcome": "second invocation accepted superblock, performed zero further writes",
+      "uncleared_occupied_slot_headers": 64
+    },
+    {
+      "name": "self-test readback failure",
+      "outcome": "pattern remains in scratch LBA; restore was never reached"
+    },
+    {
+      "name": "shared-list DAG expansion",
+      "doublings": 22,
+      "distinct_lists": 23,
+      "serialized_bytes": 79691771,
+      "display_bytes": 29360124,
+      "kernel_heap_bytes": 8388608,
+      "note": "large output sizes calculated exactly; not allocated"
+    },
+    {
+      "name": "xHCI event read interleaving",
+      "outcome": "valid cycle accepted with stale payload",
+      "consumed_completion_code": 0,
+      "actual_completion_code": 1
+    },
+    {
+      "name": "USB report completion branch",
+      "cases": [
+        {
+          "endpoint_max_packet_size": 8,
+          "report_bytes": 8,
+          "completion_code": 1,
+          "callback_called_by_current_branch": true
+        },
+        {
+          "endpoint_max_packet_size": 16,
+          "report_bytes": 8,
+          "completion_code": 13,
+          "callback_called_by_current_branch": false
+        },
+        {
+          "endpoint_max_packet_size": 64,
+          "report_bytes": 8,
+          "completion_code": 13,
+          "callback_called_by_current_branch": false
+        }
+      ]
+    },
+    {
+      "name": "UTF-8 string byte-to-char conversion",
+      "source": "é",
+      "lexed": "Ã©",
+      "source_utf8_length": 2,
+      "lexed_utf8_length": 4
+    }
+  ]
+}

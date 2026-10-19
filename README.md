@@ -44,7 +44,8 @@ At the `>` prompt: `help` lists shell commands, `ls APPS` shows the
 bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
 `stopwatch`, `primes`) runs one. **Esc stops any running program.**
-`save`/`load` persist key/value pairs to the AHCI disk, `uptime` reports
+`save`/`load` persist key/value pairs to the AHCI disk (after a one-time
+`format`, which names the disk and asks before erasing anything), `uptime` reports
 elapsed time from the timer interrupt, `mem` shows heap and physical
 memory use, and `version` shows the kernel version and which hardware
 protections are live.
@@ -88,9 +89,12 @@ supported -- see `USB_INSTALL.md`.
    controller with a USB HID boot keyboard is present -- enumerates that
    device and polls its interrupt endpoint. Both paths feed one queue.
 7. Brings up storage: finds an AHCI controller over PCI, resets it,
-   IDENTIFYs the disk, self-tests a write/read-back/restore cycle, and
-   mounts its own key/value save format. Any failure downgrades to "no
-   persistence" with a message, never a hang.
+   IDENTIFYs the disk, and -- with a single read, never a write --
+   mounts its own key/value save format if the disk already carries
+   one. A blank or foreign disk is left untouched; the shell's `format`
+   command provisions it after showing the device and asking for
+   confirmation. Any failure downgrades to "no persistence" with a
+   message, never a hang.
 8. Hands the machine to the shell.
 
 ## Layout
@@ -132,6 +136,7 @@ tests/
   fault_test.py              deliberate CPU faults -> fault screens
   ahci_test.py                storage bring-up and persistence
   usb_test.py                  APIC routing and the USB keyboard path
+  host/                        cargo test: interpreter + save format, no VM
 tools/train_tiny_nn.py      offline trainer for the demo networks' weights
 USB_INSTALL.md            putting this on a stick and booting real hardware
 CHANGES.md                 engineering log: the specific decisions and why

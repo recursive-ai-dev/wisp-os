@@ -160,6 +160,24 @@ pub fn clear_stop_request() {
     });
 }
 
+/// 8042 status port: bit 0 = output buffer full, bit 5 = that byte came
+/// from the auxiliary (mouse) device rather than the keyboard.
+const STATUS_PORT: u16 = 0x64;
+const STATUS_OUTPUT_FULL: u8 = 1 << 0;
+const STATUS_AUX_DATA: u8 = 1 << 5;
+
+/// Consume a keyboard byte that is already waiting in the 8042 output
+/// buffer, exactly as the interrupt handler would have. Used once, during
+/// the 8259-to-APIC handover: IRQ1 is edge-triggered, and a byte that
+/// arrived while both controllers had the line masked would otherwise
+/// never be read -- and the 8042 raises no further edge until it is.
+pub fn drain_pending() {
+    let status = in8(STATUS_PORT);
+    if status & STATUS_OUTPUT_FULL != 0 && status & STATUS_AUX_DATA == 0 {
+        on_irq();
+    }
+}
+
 /// Called by the IDT's vector-0x21 dispatch, once per keyboard interrupt.
 /// Reads exactly one scancode byte (the PS/2 controller signals a fresh
 /// IRQ1 per byte; there is never more than one waiting) and, if it decodes

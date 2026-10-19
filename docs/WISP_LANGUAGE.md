@@ -59,6 +59,10 @@ Run it from the shell with `run guess.wisp` (or just `run guess` -- the
   `-5` is the unary `-` operator applied to `5`.
 - **String literals**: double-quoted, `"like this"`. Supported escapes:
   `\"`, `\\`, `\n`, `\t`. No multi-line strings.
+  Any UTF-8 text may appear between the quotes and is kept exactly as
+  written: `len("é")` is `2`, because string lengths are in bytes. (The
+  console font only draws ASCII, so other characters may *display* as a
+  placeholder, but the value itself is unchanged.)
 - **Boolean literals**: `true`, `false`.
 - **Nil literal**: `nil`.
 - **Whitespace**: spaces, tabs, and newlines are insignificant except as
@@ -135,14 +139,21 @@ let grid = [[1, 2], [3, 4]];             # and nest
   Strings *inside* a list are shown quoted (`print([1, "a"])` prints
   `[1, "a"]`) so they aren't ambiguous with bare words, even though a
   bare top-level string prints unquoted (`print("a")` prints `a`).
-- **Self-referential lists** (`let a = []; push(a, a);`) are not rejected
-  -- WISP doesn't try to detect cycles when you build one -- but
-  structural operations that would otherwise recurse forever into one
-  (`==`, `print`/`str`) are depth-limited (64 levels) so a cyclic list
-  degrades to a truncated `[...]` result instead of ever crashing the
-  shell. This isn't a feature to rely on, just a documented safety net;
-  there's no practical reason to build a self-referential list in a real
-  script.
+- **Self-referential lists** (`let a = []; push(a, a);`) are allowed.
+  `==` compares them by structure (two cyclic lists are equal when no
+  path through them finds a difference); `print`/`str` stop descending
+  after 64 levels and show `[...]`. Every list a program creates is
+  freed when the program ends, cycles included.
+- **Size limits.** Because lists are shared, a few lists can describe
+  an enormous structure (`v = [v, v]` repeated 22 times is 23 lists but
+  tens of megabytes when written out). So: `print` output for one value
+  stops after 16 KiB and ends with `...(truncated)`; `str()` of a value
+  longer than that is a runtime error; `==` gives up with an error after
+  visiting 100,000 elements; `save()` rejects anything whose encoding
+  exceeds one slot (4055 bytes) as soon as it gets that far. A list
+  holds at most 32,768 elements and a string at most 256 KiB. If a
+  program runs the kernel heap down to its reserve it is stopped with an
+  "out of memory" error.
 - No slicing (`a[1..3]`), no `+` concatenation between lists, no
   `insert`/`remove`-at-arbitrary-index, no `sort`/`map`/`filter` in v1.
   `oracle.wisp` (under `esp/APPS/`) shows the standard workaround for
@@ -263,10 +274,14 @@ Function declarations may appear anywhere at the top level of a program
 are all registered before the program's top-level statements start
 running, so a function can call another function declared later in the
 file. Calling a function with the wrong number of arguments is a runtime
-error. Recursion is supported, with a call-depth limit (currently 256
-nested calls) that produces a clean "stack overflow" runtime error instead
-of crashing the shell -- if you hit it, you have an unbounded recursion
-bug.
+error. Recursion is supported, with a call-depth limit (256 nested calls)
+and a combined nesting budget (1024 levels of nested calls, statements
+and expressions together) that produce a clean "stack overflow" runtime
+error instead of crashing the shell. A simple recursive function reaches
+about 250 calls; one whose body nests deeper reaches the combined budget
+sooner. Independently, one block or expression may nest at most 128
+levels deep (parentheses, `not`/`-`, indexing, blocks, and each operator
+in a chain like `1 + 2 + 3` all count) -- deeper is a parse error.
 
 ## Built-in functions
 

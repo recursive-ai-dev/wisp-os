@@ -12,12 +12,21 @@ use super::ast::{BinaryOp, Expr, FuncDecl, Program, Stmt, TopItem, UnaryOp};
 use super::lexer::{Tok, Token};
 use super::WispError;
 
+/// Deepest syntax tree the parser builds, counting every nested block,
+/// parenthesized/sub-expression, unary operator, index, and each link of
+/// a binary-operator chain (`1 + 1 + 1` is a left-leaning tree as deep as
+/// it is long). Everything that later walks the tree -- evaluation,
+/// dropping it -- recurses once per level on the kernel stack, so the
+/// limit is enforced while parsing, before an oversized tree exists.
+/// Real programs stay in the low tens.
+pub const MAX_SYNTAX_DEPTH: usize = 128;
+
 pub fn parse(tokens: &[Token]) -> Result<Program, WispError> {
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser { tokens, pos: 0, depth: 0 };
     let mut items = Vec::new();
     while !p.is_eof() {
         if p.check(&Tok::Fn) {
-            items.push(TopItem::Func(p.parse_func_decl()?));
+            items.push(TopItem::Func(alloc::rc::Rc::new(p.parse_func_decl()?)));
         } else {
             items.push(TopItem::Stmt(p.parse_stmt()?));
         }
@@ -28,9 +37,26 @@ pub fn parse(tokens: &[Token]) -> Result<Program, WispError> {
 struct Parser<'t> {
     tokens: &'t [Token],
     pos: usize,
+    /// Syntax-tree depth of the node currently being parsed; see
+    /// [`MAX_SYNTAX_DEPTH`].
+    depth: usize,
 }
 
 impl<'t> Parser<'t> {
+    /// Go one level deeper into the syntax tree, failing cleanly past
+    /// [`MAX_SYNTAX_DEPTH`]. Callers restore `self.depth` on the way out;
+    /// on an error the whole parse is abandoned, so no restore is needed.
+    fn descend(&mut self) -> Result<(), WispError> {
+        self.depth += 1;
+        if self.depth > MAX_SYNTAX_DEPTH {
+            return Err(WispError::new(
+                self.peek_line(),
+                format!("program is nested too deeply (over {MAX_SYNTAX_DEPTH} levels of blocks/expressions)"),
+            ));
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].tok
     }
@@ -96,6 +122,7 @@ impl<'t> Parser<'t> {
 
     // ---- top-level items ----
 
+    #[inline(never)]
     fn parse_func_decl(&mut self) -> Result<FuncDecl, WispError> {
         let line = self.peek_line();
         self.expect(Tok::Fn)?;
@@ -122,6 +149,7 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, WispError> {
+        self.descend()?;
         self.expect(Tok::LBrace)?;
         let mut stmts = Vec::new();
         while !self.check(&Tok::RBrace) {
@@ -134,6 +162,7 @@ impl<'t> Parser<'t> {
             stmts.push(self.parse_stmt()?);
         }
         self.expect(Tok::RBrace)?;
+        self.depth -= 1;
         Ok(stmts)
     }
 
@@ -169,6 +198,7 @@ impl<'t> Parser<'t> {
         }
     }
 
+    #[inline(never)]
     fn parse_let(&mut self) -> Result<Stmt, WispError> {
         let line = self.peek_line();
         self.expect(Tok::Let)?;
@@ -179,6 +209,7 @@ impl<'t> Parser<'t> {
         Ok(Stmt::Let { name, expr, line })
     }
 
+    #[inline(never)]
     fn parse_assign(&mut self) -> Result<Stmt, WispError> {
         let line = self.peek_line();
         let name = self.expect_ident()?;
@@ -197,6 +228,7 @@ impl<'t> Parser<'t> {
     /// `[...]` -- and only diverge at the token right after that chain,
     /// so this parses the postfix target once and branches on what comes
     /// next, rather than needing unbounded lookahead or backtracking.
+    #[inline(never)]
     fn parse_index_assign_or_expr_stmt(&mut self) -> Result<Stmt, WispError> {
         let line = self.peek_line();
         let target = self.parse_postfix()?;
@@ -220,6 +252,7 @@ impl<'t> Parser<'t> {
         Ok(Stmt::ExprStmt(target))
     }
 
+    #[inline(never)]
     fn parse_if(&mut self) -> Result<Stmt, WispError> {
         self.expect(Tok::If)?;
         let mut branches = Vec::new();
@@ -243,6 +276,7 @@ impl<'t> Parser<'t> {
         Ok(Stmt::If { branches, else_body })
     }
 
+    #[inline(never)]
     fn parse_while(&mut self) -> Result<Stmt, WispError> {
         let line = self.expect(Tok::While)?.line;
         let cond = self.parse_expr()?;
@@ -250,6 +284,7 @@ impl<'t> Parser<'t> {
         Ok(Stmt::While { cond, body, line })
     }
 
+    #[inline(never)]
     fn parse_return(&mut self) -> Result<Stmt, WispError> {
         self.expect(Tok::Return)?;
         let expr = if self.check(&Tok::Semi) {
@@ -264,118 +299,30 @@ impl<'t> Parser<'t> {
     // ---- expressions, lowest to highest precedence ----
 
     fn parse_expr(&mut self) -> Result<Expr, WispError> {
-        self.parse_or()
+        self.descend()?;
+        let expr = self.parse_binary(1)?;
+        self.depth -= 1;
+        Ok(expr)
     }
 
-    fn parse_or(&mut self) -> Result<Expr, WispError> {
-        let mut lhs = self.parse_and()?;
-        while self.check(&Tok::Or) {
-            let line = self.peek_line();
-            self.advance();
-            let rhs = self.parse_and()?;
-            lhs = Expr::Binary {
-                op: BinaryOp::Or,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                line,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_and(&mut self) -> Result<Expr, WispError> {
-        let mut lhs = self.parse_equality()?;
-        while self.check(&Tok::And) {
-            let line = self.peek_line();
-            self.advance();
-            let rhs = self.parse_equality()?;
-            lhs = Expr::Binary {
-                op: BinaryOp::And,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                line,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_equality(&mut self) -> Result<Expr, WispError> {
-        let mut lhs = self.parse_comparison()?;
-        loop {
-            let op = match self.peek() {
-                Tok::EqEq => BinaryOp::Eq,
-                Tok::NotEq => BinaryOp::Ne,
-                _ => break,
-            };
-            let line = self.peek_line();
-            self.advance();
-            let rhs = self.parse_comparison()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                line,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_comparison(&mut self) -> Result<Expr, WispError> {
-        let mut lhs = self.parse_term()?;
-        loop {
-            let op = match self.peek() {
-                Tok::Lt => BinaryOp::Lt,
-                Tok::Le => BinaryOp::Le,
-                Tok::Gt => BinaryOp::Gt,
-                Tok::Ge => BinaryOp::Ge,
-                _ => break,
-            };
-            let line = self.peek_line();
-            self.advance();
-            let rhs = self.parse_term()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                line,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_term(&mut self) -> Result<Expr, WispError> {
-        let mut lhs = self.parse_factor()?;
-        loop {
-            let op = match self.peek() {
-                Tok::Plus => BinaryOp::Add,
-                Tok::Minus => BinaryOp::Sub,
-                _ => break,
-            };
-            let line = self.peek_line();
-            self.advance();
-            let rhs = self.parse_factor()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                line,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_factor(&mut self) -> Result<Expr, WispError> {
+    /// Every binary operator at or above `min_prec`, by precedence
+    /// climbing (lowest to highest: `or`, `and`, `==`/`!=`, comparisons,
+    /// `+`/`-`, `*`/`/`/`%`; all left-associative). One function for all
+    /// six levels rather than one per level: a parenthesized
+    /// sub-expression then costs one native stack frame here instead of
+    /// six, which is most of what bounds how deep `MAX_SYNTAX_DEPTH` can
+    /// safely be.
+    fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, WispError> {
+        let base = self.depth;
         let mut lhs = self.parse_unary()?;
-        loop {
-            let op = match self.peek() {
-                Tok::Star => BinaryOp::Mul,
-                Tok::Slash => BinaryOp::Div,
-                Tok::Percent => BinaryOp::Rem,
-                _ => break,
-            };
+        while let Some((op, prec)) = binary_op(self.peek()) {
+            if prec < min_prec {
+                break;
+            }
             let line = self.peek_line();
             self.advance();
-            let rhs = self.parse_unary()?;
+            self.descend()?;
+            let rhs = self.parse_binary(prec + 1)?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -383,13 +330,16 @@ impl<'t> Parser<'t> {
                 line,
             };
         }
+        self.depth = base;
         Ok(lhs)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, WispError> {
         let line = self.peek_line();
         if self.match_tok(&Tok::Not) {
+            self.descend()?;
             let expr = self.parse_unary()?;
+            self.depth -= 1;
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(expr),
@@ -397,7 +347,9 @@ impl<'t> Parser<'t> {
             });
         }
         if self.match_tok(&Tok::Minus) {
+            self.descend()?;
             let expr = self.parse_unary()?;
+            self.depth -= 1;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
                 expr: Box::new(expr),
@@ -412,10 +364,12 @@ impl<'t> Parser<'t> {
     /// `not`/`-` and looser than nothing (it's the tightest-binding
     /// construct in the language, same as function calls).
     fn parse_postfix(&mut self) -> Result<Expr, WispError> {
+        let base = self.depth;
         let mut expr = self.parse_primary()?;
         while self.check(&Tok::LBracket) {
             let line = self.peek_line();
             self.advance();
+            self.descend()?;
             let index = self.parse_expr()?;
             self.expect(Tok::RBracket)?;
             expr = Expr::Index {
@@ -424,6 +378,7 @@ impl<'t> Parser<'t> {
                 line,
             };
         }
+        self.depth = base;
         Ok(expr)
     }
 
@@ -475,6 +430,27 @@ impl<'t> Parser<'t> {
             other => Err(WispError::new(line, format!("unexpected {}", describe(&other)))),
         }
     }
+}
+
+/// A binary operator token's operator and precedence (higher binds
+/// tighter), or `None` if `tok` is not one.
+fn binary_op(tok: &Tok) -> Option<(BinaryOp, u8)> {
+    Some(match tok {
+        Tok::Or => (BinaryOp::Or, 1),
+        Tok::And => (BinaryOp::And, 2),
+        Tok::EqEq => (BinaryOp::Eq, 3),
+        Tok::NotEq => (BinaryOp::Ne, 3),
+        Tok::Lt => (BinaryOp::Lt, 4),
+        Tok::Le => (BinaryOp::Le, 4),
+        Tok::Gt => (BinaryOp::Gt, 4),
+        Tok::Ge => (BinaryOp::Ge, 4),
+        Tok::Plus => (BinaryOp::Add, 5),
+        Tok::Minus => (BinaryOp::Sub, 5),
+        Tok::Star => (BinaryOp::Mul, 6),
+        Tok::Slash => (BinaryOp::Div, 6),
+        Tok::Percent => (BinaryOp::Rem, 6),
+        _ => return None,
+    })
 }
 
 fn describe(tok: &Tok) -> String {

@@ -165,14 +165,24 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                             s.push(escaped);
                             i += 1;
                         }
-                        b => {
-                            // Scripts are plain ASCII by construction (the
-                            // language has no need for non-ASCII source
-                            // text yet), so byte-at-a-time is safe here;
-                            // any stray high-bit byte just becomes a
-                            // literal char, which is harmless.
+                        b if b.is_ascii() => {
                             s.push(b as char);
                             i += 1;
+                        }
+                        _ => {
+                            // A non-ASCII character: decode the whole UTF-8
+                            // sequence rather than casting each byte to a
+                            // `char` (which would turn `é`, bytes C3 A9,
+                            // into the two characters `Ã©`). `src` is a
+                            // `&str` and every earlier byte consumed was
+                            // either ASCII or a whole character, so `i` is
+                            // always on a character boundary here.
+                            let ch = src[i..]
+                                .chars()
+                                .next()
+                                .expect("i is a char boundary inside a non-empty &str");
+                            s.push(ch);
+                            i += ch.len_utf8();
                         }
                     }
                 }

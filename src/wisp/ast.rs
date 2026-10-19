@@ -158,7 +158,9 @@ pub struct FuncDecl {
 /// source text.
 #[derive(Debug, Clone)]
 pub enum TopItem {
-    Func(FuncDecl),
+    /// Shared, so registering a function with the interpreter is a
+    /// refcount bump rather than a deep copy of its whole body.
+    Func(Rc<FuncDecl>),
     Stmt(Stmt),
 }
 

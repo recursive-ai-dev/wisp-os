@@ -1,0 +1,23 @@
+# Host-side regression tests for the parts of the kernel that do not touch
+# hardware: the WISP language core (src/wisp) and the save-disk format
+# (src/save_format.rs) over an in-memory disk with a volatile write cache.
+# The kernel sources are compiled in unmodified via #[path]; only `ahci`
+# is replaced, by the disk model in src/ahci.rs here.
+#
+#   cd tests/host && cargo test --release
+#
+# --release matters: the stack-depth tests run scripts on a deliberately
+# small thread stack, and only optimized frame sizes are meaningful.
+[package]
+name = "wisp-host-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Stand-alone: not part of the kernel's (non-)workspace.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+debug-assertions = true
+overflow-checks = true
