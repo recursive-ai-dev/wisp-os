@@ -336,10 +336,11 @@ fn builtin_sleep_ms(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Va
 }
 
 /// `save(key, value)`: persist `value` under `key` on the AHCI save disk,
-/// surviving a reboot (Phase 2, Part B). Always returns `nil` on success;
-/// the interesting failure modes (no save disk, key/value too large, out
-/// of slots) all surface as a normal WISP runtime error via `Err`, the
-/// same way any other builtin reports a problem.
+/// surviving a reboot (Phase 2, Part B); `save(key, nil)` deletes the
+/// key. Always returns `nil` on success; the interesting failure modes (no
+/// save disk, key/value too large, store full) all surface as a normal
+/// WISP runtime error via `Err`, the same way any other builtin reports a
+/// problem.
 fn builtin_save(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Value, WispError> {
     expect_arity(args, 2, "save", line)?;
     let key = match &args[0] {

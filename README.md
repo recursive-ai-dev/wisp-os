@@ -45,7 +45,8 @@ bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
 `stopwatch`, `primes`) runs one. **Esc stops any running program.**
 `save`/`load` persist key/value pairs to the AHCI disk (after a one-time
-`format`, which names the disk and asks before erasing anything), `uptime` reports
+`format`, which names the disk and asks before erasing anything) -- each
+save is crash-atomic, and `keys`/`delete` list and remove them -- `uptime` reports
 elapsed time from the timer interrupt, `mem` shows heap and physical
 memory use, and `version` shows the kernel version and which hardware
 protections are live.
@@ -91,7 +92,8 @@ supported -- see `USB_INSTALL.md`.
 7. Brings up storage: finds an AHCI controller over PCI, resets it,
    IDENTIFYs the disk, and -- with a single read, never a write --
    mounts its own key/value save format if the disk already carries
-   one. A blank or foreign disk is left untouched; the shell's `format`
+   one. Saves are copy-on-write: a power cut mid-save leaves the old
+   value or the new one, never neither. A blank or foreign disk is left untouched; the shell's `format`
    command provisions it after showing the device and asking for
    confirmation. Any failure downgrades to "no persistence" with a
    message, never a hang.

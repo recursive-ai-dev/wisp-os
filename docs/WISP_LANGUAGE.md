@@ -334,16 +334,21 @@ by `fn`:
   a `string` of 32 bytes or fewer; `value` may be any WISP value --
   `nil`/`bool`/`int`/`string` directly, or a `list` (nested lists are
   supported, to the same 64-level depth limit as everything else
-  structural in this language). Returns `nil`. Runtime error if there's no
-  save disk available this boot, `key` is empty or too long, `value` is
-  too large to fit in one save slot, or every save slot is already in use
-  (64 slots total).
+  structural in this language). Saving `nil` deletes the key, freeing
+  its slot. Returns `nil`. Each save is atomic: if the machine crashes
+  or loses power while `save()` is running, the key afterwards holds
+  either its old value or the new one, never neither -- and once
+  `save()` returns, the new value is on the disk (see
+  `docs/SAVE_FORMAT.md`). Runtime error if there's no save disk
+  available this boot, `key` is empty or too long, `value` is too large
+  to fit in one save slot (its encoding is over 4047 bytes), or `key` is
+  new and 63 keys are already stored (the shell's `keys` command lists
+  them, and `delete <key>` removes one).
 - `load(key)` -- looks up the value previously saved under `key`. Returns
-  `nil` if `key` was never saved -- WISP has no separate "undefined" value
-  distinct from `nil`, so a script checks for "nothing saved yet" with
-  `if load("x") == nil { ... }`. (A key saved with the value `nil` itself
-  is indistinguishable from "never saved" -- a deliberate simplification,
-  not a bug.) Runtime error if there's no save disk available this boot,
+  `nil` if `key` was never saved (or was deleted by saving `nil`) -- WISP
+  has no separate "undefined" value distinct from `nil`, so a script
+  checks for "nothing saved yet" with `if load("x") == nil { ... }`.
+  Runtime error if there's no save disk available this boot,
   `key` is empty or too long, or the save data itself is corrupt.
   `esp/APPS/counter.wisp` is the canonical example: it loads a boot
   counter (or starts at 0 if there isn't one yet), increments it, saves it

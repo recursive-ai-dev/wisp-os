@@ -1,6 +1,6 @@
 //! The interactive command shell: prompt, line editing, and command
 //! dispatch for `help`, `clear`, `echo`, `ls`, `run`, `uptime`, `mem`,
-//! `version`, `save`, and `load`.
+//! `version`, `save`, `load`, `keys`, `delete`, and `format`.
 //!
 //! Runs entirely on our own drivers (`keyboard.rs` for input, `clock.rs` for
 //! timing) -- there is no Boot Services left to lean on by the time this
@@ -260,6 +260,8 @@ impl Shell {
             "mem" => self.cmd_mem(console),
             "save" => self.cmd_save(rest, console),
             "load" => self.cmd_load(rest, console),
+            "keys" => self.cmd_keys(console),
+            "delete" => self.cmd_delete(rest, console),
             "format" => self.cmd_format(console),
             // Hidden, feature-gated, never listed in `cmd_help`: exists
             // purely so `tests/fault_test.py` can prove the GDT/IDT/
@@ -395,6 +397,8 @@ impl Shell {
              \x20\x20version       Show the kernel version and protections\n\
              \x20\x20save <k> <v>  Save <v> under key <k> on the AHCI save disk\n\
              \x20\x20load <k>      Print the value saved under key <k>\n\
+             \x20\x20keys          List every key on the save disk\n\
+             \x20\x20delete <k>    Delete key <k> from the save disk\n\
              \x20\x20format        Set up the AHCI disk for save/load (ERASES it; asks first)\n\
              Press Esc to stop a running program.\n",
         );
@@ -467,6 +471,60 @@ impl Shell {
             Err(msg) => {
                 console.set_fg(gfx::ERROR);
                 let _ = write!(console, "load: {msg}\n");
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+    }
+
+    /// `keys`: every key on the save disk with its stored size, then how
+    /// much of the store's capacity is in use.
+    fn cmd_keys(&mut self, console: &mut Console) {
+        let Some(disk) = self.save_disk.as_ref() else {
+            console.set_fg(gfx::ERROR);
+            console.write_str("keys: no AHCI save disk available this boot\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        };
+        match disk.keys() {
+            Ok(keys) => {
+                for (key, len) in &keys {
+                    let _ = write!(console, "     {key}  ({len} bytes)\n");
+                }
+                let _ = write!(console, "{} of {} keys in use\n", keys.len(), save_format::MAX_KEYS);
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = write!(console, "keys: {msg}\n");
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+    }
+
+    /// `delete <key>`: remove a key from the save disk, freeing its slot.
+    fn cmd_delete(&mut self, rest: &str, console: &mut Console) {
+        let key = rest.trim();
+        if key.is_empty() {
+            console.set_fg(gfx::ERROR);
+            console.write_str("delete: expected 'delete <key>'\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        }
+        let Some(disk) = self.save_disk.as_ref() else {
+            console.set_fg(gfx::ERROR);
+            console.write_str("delete: no AHCI save disk available this boot\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        };
+        match disk.delete(key) {
+            Ok(true) => {
+                let _ = write!(console, "deleted '{key}'\n");
+            }
+            Ok(false) => {
+                let _ = write!(console, "delete: '{key}' not found\n");
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = write!(console, "delete: {msg}\n");
                 console.set_fg(gfx::FOREGROUND);
             }
         }

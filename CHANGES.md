@@ -2220,3 +2220,83 @@ pinned, and that exactly the withheld count was released after both the
 `CR3` and stack switches. Reverting `pmm::init` to the old behaviour fails
 that step with all three diagnostics. All four QEMU suites pass; boots
 with `-cpu max` and with 2 GiB were checked by hand.
+
+## Save format version 2: crash-atomic saves
+
+The audit remediation left one storage limitation standing: "slot
+updates are still not atomic -- flushing makes them durable, not
+crash-atomic." Version 1 overwrote a key's slot in place, sector by
+sector, so a power cut in the middle of `save` could leave the slot torn:
+the old value gone and the new one incomplete, reported on the next
+`load` as a checksum error. For `counter.wisp`, a power cut at the wrong
+moment meant the count was lost outright.
+
+Version 2 never overwrites a live value. Each key's value is a *copy*
+with a generation number; readers take the highest generation. An update
+writes a new copy into a free slot -- value sectors, flush, header sector,
+flush (the commit) -- and only then frees the old copy. Under a cache that
+may persist any subset of unflushed writes in any order, a crash at any
+point leaves the old value or the new one. Details and the argument are in
+`docs/SAVE_FORMAT.md` ("Saving: copy-on-write").
+
+- **Whole-copy checksum.** The checksum now covers the header (state, key,
+  length, generation) as well as the value: otherwise a bit flip that
+  raised a stale copy's generation would silently promote an old value.
+- **Stale copies.** A crash after the commit but before the old copy is
+  freed leaves a stale copy. Every save and delete frees all stale copies,
+  and flushes, before writing anything else, so a later delete cannot let
+  an older generation resurface.
+- **A save whose cleanup fails still succeeds.** Once the commit flush has
+  completed the new value is durable; failing to free the old copy only
+  leaves it stale. Reporting an error there would claim a save failed that
+  had in fact taken effect.
+- **63 keys.** One slot is always kept free for the next copy-on-write
+  update. `save(key, nil)` now deletes the key (frees its slot): `load` of
+  a missing key already returned `nil`, so the two were never
+  distinguishable, and the slot is no longer spent on "nothing".
+- **New shell commands** `keys` (each key and its size, plus how many of
+  the 63 are in use) and `delete <key>`.
+- **Header-only scans.** A slot's header fits in its first sector, so
+  `save`/`load` scan 64 sectors instead of reading all 512.
+- **Keys may not contain NUL** (the key field is zero-padded, so `"a"` and
+  `"a\0"` were the same key). Unreachable from WISP source, rejected
+  anyway.
+- **Version-1 disks keep working.** They mount and read unchanged (a v1
+  copy is generation 0). The first save -- once it is known to have room
+  -- upgrades the store by rewriting the superblock's version byte, one
+  flushed sector, before any v2 copy exists; a v1.0.0 kernel then reports
+  the disk unsupported instead of misreading it. A v1 store that used all
+  64 slots cannot take an update (no free slot), and says so -- with
+  "delete a key" as the remedy -- rather than falling back to an unsafe
+  in-place write. The first draft upgraded the superblock before checking
+  for room, so a save that *failed* still locked v1.0.0 out of the disk;
+  caught while writing the test for exactly that case, and reordered.
+
+Verified:
+
+- `tests/host/tests/save_format_v2.rs` (20 tests). The core harness runs
+  each operation -- small, multi-sector, shrinking and growing updates,
+  new keys, deletes, `nil` saves, operations on a store with a stale copy,
+  and upgrading saves on v1 stores -- with the device stopped after every
+  possible number of writes and flushes, builds the disk image for *every*
+  subset of the unflushed writes reaching the media (the multi-sector case
+  has seven in flight: all 128 subsets per crash point), and on each image
+  checks that the store mounts, the key holds its old or new value (the new
+  one if the operation had reported success), no other key changed, no v2
+  copy sits on a disk still labelled v1, and that the store recovers -- a
+  further save succeeds and leaves no stale copies. Version-1 disks are
+  built by an independent encoder written from the spec. The documented
+  worked example is checked byte for byte.
+- Mutation testing: eight deliberate bugs -- dropping the value barrier,
+  freeing the old copy before the commit, picking the lowest generation,
+  reclaiming without a flush, upgrading without a flush, upgrading after
+  the copy, skipping reclamation in delete, and leaving the generation out
+  of the checksum -- each fail at least one test.
+- `tests/ahci_test.py` `full_stack` now updates a key, adds, lists and
+  deletes another over real (emulated) AHCI, then decodes the image: only
+  slot 1 in use, holding generation 2 with a checksum recomputed in
+  Python. New scenario `legacy_v1_store` hand-builds a v1.0.0-layout disk,
+  boots, reads its values, saves, and checks the upgrade on disk: version
+  byte (and nothing else in the superblock) changed, the update written
+  copy-on-write at generation 1, the old copy freed, the untouched v1 copy
+  byte-identical, nothing outside the region written.

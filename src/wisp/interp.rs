@@ -79,9 +79,10 @@ pub trait Host {
     fn rand_u64(&mut self) -> u64;
     /// Persist `value` under `key`, surviving a reboot -- backed by
     /// `save_format.rs` over the AHCI save disk (Phase 2, Part B).
-    /// Overwrites any value already saved under `key`. `Err` covers both
-    /// "no save disk available this boot" and every `save_format::save`
-    /// failure (key too long, value too large, all slots full).
+    /// Replaces any value already saved under `key`, crash-atomically;
+    /// saving `Value::Nil` deletes the key. `Err` covers both "no save
+    /// disk available this boot" and every `save_format::save` failure
+    /// (key too long, value too large, store full).
     fn save(&mut self, key: &str, value: &Value) -> Result<(), &'static str>;
     /// Look up a value previously saved under `key`. `Ok(None)` means
     /// `key` was never saved -- a normal, first-class outcome, not an

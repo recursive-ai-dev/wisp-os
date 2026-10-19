@@ -105,20 +105,26 @@ BOOT_MARKERS = ["[pmm] self-test OK", "[boot] interrupts enabled"]
 # precedent of small hand-mirrored constants in test code (e.g.
 # fault_test.py's EXCEPTION_NAMES table).
 SAVE_MAGIC = b"WISPSAVE1"
-SAVE_FORMAT_VERSION = 1
+SAVE_FORMAT_VERSION = 2
 SAVE_SLOT_COUNT = 64
 SECTOR_SIZE = 512
 SECTORS_PER_SLOT = 8
 SAVE_SLOT_SIZE = SECTORS_PER_SLOT * SECTOR_SIZE  # 4096
 SAVE_KEY_MAX_LEN = 32
-SAVE_SLOT_HEADER_LEN = 1 + SAVE_KEY_MAX_LEN + 4 + 4  # in_use + key + value_len + checksum
+SAVE_MAX_KEYS = SAVE_SLOT_COUNT - 1
+SLOT_STATE_COMMITTED = 2
+SLOT_OFF_LEN = 1 + SAVE_KEY_MAX_LEN          # after state + key
+SLOT_OFF_CHECKSUM = SLOT_OFF_LEN + 4
+SLOT_OFF_GENERATION = SLOT_OFF_CHECKSUM + 4
+SAVE_SLOT_HEADER_LEN = SLOT_OFF_GENERATION + 8  # state + key + value_len + checksum + generation
 SUPERBLOCK_LBA = 0
 SLOTS_START_LBA = 1
 TAG_STR = 3
 
 
 def fnv1a32(data: bytes) -> int:
-    """Exact port of save_format.rs's fnv1a32 -- FNV-1a, 32-bit."""
+    """Exact port of save_format.rs's fnv1a32 -- FNV-1a, 32-bit (over the
+    concatenation of its parts; pass them joined)."""
     h = 0x811C_9DC5
     for b in data:
         h ^= b
@@ -474,6 +480,43 @@ def scenario_full_stack():
             f"{scenario} (load reports a clean 'not found' for an unsaved key)",
         )
 
+        # Save format v2: an update is written copy-on-write into a free
+        # slot with the next generation, and the old copy freed -- the
+        # on-disk check below verifies exactly where everything landed.
+        mon.type_text("save greeting hello again")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("load greeting")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("05_after_update"),
+            "hello again",
+            f"{scenario} (an updated value loads back)",
+        )
+        mon.type_text("save note first")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("keys")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("06_keys"),
+            ["greeting", "note", f"2 of {SAVE_MAX_KEYS} keys"],
+            f"{scenario} (keys lists both keys and the capacity)",
+        )
+        mon.type_text("delete note")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("keys")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("07_after_delete"),
+            ["deleted", f"1 of {SAVE_MAX_KEYS} keys"],
+            f"{scenario} (delete frees the key)",
+        )
+
     log, banner_shot = run_and_capture(scenario, scenario_dir, save_img=save_img, interact=interact)
 
     assert_boot_markers_once(log, scenario)
@@ -558,41 +601,58 @@ def scenario_full_stack():
     if any(raw[513 * SECTOR_SIZE:-SECTOR_SIZE]):
         raise RuntimeError(f"[{scenario}] bytes beyond the save region (LBA 512) were written")
 
-    # slot 0 must hold the "greeting" -> "hello world" save issued above --
-    # the first (and only) key saved this boot, so it must have landed in
-    # the very first free slot.
-    slot0_lba = SLOTS_START_LBA
-    slot0 = raw[slot0_lba * SECTOR_SIZE: slot0_lba * SECTOR_SIZE + SAVE_SLOT_SIZE]
-    in_use = slot0[0]
-    key_field = slot0[1:1 + SAVE_KEY_MAX_LEN]
-    key = key_field.rstrip(b"\x00").decode("ascii")
-    value_len = struct.unpack_from("<I", slot0, 1 + SAVE_KEY_MAX_LEN)[0]
-    checksum = struct.unpack_from("<I", slot0, 1 + SAVE_KEY_MAX_LEN + 4)[0]
-    payload = slot0[SAVE_SLOT_HEADER_LEN:SAVE_SLOT_HEADER_LEN + value_len]
+    # The session above, slot by slot (first free slot each time):
+    #   save greeting "hello world" -> slot 0, generation 1
+    #   save greeting "hello again" -> slot 1, generation 2; slot 0 freed
+    #   save note "first"           -> slot 0, generation 1
+    #   delete note                 -> slot 0 freed
+    # so exactly one slot -- slot 1 -- may be in use now.
+    states = [raw[(SLOTS_START_LBA + i * SECTORS_PER_SLOT) * SECTOR_SIZE] for i in range(SAVE_SLOT_COUNT)]
+    in_use_slots = [i for i, st in enumerate(states) if st != 0]
+    if in_use_slots != [1]:
+        raise RuntimeError(
+            f"[{scenario}] expected exactly slot 1 in use after update + delete, found {in_use_slots} "
+            f"(states {states[:4]}...): copy-on-write did not free the replaced/deleted copies"
+        )
+    slot1_lba = SLOTS_START_LBA + SECTORS_PER_SLOT
+    slot = raw[slot1_lba * SECTOR_SIZE: slot1_lba * SECTOR_SIZE + SAVE_SLOT_SIZE]
+    state = slot[0]
+    key = slot[1:1 + SAVE_KEY_MAX_LEN].rstrip(b"\x00").decode("ascii")
+    value_len = struct.unpack_from("<I", slot, SLOT_OFF_LEN)[0]
+    checksum = struct.unpack_from("<I", slot, SLOT_OFF_CHECKSUM)[0]
+    generation = struct.unpack_from("<Q", slot, SLOT_OFF_GENERATION)[0]
+    payload = slot[SAVE_SLOT_HEADER_LEN:SAVE_SLOT_HEADER_LEN + value_len]
 
-    expected_encoded = encode_str_value("hello world")
-    if in_use != 1:
-        raise RuntimeError(f"[{scenario}] on-disk slot 0's in-use flag is {in_use}, expected 1")
+    expected_encoded = encode_str_value("hello again")
+    # The checksum covers the whole header except the checksum field itself
+    # (state, key, length, generation), then the value.
+    expected_checksum = fnv1a32(
+        slot[:SLOT_OFF_CHECKSUM] + slot[SLOT_OFF_GENERATION:SAVE_SLOT_HEADER_LEN + value_len]
+    )
+    if state != SLOT_STATE_COMMITTED:
+        raise RuntimeError(f"[{scenario}] on-disk slot 1's state is {state}, expected {SLOT_STATE_COMMITTED}")
     if key != "greeting":
-        raise RuntimeError(f"[{scenario}] on-disk slot 0's key is {key!r}, expected 'greeting'")
+        raise RuntimeError(f"[{scenario}] on-disk slot 1's key is {key!r}, expected 'greeting'")
+    if generation != 2:
+        raise RuntimeError(f"[{scenario}] on-disk slot 1's generation is {generation}, expected 2 (one update)")
     if value_len != len(expected_encoded):
         raise RuntimeError(
-            f"[{scenario}] on-disk slot 0's value_len is {value_len}, expected {len(expected_encoded)}"
-        )
-    if checksum != fnv1a32(expected_encoded):
-        raise RuntimeError(
-            f"[{scenario}] on-disk slot 0's checksum is 0x{checksum:08x}, "
-            f"expected 0x{fnv1a32(expected_encoded):08x}"
+            f"[{scenario}] on-disk slot 1's value_len is {value_len}, expected {len(expected_encoded)}"
         )
     if payload != expected_encoded:
         raise RuntimeError(
-            f"[{scenario}] on-disk slot 0's encoded value {payload!r} != expected {expected_encoded!r}"
+            f"[{scenario}] on-disk slot 1's encoded value {payload!r} != expected {expected_encoded!r}"
+        )
+    if checksum != expected_checksum:
+        raise RuntimeError(
+            f"[{scenario}] on-disk slot 1's checksum is 0x{checksum:08x}, expected 0x{expected_checksum:08x}"
         )
 
     print(
         f"==> PASS [{scenario}]: PCI->ABAR->port->IDENTIFY->raw read/write->save_format, "
         f"all verified end to end (total_sectors={total_sectors}, PI=0x{pi:02x}, "
-        f"slot 0 = key='greeting' value='hello world' checksum=0x{checksum:08x})"
+        f"slot 1 = key='greeting' value='hello again' generation={generation} checksum=0x{checksum:08x}; "
+        f"replaced and deleted copies freed)"
     )
 
 
@@ -638,6 +698,110 @@ def scenario_foreign_disk_untouched():
     print(f"==> PASS [{scenario}]: foreign disk byte-identical after boot and save/load attempts")
 
 
+def scenario_legacy_v1_store():
+    """Save format v2 compatibility: a store written in the v1.0.0 layout
+    (format version 1 -- no generation field, checksum over the value
+    only), built here byte by byte from docs/SAVE_FORMAT.md's description
+    of it, must mount, read back, and be upgraded in place by its first
+    save: superblock version byte rewritten, the updated key written as a
+    version-2 copy in a free slot, the old copy freed, and every other
+    version-1 copy left byte-identical."""
+    scenario = "legacy_v1_store"
+    scenario_dir = os.path.join(OUT_DIR, scenario)
+    os.makedirs(scenario_dir, exist_ok=True)
+    save_img = os.path.join(scenario_dir, "save.img")
+    subprocess.run(["qemu-img", "create", "-f", "raw", save_img, "64M"], check=True, capture_output=True)
+
+    def v1_slot(key: str, encoded: bytes) -> bytes:
+        slot = bytearray(SAVE_SLOT_SIZE)
+        slot[0] = 1  # v1 "in use"
+        slot[1:1 + len(key)] = key.encode("ascii")
+        struct.pack_into("<I", slot, SLOT_OFF_LEN, len(encoded))
+        struct.pack_into("<I", slot, SLOT_OFF_CHECKSUM, fnv1a32(encoded))  # v1: value bytes only
+        slot[SLOT_OFF_GENERATION:SLOT_OFF_GENERATION + len(encoded)] = encoded  # v1 values start at 41
+        return bytes(slot)
+
+    superblock = bytearray(SECTOR_SIZE)
+    superblock[0:9] = SAVE_MAGIC
+    superblock[9] = 1
+    struct.pack_into("<H", superblock, 10, SAVE_SLOT_COUNT)
+    struct.pack_into("<I", superblock, 12, SAVE_SLOT_SIZE)
+    counter_v1 = v1_slot("counter", bytes([2]) + struct.pack("<q", 41))  # TAG_INT
+    motto_v1 = v1_slot("motto", encode_str_value("keep going"))
+    with open(save_img, "r+b") as f:
+        f.write(superblock)
+        f.seek(SLOTS_START_LBA * SECTOR_SIZE)
+        f.write(counter_v1 + motto_v1)
+    with open(save_img, "rb") as f:
+        before = f.read()
+
+    def interact(mon):
+        mon.type_text("load counter")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("load motto")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("keys")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("01_v1_values_read"),
+            ["41", "keep going", f"2 of {SAVE_MAX_KEYS} keys"],
+            f"{scenario} (version-1 values read back)",
+        )
+        mon.type_text("save counter 42")
+        mon.enter()
+        time.sleep(0.5)
+        mon.type_text("load counter")
+        mon.enter()
+        time.sleep(0.3)
+        acceptance_test.assert_ocr(
+            mon.screendump("02_v1_store_updated"),
+            ["saved", "42"],
+            f"{scenario} (first save to a version-1 store)",
+        )
+
+    log, _ = run_and_capture(scenario, scenario_dir, save_img=save_img, interact=interact)
+    assert_boot_markers_once(log, scenario)
+    assert_log_contains(log, "[save_format] existing save store mounted", scenario)
+
+    with open(save_img, "rb") as f:
+        after = f.read()
+    slot = lambda i: after[(SLOTS_START_LBA + i * SECTORS_PER_SLOT) * SECTOR_SIZE:][:SAVE_SLOT_SIZE]
+    problems = []
+    if after[9] != SAVE_FORMAT_VERSION:
+        problems.append(f"superblock version is {after[9]}, expected the upgrade to {SAVE_FORMAT_VERSION}")
+    if after[:9] != SAVE_MAGIC or after[10:SECTOR_SIZE] != bytes(superblock[10:]):
+        problems.append("the upgrade changed more of the superblock than its version byte")
+    if slot(0)[0] != 0:
+        problems.append(f"the replaced version-1 copy (slot 0) was not freed (state {slot(0)[0]})")
+    if slot(1) != motto_v1:
+        problems.append("the untouched version-1 copy (slot 1) changed")
+    new = slot(2)
+    value_len = struct.unpack_from("<I", new, SLOT_OFF_LEN)[0]
+    expected = encode_str_value("42")
+    expected_checksum = fnv1a32(new[:SLOT_OFF_CHECKSUM] + new[SLOT_OFF_GENERATION:SAVE_SLOT_HEADER_LEN + value_len])
+    if (
+        new[0] != SLOT_STATE_COMMITTED
+        or new[1:1 + SAVE_KEY_MAX_LEN].rstrip(b"\x00") != b"counter"
+        or struct.unpack_from("<Q", new, SLOT_OFF_GENERATION)[0] != 1
+        or new[SAVE_SLOT_HEADER_LEN:SAVE_SLOT_HEADER_LEN + value_len] != expected
+        or struct.unpack_from("<I", new, SLOT_OFF_CHECKSUM)[0] != expected_checksum
+    ):
+        problems.append(f"slot 2 is not a valid version-2 copy of counter='42' at generation 1: {new[:64].hex()}")
+    region_end = (SLOTS_START_LBA + SAVE_SLOT_COUNT * SECTORS_PER_SLOT) * SECTOR_SIZE
+    if after[region_end:] != before[region_end:]:
+        problems.append("bytes outside the save region changed")
+    if problems:
+        raise RuntimeError(f"[{scenario}] " + "; ".join(problems))
+    print(
+        f"==> PASS [{scenario}]: a version-1 store mounted and read back; its first save upgraded it in place "
+        f"(version byte only), wrote the update copy-on-write at generation 1, freed the old copy, and left "
+        f"the other version-1 copy byte-identical"
+    )
+
+
 def main():
     shutil.rmtree(OUT_DIR, ignore_errors=True)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -648,6 +812,7 @@ def main():
     scenario_controller_no_disk()
     scenario_full_stack()
     scenario_foreign_disk_untouched()
+    scenario_legacy_v1_store()
 
     print("==> ALL AHCI SCENARIOS PASSED")
     print(f"    artifacts under: {OUT_DIR}")

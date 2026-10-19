@@ -406,7 +406,10 @@ fn probe_rejects_unsupported_versions_and_geometry() {
     unsafe { save_format::provision(&hba, hba.total_sectors()) }.unwrap();
     let mut sb = [0u8; SECTOR_SIZE as usize];
     unsafe { hba.read_sector(0, &mut sb) }.unwrap();
-    for (offset, value) in [(9usize, 2u8), (10, 63), (12, 0xFF)] {
+    // Version 0 and any version past the current one are unsupported; so
+    // is any other geometry. (Versions 1 and 2 are both read: see the
+    // save-format v2 tests below.)
+    for (offset, value) in [(9usize, 0u8), (9, 3), (9, 0xFF), (10, 63), (12, 0xFF)] {
         let mut bad = sb;
         bad[offset] = value;
         hba.seed(0, &bad);
