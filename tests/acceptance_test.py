@@ -1192,7 +1192,11 @@ def main():
         assert_debug_log("[wisp] stopwatch.wisp stopped by Esc at line", "step 18b (stopwatch -- Esc stopped it)")
         assert_ocr(
             shot,
-            ["stopped (Esc pressed)", "stopwatch_done"],
+            # "stopped", not the full "stopped (Esc pressed)": tesseract
+            # drops or alters the parenthesized part depending on where
+            # the line lands (seen: "(Esc pressed", "{Ese pressed"). The
+            # stop itself is proven exactly by the debug-log line above.
+            ["stopped", "stopwatch_done"],
             "step 18b (stopwatch -- Esc interrupted sleep_ms(), prompt responsive, no stray keys)",
         )
         print("step 18b (stopwatch -- Esc interrupted sleep_ms(), prompt responsive):", shot, "-- OCR verified")
