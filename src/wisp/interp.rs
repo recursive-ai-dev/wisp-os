@@ -2,7 +2,7 @@
 //! a `Result<(), WispError>`.
 //!
 //! A [`Session`] holds everything a program builds up -- its globals, its
-//! functions, and the registry of every list it created -- and an
+//! functions, and the registry of every list and map it created -- and an
 //! [`Interp`] is one run of code against a session and a [`Host`]. A
 //! script run (`super::run_source`) is one session and one run; the
 //! shell's interactive `wisp` prompt keeps one session alive across many
@@ -37,7 +37,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use super::ast::{BinaryOp, Expr, FuncDecl, Program, Stmt, TopItem, UnaryOp};
 use super::builtins;
-use super::value::{self, List, ListRegistry, Value, MAX_LIST_LEN};
+use super::value::{self, List, MapKey, ObjectRegistry, Value, MAX_LIST_LEN, MAX_MAP_LEN};
 use super::WispError;
 
 /// Recursion guard: a user function calling itself (directly or via a
@@ -189,14 +189,14 @@ enum Flow {
 }
 
 /// Everything a program builds up that outlives one run of code: its
-/// globals, its functions, and every list it created. See the module doc
-/// comment for how runs and sessions relate.
+/// globals, its functions, and every list and map it created. See the
+/// module doc comment for how runs and sessions relate.
 pub struct Session {
     globals: BTreeMap<String, Value>,
     functions: BTreeMap<String, Rc<FuncDecl>>,
-    /// Every list this session creates; emptied when the session is
-    /// dropped, which is what frees cyclic lists. See [`ListRegistry`].
-    lists: ListRegistry,
+    /// Every list and map this session creates; emptied when the session
+    /// is dropped, which is what frees cycles. See [`ObjectRegistry`].
+    objects: ObjectRegistry,
 }
 
 impl Default for Session {
@@ -210,7 +210,7 @@ impl Session {
         Self {
             globals: BTreeMap::new(),
             functions: BTreeMap::new(),
-            lists: ListRegistry::new(),
+            objects: ObjectRegistry::new(),
         }
     }
 
@@ -326,6 +326,9 @@ impl Interp<'_, '_> {
 
     // ---- variable scope: global map + a stack of block-local frames ----
 
+    // Never inlined into `eval_expr`: cloning a `Value` is code enough to
+    // enlarge that frame, which every level of expression nesting pays.
+    #[inline(never)]
     fn get_var(&self, stack: &ScopeStack, name: &str) -> Option<Value> {
         for frame in stack.iter().rev() {
             if let Some(v) = frame.get(name) {
@@ -534,28 +537,23 @@ impl Interp<'_, '_> {
         line: u32,
         stack: &mut ScopeStack,
     ) -> Result<Flow, WispError> {
-        match self.eval_expr(iter, stack)? {
-            Value::List(list) => {
-                // A snapshot of the element handles (cheap: refcount bumps,
-                // no deep copy), so changing the list inside the loop
-                // cannot change -- or endlessly extend -- what it visits.
-                let items = {
-                    let items = list.borrow();
-                    let mut snapshot = Vec::new();
-                    snapshot
-                        .try_reserve_exact(items.len())
-                        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
-                    snapshot.extend(items.iter().cloned());
-                    snapshot
-                };
-                for item in items {
-                    match self.run_for_pass(var, item, body, line, stack)? {
-                        Flow::Break(_) => break,
-                        Flow::Continue(_) | Flow::Normal => {}
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                    }
+        let iterable = self.eval_expr(iter, stack)?;
+        if let Value::List(_) | Value::Map(_) = iterable {
+            // A snapshot of the element handles, or of the map's keys
+            // (cheap: refcount bumps, no deep copy), so changing the list
+            // or map inside the loop cannot change -- or endlessly extend
+            // -- what it visits.
+            let items = snapshot(&iterable).ok_or_else(|| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+            for item in items {
+                match self.run_for_pass(var, item, body, line, stack)? {
+                    Flow::Break(_) => break,
+                    Flow::Continue(_) | Flow::Normal => {}
+                    Flow::Return(v) => return Ok(Flow::Return(v)),
                 }
             }
+            return Ok(Flow::Normal);
+        }
+        match iterable {
             Value::Str(text) => {
                 // Strings are immutable, so the loop walks the one it was
                 // given, one character per pass, without copying it.
@@ -573,7 +571,7 @@ impl Interp<'_, '_> {
             other => {
                 return Err(WispError::new(
                     iter.line().unwrap_or(line),
-                    format!("'for' loops over a list or a string, found {}", other.type_name()),
+                    format!("'for' loops over a list, a map or a string, found {}", other.type_name()),
                 ))
             }
         }
@@ -617,6 +615,20 @@ impl Interp<'_, '_> {
                 line,
                 "cannot assign into a string: strings are immutable (build a new one with slices and '+')",
             ));
+        }
+        if let Value::Map(map) = &obj {
+            let key = map_key(&idx, line)?;
+            let mut entries = map.borrow_mut();
+            if entries.len() >= MAX_MAP_LEN && !entries.contains_key(&key) {
+                return Err(WispError::new(
+                    line,
+                    format!("map is full ({MAX_MAP_LEN} entries is the limit)"),
+                ));
+            }
+            let old = entries.insert(key, v);
+            drop(entries);
+            drop(old);
+            return Ok(Flow::Normal);
         }
         let (list, i) = index_target(&obj, &idx, line)?;
         list.borrow_mut()[i] = v;
@@ -667,6 +679,7 @@ impl Interp<'_, '_> {
             Expr::Binary { op, lhs, rhs, line } => self.eval_binary(*op, lhs, rhs, *line, stack),
             Expr::Call { name, args, line } => self.eval_call(name, args, *line, stack),
             Expr::ListLit { items, line } => self.eval_list(items, *line, stack),
+            Expr::MapLit { entries, line } => self.eval_map(entries, *line, stack),
             Expr::Index { object, index, line } => self.eval_index(object, index, *line, stack),
             Expr::Slice { object, start, end, line } => {
                 self.eval_slice(object, start.as_deref(), end.as_deref(), *line, stack)
@@ -715,7 +728,31 @@ impl Interp<'_, '_> {
         for it in items {
             values.push(self.eval_expr(it, stack)?);
         }
-        Ok(self.session.lists.new_list(values))
+        Ok(self.session.objects.new_list(values))
+    }
+
+    #[inline(never)]
+    fn eval_map(&mut self, entries: &[(Expr, Expr)], line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
+        if entries.len() > MAX_MAP_LEN {
+            return Err(WispError::new(
+                line,
+                format!("map literal is too long (over {MAX_MAP_LEN} entries)"),
+            ));
+        }
+        let mut map = BTreeMap::new();
+        for (key_expr, value_expr) in entries {
+            let key_line = key_expr.line().unwrap_or(line);
+            let key = map_key(&self.eval_expr(key_expr, stack)?, key_line)?;
+            if map.contains_key(&key) {
+                return Err(WispError::new(
+                    key_line,
+                    format!("map literal has the key {} twice", key.describe()),
+                ));
+            }
+            let v = self.eval_expr(value_expr, stack)?;
+            map.insert(key, v);
+        }
+        Ok(self.session.objects.new_map(map))
     }
 
     #[inline(never)]
@@ -724,6 +761,11 @@ impl Interp<'_, '_> {
         let idx = self.eval_expr(index, stack)?;
         if let Value::Str(text) = &obj {
             return char_at(text, &idx, line);
+        }
+        if let Value::Map(map) = &obj {
+            let key = map_key(&idx, line)?;
+            let found = map.borrow().get(&key).cloned();
+            return found.ok_or_else(|| missing_key(&key, line));
         }
         let (list, i) = index_target(&obj, &idx, line)?;
         let v = list.borrow()[i].clone();
@@ -785,7 +827,7 @@ impl Interp<'_, '_> {
                     .try_reserve_exact(b - a)
                     .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
                 items.extend(list.borrow()[a..b].iter().cloned());
-                Ok(self.session.lists.new_list(items))
+                Ok(self.session.objects.new_list(items))
             }
             _ => unreachable!("non-sliceable values were rejected above"),
         }
@@ -897,7 +939,7 @@ impl Interp<'_, '_> {
         items.extend(a.iter().cloned());
         items.extend(b.iter().cloned());
         drop((a, b));
-        Ok(self.session.lists.new_list(items))
+        Ok(self.session.objects.new_list(items))
     }
 
     /// The cooperative checks run before every loop iteration and function
@@ -915,11 +957,11 @@ impl Interp<'_, '_> {
     #[inline(never)]
     fn call_named(&mut self, name: &str, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
         if builtins::is_builtin(name) {
-            let result = builtins::call(&mut *self.host, &mut self.session.lists, name, args, line)?;
+            let result = builtins::call(&mut *self.host, &mut self.session.objects, name, args, line)?;
             if name == "load" {
-                // A list that arrives from the save disk becomes part of
-                // this session's object graph like any other.
-                self.session.lists.adopt(&result);
+                // A list or map that arrives from the save disk becomes
+                // part of this session's object graph like any other.
+                self.session.objects.adopt(&result);
             }
             return Ok(result);
         }
@@ -1001,7 +1043,7 @@ fn index_target(
         other => {
             return Err(WispError::new(
                 line,
-                format!("cannot index into {} (only lists and strings can be indexed)", other.type_name()),
+                format!("cannot index into {} (only lists, maps and strings can be indexed)", other.type_name()),
             ))
         }
     };
@@ -1022,6 +1064,51 @@ fn index_target(
         ));
     }
     Ok((list, i as usize))
+}
+
+/// The key `value` makes, for `map[value]` and map literals.
+fn map_key(value: &Value, line: u32) -> Result<MapKey, WispError> {
+    MapKey::from_value(value).ok_or_else(|| {
+        WispError::new(
+            line,
+            format!("map keys must be ints or strings, found {}", value.type_name()),
+        )
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn missing_key(key: &MapKey, line: u32) -> WispError {
+    WispError::new(
+        line,
+        format!(
+            "key {} is not in the map (check with contains(), or read it with get())",
+            key.describe()
+        ),
+    )
+}
+
+/// What `for` visits in a list (its elements) or a map (its keys, in
+/// order), copied out so the loop body may change the original. `None` if
+/// the copy cannot be allocated; `Some(empty)` for any other value.
+/// Outlined so its locals stay out of every `for` statement's frame.
+#[inline(never)]
+fn snapshot(value: &Value) -> Option<Vec<Value>> {
+    let mut items = Vec::new();
+    match value {
+        Value::List(list) => {
+            let list = list.borrow();
+            items.try_reserve_exact(list.len()).ok()?;
+            items.extend(list.iter().cloned());
+        }
+        Value::Map(map) => {
+            let map = map.borrow();
+            items.try_reserve_exact(map.len()).ok()?;
+            items.extend(map.keys().map(MapKey::to_value));
+        }
+        _ => {}
+    }
+    Some(items)
 }
 
 /// `text[index]`: the character starting at byte offset `index`, as a new

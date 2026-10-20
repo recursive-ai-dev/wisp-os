@@ -8,7 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::interp::{Host, OUT_OF_MEMORY_MESSAGE, STOPPED_MESSAGE};
-use super::value::{self, List, ListRegistry, Value, MAX_DISPLAY_LEN, MAX_LIST_LEN, MAX_STR_LEN};
+use super::value::{self, List, Map, MapKey, ObjectRegistry, Value, MAX_DISPLAY_LEN, MAX_LIST_LEN, MAX_STR_LEN};
 use super::WispError;
 
 pub fn is_builtin(name: &str) -> bool {
@@ -57,19 +57,22 @@ pub fn is_builtin(name: &str) -> bool {
             | "min"
             | "max"
             | "type"
+            | "keys"
+            | "values"
+            | "get"
     )
 }
 
 // Never inlined into the interpreter: its frame (every builtin's locals)
 // would otherwise be paid at every level of WISP function recursion.
 //
-// `lists` is the running session's registry: every list a builtin creates
-// must be made through it, so that a cycle a script later builds out of
-// that list is still reclaimed when the session ends (see `ListRegistry`).
+// `objects` is the running session's registry: every list or map a builtin
+// creates must be made through it, so that a cycle a script later builds
+// out of it is still reclaimed when the session ends (see `ObjectRegistry`).
 #[inline(never)]
 pub fn call(
     host: &mut dyn Host,
-    lists: &mut ListRegistry,
+    objects: &mut ObjectRegistry,
     name: &str,
     args: Vec<Value>,
     line: u32,
@@ -107,7 +110,7 @@ pub fn call(
         "rect" => builtin_rect(host, &args, line),
         "line" => builtin_line(host, &args, line),
         "fill_screen" => builtin_fill_screen(host, &args, line),
-        "split" => builtin_split(host, lists, &args, line),
+        "split" => builtin_split(host, objects, &args, line),
         "join" => builtin_join(&args, line),
         "find" => builtin_find(host, &args, line),
         "contains" => builtin_contains(host, &args, line),
@@ -119,13 +122,13 @@ pub fn call(
         "ends_with" => builtin_affix(&args, line, "ends_with", |text, part| text.ends_with(part)),
         "chr" => builtin_chr(&args, line),
         "ord" => builtin_ord(&args, line),
-        "chars" => builtin_chars(host, lists, &args, line),
+        "chars" => builtin_chars(host, objects, &args, line),
         "repeat" => builtin_repeat(&args, line),
         "insert" => builtin_insert(&args, line),
         "remove" => builtin_remove(&args, line),
         "sort" => builtin_sort(&args, line),
         "reverse" => builtin_reverse(&args, line),
-        "range" => builtin_range(lists, &args, line),
+        "range" => builtin_range(objects, &args, line),
         "abs" => builtin_abs(&args, line),
         "min" => builtin_min_max(&args, line, "min"),
         "max" => builtin_min_max(&args, line, "max"),
@@ -133,6 +136,9 @@ pub fn call(
             expect_arity(&args, 1, "type", line)?;
             Ok(Value::Str(Rc::new(String::from(args[0].type_name()))))
         }
+        "keys" => builtin_keys_values(objects, &args, line, "keys"),
+        "values" => builtin_keys_values(objects, &args, line, "values"),
+        "get" => builtin_get(&args, line),
         _ => unreachable!("is_builtin() must be checked before call()"),
     }
 }
@@ -256,9 +262,10 @@ fn builtin_len(args: &[Value], line: u32) -> Result<Value, WispError> {
     match &args[0] {
         Value::Str(s) => Ok(Value::Int(s.len() as i64)),
         Value::List(l) => Ok(Value::Int(l.borrow().len() as i64)),
+        Value::Map(m) => Ok(Value::Int(m.borrow().len() as i64)),
         other => Err(WispError::new(
             line,
-            format!("len() expects a string or list, found {}", other.type_name()),
+            format!("len() expects a string, list or map, found {}", other.type_name()),
         )),
     }
 }
@@ -463,8 +470,8 @@ fn builtin_screen_height(host: &mut dyn Host, args: &[Value], line: u32) -> Resu
 /// hand (see `docs/WISP_LANGUAGE.md`'s operator table), so an ordinary
 /// `int` doing double duty as a packed color -- `rgb(255, 0, 0)` and the
 /// equivalent literal `16711680` both read unambiguously as pure red -- is
-/// the natural fit within the existing five-value-type language, rather
-/// than growing a sixth `Value` variant for this one feature.
+/// the natural fit within the existing value types, rather than growing
+/// another `Value` variant for this one feature.
 fn builtin_rgb(args: &[Value], line: u32) -> Result<Value, WispError> {
     expect_arity(args, 3, "rgb", line)?;
     let channel = |v: &Value, which: &str| -> Result<i64, WispError> {
@@ -629,7 +636,7 @@ fn new_str(text: String) -> Value {
 /// `MAX_LIST_LEN` of them, with the heap reserve checked as it grows.
 fn string_list<'a>(
     host: &mut dyn Host,
-    lists: &mut ListRegistry,
+    objects: &mut ObjectRegistry,
     pieces: impl Iterator<Item = &'a str>,
     fn_name: &str,
     line: u32,
@@ -654,26 +661,26 @@ fn string_list<'a>(
         text.push_str(piece);
         items.push(new_str(text));
     }
-    Ok(lists.new_list(items))
+    Ok(objects.new_list(items))
 }
 
 /// `split(text)` splits on runs of whitespace, dropping empty pieces --
 /// the natural reading of a typed command line. `split(text, sep)` splits
 /// on every occurrence of `sep`, keeping the empty pieces between adjacent
 /// separators, so `join(split(t, sep), sep)` always gives `t` back.
-fn builtin_split(host: &mut dyn Host, lists: &mut ListRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
+fn builtin_split(host: &mut dyn Host, objects: &mut ObjectRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
     if args.is_empty() || args.len() > 2 {
         return Err(WispError::new(line, format!("split() expects 1 or 2 arguments, got {}", args.len())));
     }
     let text = expect_str(&args[0], "split", "the text", line)?;
     match args.get(1) {
-        None => string_list(host, lists, text.split_whitespace(), "split", line),
+        None => string_list(host, objects, text.split_whitespace(), "split", line),
         Some(sep) => {
             let sep = expect_str(sep, "split", "the separator", line)?;
             if sep.is_empty() {
                 return Err(WispError::new(line, "split(): the separator must not be empty"));
             }
-            string_list(host, lists, text.split(sep.as_str()), "split", line)
+            string_list(host, objects, text.split(sep.as_str()), "split", line)
         }
     }
 }
@@ -715,8 +722,14 @@ fn builtin_find(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Value,
     position(host, &args[0], &args[1], "find", line).map(|p| Value::Int(p.map_or(-1, |p| p as i64)))
 }
 
+/// `contains(text, part)` / `contains(list, value)`: whether `find` would
+/// find it. `contains(map, key)`: whether `map` has an entry for `key`.
 fn builtin_contains(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Value, WispError> {
     expect_arity(args, 2, "contains", line)?;
+    if let Value::Map(map) = &args[0] {
+        let key = expect_key(&args[1], "contains", line)?;
+        return Ok(Value::Bool(map.borrow().contains_key(&key)));
+    }
     position(host, &args[0], &args[1], "contains", line).map(|p| Value::Bool(p.is_some()))
 }
 
@@ -826,11 +839,11 @@ fn builtin_ord(args: &[Value], line: u32) -> Result<Value, WispError> {
 
 /// `chars(text)`: a list of `text`'s characters, each a one-character
 /// string (one to four bytes).
-fn builtin_chars(host: &mut dyn Host, lists: &mut ListRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
+fn builtin_chars(host: &mut dyn Host, objects: &mut ObjectRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
     expect_arity(args, 1, "chars", line)?;
     let text = expect_str(&args[0], "chars", "the text", line)?;
     let pieces = text.char_indices().map(|(i, ch)| &text[i..i + ch.len_utf8()]);
-    string_list(host, lists, pieces, "chars", line)
+    string_list(host, objects, pieces, "chars", line)
 }
 
 fn builtin_repeat(args: &[Value], line: u32) -> Result<Value, WispError> {
@@ -886,9 +899,17 @@ fn builtin_insert(args: &[Value], line: u32) -> Result<Value, WispError> {
 }
 
 /// `remove(list, index)`: takes element `index` out of the list and
-/// returns it; the elements after it move down one.
+/// returns it; the elements after it move down one. `remove(map, key)`:
+/// takes `key`'s entry out of the map and returns its value.
 fn builtin_remove(args: &[Value], line: u32) -> Result<Value, WispError> {
     expect_arity(args, 2, "remove", line)?;
+    if let Value::Map(map) = &args[0] {
+        let key = expect_key(&args[1], "remove", line)?;
+        let removed = map.borrow_mut().remove(&key);
+        return removed.ok_or_else(|| {
+            WispError::new(line, format!("remove(): key {} is not in the map", key.describe()))
+        });
+    }
     let list = expect_list(&args[0], "remove", line)?;
     let mut items = list.borrow_mut();
     if items.is_empty() {
@@ -943,7 +964,7 @@ fn builtin_reverse(args: &[Value], line: u32) -> Result<Value, WispError> {
 
 /// `range(n)`: `[0, 1, ..., n - 1]`; `range(a, b)`: `[a, ..., b - 1]`.
 /// Empty when the end is not past the start.
-fn builtin_range(lists: &mut ListRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
+fn builtin_range(objects: &mut ObjectRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
     let (start, end) = match args {
         [n] => (0, expect_int(n, "range", "the count", line)?),
         [a, b] => (expect_int(a, "range", "the start", line)?, expect_int(b, "range", "the end", line)?),
@@ -961,7 +982,64 @@ fn builtin_range(lists: &mut ListRegistry, args: &[Value], line: u32) -> Result<
         .try_reserve_exact(span as usize)
         .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
     items.extend((0..span as i64).map(|k| Value::Int(start + k)));
-    Ok(lists.new_list(items))
+    Ok(objects.new_list(items))
+}
+
+// ---- maps ------------------------------------------------------------------
+//
+// `len`, `contains` and `remove` also take a map (above); these three are
+// for maps only. A map keeps its entries in key order -- ints ascending,
+// then strings in the order `<` uses -- so every list built here is in
+// that order, the same one `for` and `print` use.
+
+fn expect_map<'a>(v: &'a Value, fn_name: &str, line: u32) -> Result<&'a Map, WispError> {
+    match v {
+        Value::Map(m) => Ok(m),
+        other => Err(WispError::new(
+            line,
+            format!("{fn_name}() expects a map as its first argument, found {}", other.type_name()),
+        )),
+    }
+}
+
+fn expect_key(v: &Value, fn_name: &str, line: u32) -> Result<MapKey, WispError> {
+    MapKey::from_value(v).ok_or_else(|| {
+        WispError::new(
+            line,
+            format!("{fn_name}() expects an int or string key, found {}", v.type_name()),
+        )
+    })
+}
+
+/// `keys(map)` / `values(map)`: a new list of the map's keys, or of its
+/// values, in key order.
+fn builtin_keys_values(objects: &mut ObjectRegistry, args: &[Value], line: u32, fn_name: &str) -> Result<Value, WispError> {
+    expect_arity(args, 1, fn_name, line)?;
+    let map = expect_map(&args[0], fn_name, line)?.borrow();
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(map.len())
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    if fn_name == "keys" {
+        items.extend(map.keys().map(MapKey::to_value));
+    } else {
+        items.extend(map.values().cloned());
+    }
+    drop(map);
+    Ok(objects.new_list(items))
+}
+
+/// `get(map, key)`: the value under `key`, or `nil` if there is none;
+/// `get(map, key, default)`: `default` instead of `nil`. The way to read a
+/// key that may be missing, where `map[key]` would be an error.
+fn builtin_get(args: &[Value], line: u32) -> Result<Value, WispError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(WispError::new(line, format!("get() expects 2 or 3 arguments, got {}", args.len())));
+    }
+    let map = expect_map(&args[0], "get", line)?;
+    let key = expect_key(&args[1], "get", line)?;
+    let found = map.borrow().get(&key).cloned();
+    Ok(found.unwrap_or_else(|| args.get(2).cloned().unwrap_or(Value::Nil)))
 }
 
 // ---- numbers ---------------------------------------------------------------

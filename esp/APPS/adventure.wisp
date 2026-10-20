@@ -1,8 +1,8 @@
 # adventure.wisp -- a small self-contained text adventure.
 #
 # Five rooms, two items, one locked door -- built entirely from WISP v1
-# features: no maps (see docs/WISP_LANGUAGE.md's "Lists" section), so
-# room state lives in plain globals (which room you're in, which items
+# features, which had no maps (see docs/WISP_LANGUAGE.md's "Maps" section
+# for what a newer program would use), so room state lives in plain globals (which room you're in, which items
 # you're carrying) rather than a data structure keyed by room name. No
 # string indexing/splitting either, so commands are whole-line literals
 # compared with `==` (e.g. "take lantern" is one opaque string, never

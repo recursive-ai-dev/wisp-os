@@ -2490,3 +2490,125 @@ red `stopped (Esc pressed)` line, and tesseract dropped the closing
 parenthesis when the stopwatch happened to draw one lap fewer. It now
 asserts `stopped`; the stop was already proven exactly by its debug-log
 check.
+
+## Maps
+
+Every program bigger than a demo was paying for WISP's missing key-value
+type: `adventure.wisp` keeps room state in loose globals, and the
+documented workaround was two parallel lists matched by index. WISP now
+has a sixth value type, `map`.
+
+- **Syntax.** `{key: value, ...}` literals, `map[key]` reads,
+  `map[key] = value;` writes (adding a new key), chained freely with list
+  indexing. A `{` is a map literal only where an operand is expected, so
+  no block parses differently: a block's `{` always follows a complete
+  condition or a `)`, where the expression parser has already stopped.
+- **Keys** are ints or strings, the two types with an order. A map is a
+  `BTreeMap` under the hood, kept in key order (ints, then strings by
+  byte), so `print`, `for`, `keys()` and `values()` never depend on
+  insertion history and need no hashing (and no source of hash
+  randomness) in the kernel.
+- **Missing keys are errors, not `nil`.** `map[key]` on a missing key
+  says so and names the two ways out: `contains(map, key)` and
+  `get(map, key[, default])`. A typo'd key that silently read as `nil`
+  would be the same class of bug WISP's `let` rule exists to catch.
+- **Builtins.** New: `keys`, `values`, `get`. Extended to maps: `len`,
+  `contains` (keys), `remove` (by key, returning the value), `type`
+  (`"map"`). `for k in map` visits a snapshot of the keys, as `for` over
+  a list visits a snapshot of its elements. The same key twice in one
+  literal is an error.
+- **Same resource bounds as lists.** At most 32,768 entries. Display,
+  equality and encoding are bounded exactly as for lists (output budget,
+  pair-visited-once bisimilarity, 64-level depth). The list registry
+  became an `ObjectRegistry` that records maps too, so a cycle through a
+  map (`m["me"] = m;`) is reclaimed when the program or `wisp` session
+  ends, including maps that arrive from `load`. Dropping is iterative for
+  both containers through one shared work-stack (`value::release`), so a
+  100,000-deep chain of maps, or of maps and lists alternating, frees
+  without recursion.
+- **On disk.** Save-format value tag 5: entry count, then each key and
+  value in key order. Decoding rejects a non-int/string key, a repeated
+  or out-of-order key, and an implausible count as corrupt data. The
+  slot layout is unchanged, so the format version stays 2; a kernel from
+  before maps reads every other key and reports a map-holding key as an
+  unrecognized tag rather than misreading it (only `load` decodes
+  values -- mounting, saving and `keys` never do).
+- **The `wisp>` prompt.** `parse_interactive` used to refuse to supply a
+  missing final `;` to any line ending in `}`, which would have rejected
+  `let m = {"a": 1}`. The exclusion was unnecessary: appending a `;` can
+  only rescue a parse that failed at the very end of the input, and the
+  original error is still the one reported otherwise. It now applies to
+  every line.
+- **`esp/APPS/words.wisp`**, a word counter whose whole state is one
+  map, is the worked example. Writing its tests caught a real bug in its
+  first draft: stripping "punctuation" by checking an ASCII letter list
+  turned `café` into `caf`. Any character outside ASCII now counts as
+  part of a word.
+
+### Native stack
+
+Measured on the UEFI target as before (`--emit=asm`, prologue sizes,
+without the return address). A new `Value` variant and new match arms
+moved several frames, so each recursive one was checked and, where it
+grew, the growth outlined:
+
+- `Value::clone` (now with a `Map` arm) stopped inlining into variable
+  lookup and grew `eval_expr` from 152 to 168 bytes; `get_var` is now
+  never-inlined and `eval_expr` is 136 -- smaller than before.
+- `ObjectRegistry::adopt` had been inlining into `call_named`; it is now
+  never-inlined (it runs once per `load`), and `call_named` went from 296
+  to 200 bytes, so every WISP function call is cheaper than before.
+- The map arms of display and equality are outlined (`write_map`,
+  `maps_eq`), keeping `write_nested` at 136 and `values_eq` at 120 (was
+  248).
+- Parsing a map literal is outlined (`parse_map_entries`). Returning the
+  whole `Expr` from it made LLVM give the result its own slot and grew
+  `parse_postfix` from 344 to 456 bytes; returning only the entries keeps
+  it at 344.
+- `eval_index` is 16 bytes larger (200), i.e. 336 bytes per level of
+  nested indexing, well inside the ~750-byte unit `MAX_NESTING` is sized
+  for. A level of map literal nesting costs `eval_expr` + `eval_map` =
+  400 bytes. No limit needed to change.
+
+### Verification
+
+- `tests/host/tests/maps.rs` (43 tests): every construct, builtin and
+  error message; key order; `for` over a snapshot; `==` on cyclic and
+  exponentially shared maps; display bounds; the entry limit; cycle
+  reclamation (allocator-counted) for literals, `keys`/`values` and maps
+  from `load`; 100,000-deep drops on a 640 KiB stack; nesting at exactly
+  the parser's limit; maps at the interactive prompt; and maps through
+  the real save format on an in-memory disk, both ways. Encodings are
+  checked against bytes written by hand from `docs/SAVE_FORMAT.md` (the
+  helper itself checked against that document's worked example), along
+  with eight hand-corrupted encodings. Three tests drive `words.wisp`
+  through scripted sessions. The documented examples run as written.
+- Mutation testing: 17 deliberate bugs, one per safety property (no
+  registration for literals, `keys`/`values` or loaded maps; no reclaim;
+  recursive drop, in either container; no key-order check on load; no
+  entry limit; duplicate literal keys; no visited-pair set in `==`; no
+  display depth limit; no `for` snapshot; the old `}` rule in
+  `parse_interactive`; keys encoded out of order; `contains` on values;
+  `get` ignoring its default; a missing key reading as `nil`). Sixteen
+  failed a test at once. The seventeenth -- `MapCell` without its
+  iterative `Drop` -- passed, because the deep-drop test alternated maps
+  with lists and the list's `Drop` unwound the maps too; a pure map
+  chain now catches it.
+- All earlier host suites unchanged except one assertion that pinned the
+  old `for` error wording.
+- `tests/acceptance_test.py` steps 23-24 and 13d: `words.wisp` counts,
+  ranks, forgets and lists in order; a map is built, changed and saved at
+  the `wisp>` prompt; and the second, separate boot loads it back
+  (`loaded a map with gold 42 and the red key`) -- the new tag through a
+  real AHCI disk across a reboot. Two first drafts failed on the test
+  side, not the kernel's (the screenshots were read directly): short
+  quoted echo lines OCR as fragments (`"2_entries_map"` as `ries_map`),
+  so the steps print sentences instead; and a fixed sleep took the
+  second boot's screenshot before QEMU had finished typing the line, so
+  both steps now wait for their output.
+- The full suite also caught the pre-existing step 14a failing once in
+  three runs. Every `bounce` frame is `fill_screen` and then `rect`, so a
+  single screendump between the two shows only the background. The step
+  now samples up to five frames for the ball.
+- `tests/ahci_test.py`, `tests/fault_test.py` and `tests/usb_test.py`:
+  all scenarios pass. Kernel builds with zero warnings.

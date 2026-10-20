@@ -33,8 +33,8 @@ below).
 
 ## Color: a packed `int`, not a new type
 
-WISP still has exactly the five value types `docs/WISP_LANGUAGE.md`
-describes -- this feature did not add a sixth `color` type. A color is a
+WISP has only the value types `docs/WISP_LANGUAGE.md` describes -- this
+feature did not add a `color` type. A color is a
 plain `int`, packed as `0xRRGGBB`: the red channel in bits 16-23, green
 in bits 8-15, blue in bits 0-7, each `0..=255`. `rgb(255, 0, 0)` and the
 equivalent literal `16711680` both mean pure red; nothing distinguishes

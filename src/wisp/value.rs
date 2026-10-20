@@ -1,25 +1,26 @@
 //! Runtime value representation. Per `docs/WISP_LANGUAGE.md`, WISP has
-//! five value types: `nil`, `bool`, `int`, `string`, and `list`.
+//! six value types: `nil`, `bool`, `int`, `string`, `list` and `map`.
 //!
 //! # Resource bounds
 //!
-//! Lists are shared by reference, so a handful of lists can describe a
-//! graph whose *expansion* is astronomically large (`v = [v, v]` doubled
-//! 22 times is 23 lists but 29 MB of display text). Every structural
-//! operation here is therefore bounded by work or output, not just by
-//! nesting depth:
+//! Lists and maps are shared by reference, so a handful of them can
+//! describe a graph whose *expansion* is astronomically large
+//! (`v = [v, v]` doubled 22 times is 23 lists but 29 MB of display text).
+//! Every structural operation here is therefore bounded by work or
+//! output, not just by nesting depth:
 //!
 //! - display stops after [`MAX_DISPLAY_LEN`] bytes and marks the cut;
-//! - equality visits each pair of lists at most once and gives up with an
-//!   error after [`MAX_EQ_WORK`] element comparisons;
-//! - dropping a list is iterative ([`ListCell`]'s `Drop`), so a deeply
+//! - equality visits each pair of lists (or maps) at most once and gives
+//!   up with an error after [`MAX_EQ_WORK`] element comparisons;
+//! - dropping a list or map is iterative ([`release`]), so a deeply
 //!   nested chain is freed without recursing on the kernel stack.
 //!
-//! Cycles (`let a = []; push(a, a);`) are allowed, and are reclaimed when
-//! the script ends: every list a run creates is recorded in its
-//! [`ListRegistry`], and [`ListRegistry::reclaim`] empties them all.
+//! Cycles (`let a = []; push(a, a);`, `m["me"] = m;`) are allowed, and are
+//! reclaimed when the script ends: every list and map a run creates is
+//! recorded in its [`ObjectRegistry`], and [`ObjectRegistry::reclaim`]
+//! empties them all.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::rc::{Rc, Weak};
 use alloc::string::String;
@@ -27,7 +28,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ops::Deref;
 
-/// Recursion guard for structural operations over nested lists (equality,
+/// Recursion guard for structural operations over nested lists and maps (equality,
 /// display, serialization): bounding how deep they descend keeps a
 /// pathologically nested value from overflowing the kernel stack. 64
 /// levels is far beyond any real script's data.
@@ -51,6 +52,12 @@ pub const MAX_STR_LEN: usize = 256 * 1024;
 /// Most elements one list may hold. Each element is 16 bytes, so this
 /// bounds a single list's backing allocation to 512 KiB.
 pub const MAX_LIST_LEN: usize = 32 * 1024;
+
+/// Most entries one map may hold -- the same bound as a list's elements.
+/// An entry costs a key and a value (32 bytes) plus its share of the
+/// tree's nodes, so a full map is around 1.5 MiB: large, but within what
+/// the shell's heap reserve check stops a script at.
+pub const MAX_MAP_LEN: usize = 32 * 1024;
 
 /// The shared, mutable storage behind every `Value::List` handle.
 ///
@@ -77,24 +84,111 @@ impl Deref for ListCell {
 
 impl Drop for ListCell {
     fn drop(&mut self) {
-        // Move the elements onto an explicit work stack. A child list this
-        // was the last owner of is unwrapped and its elements moved onto
-        // the same stack, so it is then dropped empty -- its own `drop`
-        // has nothing left to recurse into.
-        let mut pending = core::mem::take(self.0.get_mut());
-        while let Some(value) = pending.pop() {
-            if let Value::List(rc) = value {
-                if let Ok(cell) = Rc::try_unwrap(rc) {
-                    let mut cell = cell;
-                    pending.append(cell.0.get_mut());
-                }
-            }
-        }
+        release(core::mem::take(self.0.get_mut()));
     }
 }
 
 /// A list handle, as stored in `Value::List`.
 pub type List = Rc<ListCell>;
+
+/// A map key. Only ints and strings can be keys: they are the two types
+/// with an order (`<`), and a key must never change once it is in a map,
+/// which rules out the shared, mutable list and map.
+///
+/// The derived order -- every int before every string, ints numerically,
+/// strings by byte -- is the order a map's entries are kept, displayed and
+/// visited in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MapKey {
+    Int(i64),
+    Str(Rc<String>),
+}
+
+impl MapKey {
+    /// The key for `value`, or `None` if that type cannot be a key.
+    pub fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Int(i) => Some(MapKey::Int(*i)),
+            Value::Str(s) => Some(MapKey::Str(s.clone())),
+            _ => None,
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        match self {
+            MapKey::Int(i) => Value::Int(*i),
+            MapKey::Str(s) => Value::Str(s.clone()),
+        }
+    }
+
+    /// The key as a script would write it: `3`, `"gold"`. For error
+    /// messages; a string key is cut short past 64 bytes.
+    pub fn describe(&self) -> String {
+        match self {
+            MapKey::Int(i) => format!("{i}"),
+            MapKey::Str(s) => {
+                let mut cut = s.len().min(64);
+                while !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let more = if cut < s.len() { "..." } else { "" };
+                format!("\"{}{more}\"", &s[..cut])
+            }
+        }
+    }
+}
+
+/// The shared, mutable storage behind every `Value::Map` handle; a newtype
+/// for the same iterative-`Drop` reason as [`ListCell`].
+#[derive(Debug, Default)]
+pub struct MapCell(RefCell<BTreeMap<MapKey, Value>>);
+
+impl MapCell {
+    pub fn new(entries: BTreeMap<MapKey, Value>) -> Self {
+        Self(RefCell::new(entries))
+    }
+}
+
+impl Deref for MapCell {
+    type Target = RefCell<BTreeMap<MapKey, Value>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for MapCell {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        pending.extend(core::mem::take(self.0.get_mut()).into_values());
+        release(pending);
+    }
+}
+
+/// A map handle, as stored in `Value::Map`.
+pub type Map = Rc<MapCell>;
+
+/// Drop `pending` without recursing. A list or map in it that this was the
+/// last owner of is unwrapped and its contents moved onto the same work
+/// stack, so the cell itself is then dropped empty -- its own `drop` has
+/// nothing left to recurse into.
+fn release(mut pending: Vec<Value>) {
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::List(rc) => {
+                if let Ok(mut cell) = Rc::try_unwrap(rc) {
+                    pending.append(cell.0.get_mut());
+                }
+            }
+            Value::Map(rc) => {
+                if let Ok(mut cell) = Rc::try_unwrap(rc) {
+                    pending.extend(core::mem::take(cell.0.get_mut()).into_values());
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -114,6 +208,9 @@ pub enum Value {
     /// collection" behavior most scripting languages give you for
     /// reference types.
     List(List),
+    /// A shared, mutable map from int or string keys to values, kept in
+    /// key order (see [`MapKey`]). Shared on copy exactly as a list is.
+    Map(Map),
 }
 
 impl Value {
@@ -124,6 +221,7 @@ impl Value {
             Value::Int(_) => "int",
             Value::Str(_) => "string",
             Value::List(_) => "list",
+            Value::Map(_) => "map",
         }
     }
 
@@ -131,8 +229,8 @@ impl Value {
     /// output and error messages that quote a value back to the user.
     /// A bare top-level `string` displays without quotes (so
     /// `print("hi")` prints `hi`, not `"hi"`); a `string` *nested* inside
-    /// a list displays quoted, so `print([1, "a"])` reads unambiguously
-    /// as `[1, "a"]` rather than `[1, a]`.
+    /// a list or map displays quoted, so `print([1, "a"])` reads
+    /// unambiguously as `[1, "a"]` rather than `[1, a]`.
     ///
     /// Output past [`MAX_DISPLAY_LEN`] bytes is cut off and ends with
     /// [`TRUNCATION_MARKER`]; see [`Value::try_display_string`] for a
@@ -206,8 +304,34 @@ impl Value {
                 }
                 out.push("]")
             }
+            Value::Map(entries) => write_map(entries, out, depth),
         }
     }
+}
+
+/// [`Value::write_nested`]'s map arm, outlined so that its locals are not
+/// paid at every level of list nesting too.
+#[inline(never)]
+fn write_map(entries: &Map, out: &mut DisplayBuf, depth: u32) -> bool {
+    if depth >= MAX_VALUE_DEPTH {
+        return out.push("{...}");
+    }
+    if !out.push("{") {
+        return false;
+    }
+    for (i, (key, v)) in entries.borrow().iter().enumerate() {
+        if i > 0 && !out.push(", ") {
+            return false;
+        }
+        let key_written = match key {
+            MapKey::Int(k) => out.push(&format!("{k}")),
+            MapKey::Str(k) => out.push("\"") && out.push(k) && out.push("\""),
+        };
+        if !key_written || !out.push(": ") || !v.write_nested(out, depth + 1) {
+            return false;
+        }
+    }
+    out.push("}")
 }
 
 /// Display output with a hard byte budget.
@@ -234,7 +358,8 @@ impl DisplayBuf {
 
 /// Structural equality, as used by `==`/`!=`.
 ///
-/// Each pair of list identities is compared at most once: a pair met again
+/// Two maps are equal when they hold the same keys with equal values.
+/// Each pair of list (or map) identities is compared at most once: a pair met again
 /// (through sharing, or around a cycle) is assumed equal for the rest of
 /// the comparison, which is exactly bisimilarity -- two cyclic lists are
 /// equal iff no finite path through them finds a difference. That keeps
@@ -285,8 +410,35 @@ fn values_eq(a: &Value, b: &Value, depth: u32, state: &mut EqState) -> Result<bo
             }
             Ok(true)
         }
+        (Value::Map(x), Value::Map(y)) => maps_eq(x, y, depth, state),
         _ => Ok(false),
     }
+}
+
+/// [`values_eq`]'s map arm, outlined for the same reason as [`write_map`].
+#[inline(never)]
+fn maps_eq(x: &Map, y: &Map, depth: u32, state: &mut EqState) -> Result<bool, &'static str> {
+    if Rc::ptr_eq(x, y) {
+        return Ok(true);
+    }
+    if !state.seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+        return Ok(true);
+    }
+    if depth >= MAX_VALUE_DEPTH {
+        return Err("maps are nested too deeply to compare (over 64 levels)");
+    }
+    let xb = x.borrow();
+    let yb = y.borrow();
+    if xb.len() != yb.len() {
+        return Ok(false);
+    }
+    // Both iterate in key order, so equal maps pair up entry by entry.
+    for ((kx, vx), (ky, vy)) in xb.iter().zip(yb.iter()) {
+        if kx != ky || !values_eq(vx, vy, depth + 1, state)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl PartialEq for Value {
@@ -298,87 +450,132 @@ impl PartialEq for Value {
     }
 }
 
-/// Every list one script run creates, so the run's cyclic garbage can be
-/// reclaimed when it ends.
+/// Every list and map one script run creates, so the run's cyclic garbage
+/// can be reclaimed when it ends.
 ///
 /// Reference counting alone never frees a cycle: `push(a, a)` keeps `a`
 /// alive after its last variable is gone. Rather than forbid cycles (the
 /// language allows them) or add a tracing collector, the interpreter
-/// records a weak handle to each list as it is created and, at the end of
-/// the run, empties every list still alive. Nothing outside the run can
-/// hold a list (values cross the boundary only by being serialized to the
-/// save disk), so emptying them is unobservable -- and once emptied, no
-/// list owns another, so every cycle falls apart and is freed.
-pub struct ListRegistry {
-    lists: Vec<Weak<ListCell>>,
+/// records a weak handle to each list and map as it is created and, at the
+/// end of the run, empties every one still alive. Nothing outside the run
+/// can hold one (values cross the boundary only by being serialized to the
+/// save disk), so emptying them is unobservable -- and once emptied, none
+/// owns another, so every cycle falls apart and is freed.
+pub struct ObjectRegistry {
+    objects: Vec<Tracked>,
     /// Size at which dead entries are next pruned; doubles with the live
     /// count so registration stays amortized O(1).
     prune_at: usize,
 }
 
-impl ListRegistry {
+enum Tracked {
+    List(Weak<ListCell>),
+    Map(Weak<MapCell>),
+}
+
+impl Tracked {
+    fn is_alive(&self) -> bool {
+        match self {
+            Tracked::List(w) => w.strong_count() > 0,
+            Tracked::Map(w) => w.strong_count() > 0,
+        }
+    }
+}
+
+impl ObjectRegistry {
     const MIN_PRUNE_AT: usize = 1024;
 
     pub fn new() -> Self {
-        Self { lists: Vec::new(), prune_at: Self::MIN_PRUNE_AT }
+        Self { objects: Vec::new(), prune_at: Self::MIN_PRUNE_AT }
     }
 
     /// Create a list owned by this run.
     pub fn new_list(&mut self, items: Vec<Value>) -> Value {
         let list = Rc::new(ListCell::new(items));
-        self.track(&list);
+        self.track(Tracked::List(Rc::downgrade(&list)));
         Value::List(list)
     }
 
-    /// Record `list`, and every list reachable from it, as owned by this
-    /// run -- for values that arrive from outside the interpreter (`load`).
-    /// Iterative, and each list identity is visited once.
+    /// Create a map owned by this run.
+    pub fn new_map(&mut self, entries: BTreeMap<MapKey, Value>) -> Value {
+        let map = Rc::new(MapCell::new(entries));
+        self.track(Tracked::Map(Rc::downgrade(&map)));
+        Value::Map(map)
+    }
+
+    /// Record `value`, and every list and map reachable from it, as owned
+    /// by this run -- for values that arrive from outside the interpreter
+    /// (`load`). Iterative, and each identity is visited once. Outlined: it
+    /// runs once per `load`, and inlined it would enlarge the frame of
+    /// every WISP function call.
+    #[inline(never)]
     pub fn adopt(&mut self, value: &Value) {
         let mut seen = BTreeSet::new();
-        let mut pending: Vec<List> = Vec::new();
-        if let Value::List(l) = value {
-            pending.push(l.clone());
-        }
-        while let Some(list) = pending.pop() {
-            if !seen.insert(Rc::as_ptr(&list) as usize) {
-                continue;
-            }
-            self.track(&list);
-            for item in list.borrow().iter() {
-                if let Value::List(child) = item {
-                    pending.push(child.clone());
+        let mut pending: Vec<Value> = Vec::new();
+        pending.push(value.clone());
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::List(list) => {
+                    if seen.insert(Rc::as_ptr(&list) as usize) {
+                        self.track(Tracked::List(Rc::downgrade(&list)));
+                        pending.extend(list.borrow().iter().filter(|v| is_container(v)).cloned());
+                    }
                 }
+                Value::Map(map) => {
+                    if seen.insert(Rc::as_ptr(&map) as usize) {
+                        self.track(Tracked::Map(Rc::downgrade(&map)));
+                        pending.extend(map.borrow().values().filter(|v| is_container(v)).cloned());
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    fn track(&mut self, list: &List) {
-        if self.lists.len() >= self.prune_at {
-            self.lists.retain(|w| w.strong_count() > 0);
-            self.prune_at = (self.lists.len() * 2).max(Self::MIN_PRUNE_AT);
+    fn track(&mut self, object: Tracked) {
+        if self.objects.len() >= self.prune_at {
+            self.objects.retain(Tracked::is_alive);
+            self.prune_at = (self.objects.len() * 2).max(Self::MIN_PRUNE_AT);
         }
-        self.lists.push(Rc::downgrade(list));
+        self.objects.push(object);
     }
 
-    /// Empty every list this run created that is still alive, freeing all
-    /// of the run's cyclic garbage. Dropping the moved-out elements may
-    /// free other lists outright; [`ListCell`]'s iterative `Drop` keeps
+    /// Empty every list and map this run created that is still alive,
+    /// freeing all of the run's cyclic garbage. Dropping the moved-out
+    /// contents may free other lists and maps outright; [`release`] keeps
     /// that from recursing, and their registry entries simply fail to
     /// upgrade when reached.
     pub fn reclaim(&mut self) {
-        for weak in core::mem::take(&mut self.lists) {
-            if let Some(list) = weak.upgrade() {
-                let items = core::mem::take(&mut *list.borrow_mut());
-                drop(list);
-                drop(items);
+        for object in core::mem::take(&mut self.objects) {
+            match object {
+                Tracked::List(weak) => {
+                    if let Some(list) = weak.upgrade() {
+                        let items = core::mem::take(&mut *list.borrow_mut());
+                        drop(list);
+                        release(items);
+                    }
+                }
+                Tracked::Map(weak) => {
+                    if let Some(map) = weak.upgrade() {
+                        let entries = core::mem::take(&mut *map.borrow_mut());
+                        drop(map);
+                        let mut values = Vec::new();
+                        values.extend(entries.into_values());
+                        release(values);
+                    }
+                }
             }
         }
         self.prune_at = Self::MIN_PRUNE_AT;
     }
 }
 
-impl Drop for ListRegistry {
+impl Drop for ObjectRegistry {
     fn drop(&mut self) {
         self.reclaim();
     }
+}
+
+fn is_container(value: &Value) -> bool {
+    matches!(value, Value::List(_) | Value::Map(_))
 }

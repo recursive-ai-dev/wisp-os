@@ -94,8 +94,9 @@
 //!
 //! A minimal type-tagged binary format: one tag byte, then a type-specific
 //! payload. `Nil`/`Bool`/`Int`/`Str` encode directly; `List` encodes its
-//! element count followed by each element's own tagged encoding,
-//! recursively, bounded by `wisp::value`'s own [`wisp::value::MAX_VALUE_DEPTH`]
+//! element count followed by each element's own tagged encoding, and `Map`
+//! its entry count followed by each entry's key and then value, in key
+//! order -- recursively, bounded by `wisp::value`'s own [`wisp::value::MAX_VALUE_DEPTH`]
 //! -- the same recursion guard the interpreter itself already uses for
 //! nested-list equality/display, not a separately-invented limit. [`save`]
 //! returns an explicit error (never silently truncates) if a value's
@@ -106,12 +107,13 @@
 //! missing key as `nil`, so the two were never distinguishable, and this
 //! way the slot is freed instead of spent on a value that says "nothing".
 
+use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::ahci::Hba;
-use crate::wisp::value::{ListCell, Value, MAX_VALUE_DEPTH};
+use crate::wisp::value::{ListCell, MapCell, MapKey, Value, MAX_VALUE_DEPTH};
 
 /// On-disk magic identifying a disk formatted for this store. It names the
 /// store, not the layout -- that is the version byte's job -- so it stays
@@ -176,6 +178,10 @@ const TAG_BOOL: u8 = 1;
 const TAG_INT: u8 = 2;
 const TAG_STR: u8 = 3;
 const TAG_LIST: u8 = 4;
+/// Added with WISP maps, without a format version change: the slot layout
+/// is the same, and a kernel that predates maps reports a value holding
+/// one as unreadable (an unrecognized tag) rather than misreading it.
+const TAG_MAP: u8 = 5;
 
 fn slot_lba(slot_index: u16) -> u64 {
     SLOTS_START_LBA + (slot_index as u64) * (SECTORS_PER_SLOT as u64)
@@ -284,6 +290,17 @@ fn serialize_value(value: &Value, depth: u32, out: &mut Vec<u8>) -> Result<(), &
                 serialize_value(item, depth + 1, out)?;
             }
         }
+        Value::Map(entries) => {
+            let entries = entries.borrow();
+            let count =
+                u32::try_from(entries.len()).map_err(|_| "save_format: map is too large to serialize")?;
+            put(out, &[TAG_MAP])?;
+            put(out, &count.to_le_bytes())?;
+            for (key, item) in entries.iter() {
+                serialize_value(&key.to_value(), depth + 1, out)?;
+                serialize_value(item, depth + 1, out)?;
+            }
+        }
     }
     Ok(())
 }
@@ -358,6 +375,35 @@ fn deserialize_value(bytes: &[u8], depth: u32) -> Result<(Value, usize), &'stati
                 consumed += item_len;
             }
             Ok((Value::List(Rc::new(ListCell::new(items))), consumed))
+        }
+        TAG_MAP => {
+            let count_slice = rest
+                .get(0..4)
+                .ok_or("save_format: truncated value data (missing map length)")?;
+            let count = u32::from_le_bytes(count_slice.try_into().expect("slice is exactly 4 bytes long"));
+            // Every entry is at least two bytes (a key and a value), so the
+            // same up-front plausibility check as a list's applies.
+            if count as usize > LEGACY_VALUE_MAX_LEN / 2 {
+                return Err("save_format: stored map length is implausibly large -- corrupt data");
+            }
+            let mut consumed = 1 + 4;
+            let mut entries = BTreeMap::new();
+            for _ in 0..count {
+                let (key, key_len) = deserialize_value(&bytes[consumed..], depth + 1)?;
+                consumed += key_len;
+                let key = MapKey::from_value(&key)
+                    .ok_or("save_format: stored map key is not an int or a string -- corrupt data")?;
+                // `serialize_value` writes entries in key order, so a key
+                // that is not greater than the one before it (including a
+                // repeated key) is not something it could have written.
+                if entries.last_key_value().is_some_and(|(last, _)| *last >= key) {
+                    return Err("save_format: stored map keys are out of order -- corrupt data");
+                }
+                let (item, item_len) = deserialize_value(&bytes[consumed..], depth + 1)?;
+                consumed += item_len;
+                entries.insert(key, item);
+            }
+            Ok((Value::Map(Rc::new(MapCell::new(entries))), consumed))
         }
         _ => Err("save_format: unrecognized value type tag -- corrupt data"),
     }

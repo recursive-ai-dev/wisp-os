@@ -181,7 +181,7 @@ fn for_loops_over_strings_visit_characters() {
 
 #[test]
 fn for_loops_reject_other_types() {
-    assert_err("for x in 5 { }", "'for' loops over a list or a string, found int");
+    assert_err("for x in 5 { }", "'for' loops over a list, a map or a string, found int");
     assert_err("for x in nil { }", "found nil");
 }
 

@@ -43,7 +43,7 @@ To build and run from source:
 At the `>` prompt: `help` lists shell commands, `ls APPS` shows the
 bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
-`stopwatch`, `primes`, `calc`) runs one. `wisp` opens an interactive
+`stopwatch`, `primes`, `calc`, `words`) runs one. `wisp` opens an interactive
 WISP prompt that runs each line as you type it -- the way to try the
 language, or write a quick program, on the machine itself. Every line of
 input can be edited with the arrow keys, Home, End and Delete, and Up/Down
@@ -161,7 +161,8 @@ CHANGES.md                 engineering log: the specific decisions and why
   `push`/`pop`, and the swap-to-last-then-pop removal pattern.
 - **`adventure.wisp`** -- a small five-room text adventure with an
   item-gated locked door, built entirely from globals and whole-line
-  string comparisons (WISP has no maps and no string indexing).
+  string comparisons (it was written for WISP v1, before maps and string
+  indexing).
 - **`xor_brain.wisp`** -- a 2-2-1 ReLU network computing XOR from
   analytically-derived integer weights. The simplest possible proof that
   real forward-pass inference runs correctly as WISP code.
@@ -185,6 +186,10 @@ CHANGES.md                 engineering log: the specific decisions and why
   written in WISP itself: the worked example of `for` over a string,
   string indexing, and the string builtins. Every bad expression is its
   own message, and the calculator keeps running.
+- **`words.wisp`** -- a word counter: type text, then ask for the most-used
+  words, one word's count, or the whole alphabetical list. Every tally
+  lives in one map, so it is the worked example of map reads and writes,
+  `get()`, `contains()`, `remove()`, and `for` over a map's keys.
 
 ## Known rough edges (see CHANGES.md for the full story on each)
 
