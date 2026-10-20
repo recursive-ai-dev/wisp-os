@@ -973,15 +973,27 @@ def main():
         # Console::encode()'s BGR-vs-RGB hardware-layout translation,
         # exactly like the text console already does -- not just that
         # the script executed without crashing.
+        #
+        # Every frame is fill_screen(bg) and then rect(ball), so a single
+        # screendump that lands between those two calls rightly shows only
+        # the background (seen once in three runs). Sample a few frames:
+        # the ball must be on screen in one of them.
         mon.type_text("run bounce")
         mon.enter()
         time.sleep(1.0)
-        shot = mon.screendump("14a_run_bounce_midflight")
-        assert_colors_present(
-            shot,
-            [(10, 10, 20), (255, 140, 0)],
-            "step 14a (run bounce -- mid-flight background+ball colors)",
-        )
+        for attempt in range(5):
+            shot = mon.screendump("14a_run_bounce_midflight")
+            try:
+                assert_colors_present(
+                    shot,
+                    [(10, 10, 20), (255, 140, 0)],
+                    "step 14a (run bounce -- mid-flight background+ball colors)",
+                )
+                break
+            except RuntimeError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.1)
         print("step 14a (run bounce -- mid-flight background+ball colors):", shot, "-- pixel verified")
 
         shot = wait_for_text(mon, "14b_run_bounce_finished", "bounce.wisp finished", timeout=10.0)
@@ -1376,6 +1388,76 @@ def main():
         time.sleep(0.2)
         print("step 22b (wisp prompt -- Up recalled 'let n = 41', edited to 46):", shot, "-- OCR verified")
 
+        # words.wisp: a word counter whose whole state is one map, so its
+        # answers exercise map writes, get(), key-order iteration and the
+        # ranking built on them, on the real machine.
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("run words")
+        mon.enter()
+        time.sleep(0.5)
+        for line in ["The cat saw the dog.", "the dog ran", "top"]:
+            mon.type_text(line)
+            mon.enter()
+            time.sleep(0.4)
+        shot = wait_for_text(mon, "23a_words_top", "Most used")
+        assert_ocr(
+            shot,
+            ["8 words, 5 different", "the: 3 times", "dog: twice", "cat: once"],
+            "step 23a (run words -- tallies kept in a map, ranked)",
+        )
+        print("step 23a (run words -- tallies kept in a map, ranked):", shot, "-- OCR verified")
+        for line in ["forget the", "list", "quit"]:
+            mon.type_text(line)
+            mon.enter()
+            time.sleep(0.4)
+        shot = wait_for_text(mon, "23b_words_list", "words done")
+        assert_ocr(
+            shot,
+            ["Forgot the", "cat: once", "ran: once", "saw: once", "words done"],
+            "step 23b (words -- forget removed a key, list walked the rest in order)",
+        )
+        text = ocr_text(shot)
+        after_forget = text[text.find("Forgot the"):]
+        if "the: 3 times" in after_forget:
+            raise RuntimeError(f"step 23b: 'the' was still listed after 'forget the'.\nOCR text:\n{text}")
+        if not re.search(r"cat: once.*dog: twice.*ran: once.*saw: once", after_forget, re.S):
+            raise RuntimeError(f"step 23b: the list was not in alphabetical order.\nOCR text:\n{text}")
+        print("step 23b (words -- forget removed a key, list walked the rest in order):", shot, "-- OCR verified")
+
+        # Maps at the wisp> prompt, then saved to the AHCI disk; the second
+        # boot below loads it back (step 13d).
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("wisp")
+        mon.enter()
+        time.sleep(0.3)
+        for line in [
+            'let inv = {"gold": 7, "keys": ["red"]}',
+            'inv["gold"] = inv["gold"] + 35',
+            'save("inventory", inv)',
+            'print("inventory is a " + type(inv) + " of " + str(len(inv)) + " entries")',
+            'print("gold " + str(inv["gold"]) + ", gems " + str(get(inv, "gems", 0)))',
+        ]:
+            mon.type_text(line)
+            mon.enter()
+            time.sleep(0.3)
+        shot = wait_for_text(mon, "24a_wisp_map_saved", "gold 42")
+        assert_ocr(
+            shot,
+            # Printed as sentences, not echoed: tesseract split short
+            # quoted echo lines like "2_entries_map" (read: ries_map).
+            ["inventory is a map of 2 entries", "gold 42, gems 0"],
+            "step 24a (wisp prompt -- a map built, changed and saved)",
+            must_not_contain=["wisp: line"],
+        )
+        mon.type_text("exit")
+        mon.enter()
+        time.sleep(0.2)
+        print("step 24a (wisp prompt -- a map built, changed and saved):", shot, "-- OCR verified")
+
         mon.quit()
     finally:
         time.sleep(0.5)
@@ -1444,6 +1526,28 @@ def main():
             "step 13c (run counter -- second, separate boot -- count persisted as 2)",
         )
         print("step 13c (run counter -- second, separate boot -- count persisted as 2):", shot, "-- OCR verified")
+
+        # The map step 24a saved, read back by this separate boot: the
+        # map encoding (save format tag 5) on a real AHCI disk.
+        mon2.type_text("wisp")
+        mon2.enter()
+        time.sleep(0.3)
+        mon2.type_text('let inv = load("inventory")')
+        mon2.enter()
+        time.sleep(0.3)
+        mon2.type_text('print("loaded a " + type(inv) + " with gold " + str(inv["gold"]) + " and the " + inv["keys"][0] + " key")')
+        mon2.enter()
+        time.sleep(0.3)
+        # A long line: wait for its output, not a fixed time, since QEMU
+        # types it one key at a time.
+        shot = wait_for_text(mon2, "13d_wisp_map_loaded_second_boot", "red key")
+        assert_ocr(
+            shot,
+            "loaded a map with gold 42 and the red key",
+            "step 13d (wisp prompt -- second boot loads the map step 24a saved)",
+            must_not_contain=["wisp: line"],
+        )
+        print("step 13d (wisp prompt -- second boot loads the map step 24a saved):", shot, "-- OCR verified")
 
         mon2.quit()
     finally:

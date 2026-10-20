@@ -59,14 +59,18 @@ pub fn run_source(source: &str, host: &mut dyn interp::Host) -> Result<(), WispE
 /// Lex and parse one piece of an interactive session (see
 /// `interp::Session::run_interactive`). A piece that is a single
 /// expression or statement missing only its final `;` is accepted as if
-/// the `;` were there -- at a prompt, `1 + 2` means what it says.
+/// the `;` were there -- at a prompt, `1 + 2` means what it says, and so
+/// does `let m = {"a": 1}`, which ends in a `}` that closes a map rather
+/// than a block. Appending a `;` can only rescue a parse that failed at
+/// the very end of the input, so any other mistake is still reported, as
+/// the original parse found it.
 pub fn parse_interactive(source: &str) -> Result<ast::Program, WispError> {
     let tokens = lexer::lex(source)?;
     match parser::parse(&tokens) {
         Ok(program) => Ok(program),
         Err(first) => {
             let trimmed = source.trim_end();
-            if trimmed.ends_with(';') || trimmed.ends_with('}') {
+            if trimmed.ends_with(';') {
                 return Err(first);
             }
             let mut patched = String::from(trimmed);

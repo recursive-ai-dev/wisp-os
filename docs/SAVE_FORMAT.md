@@ -205,8 +205,8 @@ freed instead of spent on a value that means "nothing".
 ## Value encoding
 
 A minimal type-tagged binary format: one tag byte, then a type-specific
-payload. All multi-byte integers are little-endian. Unchanged since
-version 1.
+payload. All multi-byte integers are little-endian. Tags `0`-`4` are
+unchanged since version 1; tag `5` was added with WISP maps.
 
 | Tag | WISP type | Payload |
 | --- | --- | --- |
@@ -215,14 +215,26 @@ version 1.
 | `2` | `Int` | 8 bytes: `i64` |
 | `3` | `Str` | 4 bytes (`u32` byte length) + that many UTF-8 bytes |
 | `4` | `List` | 4 bytes (`u32` element count) + each element, recursively encoded the same way |
+| `5` | `Map` | 4 bytes (`u32` entry count) + for each entry, in ascending key order, its key (an `Int` or `Str`, encoded as above) and then its value, recursively encoded the same way |
 
-`List` nesting is bounded by `wisp::value::MAX_VALUE_DEPTH` -- the same
-recursion guard `wisp::value::Value` already uses for structural
-equality and display, reused here rather than inventing a second,
-separate depth limit. Decoding rejects a list whose claimed element
-count is larger than could possibly fit in the remaining bytes
+`List` and `Map` nesting is bounded by `wisp::value::MAX_VALUE_DEPTH` --
+the same recursion guard `wisp::value::Value` already uses for
+structural equality and display, reused here rather than inventing a
+second, separate depth limit. Decoding rejects a list or map whose
+claimed count is larger than could possibly fit in the remaining bytes
 *before* looping over it, so a corrupt or truncated stored value can't
-be walked as if it were trusted, well-formed input. An encoding longer
+be walked as if it were trusted, well-formed input. A map's keys must
+decode as `Int`s or `Str`s in strictly ascending order (all ints, by
+value, before all strings, by byte) -- the only order the encoder writes
+-- so a repeated or out-of-order key is reported as corrupt data rather
+than silently merged.
+
+Adding the `Map` tag did not change the format version: the slot layout
+is the same, so a disk written with maps is still a version-2 disk, and
+nothing about the other keys on it changes. A kernel from before maps
+reads every other key normally and reports a key holding a map (or a
+list containing one) as unreadable -- "unrecognized value type tag" --
+rather than misreading it. An encoding longer
 than 4047 bytes (`slot size - header size`) is rejected by `save`
 outright, as soon as the encoder reaches that size -- never truncated.
 

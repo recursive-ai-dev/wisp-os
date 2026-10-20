@@ -1,7 +1,8 @@
 //! Recursive-descent parser: `Vec<Token>` -> `ast::Program`. Precedence
 //! climbing follows the table in `docs/WISP_LANGUAGE.md` exactly, lowest
 //! to highest: `or`, `and`, `==`/`!=`, comparisons, `+`/`-`, `*`/`/`/`%`,
-//! unary `not`/`-`, then calls/grouping/literals.
+//! unary `not`/`-`, then calls/grouping/literals (including `[...]` list
+//! and `{...}` map literals).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -454,8 +455,42 @@ impl<'t> Parser<'t> {
                 self.expect(Tok::RBracket)?;
                 Ok(Expr::ListLit { items, line })
             }
+            // Only reached where an operand is expected, so a `{` here is
+            // never a block: a block's `{` comes after a complete condition
+            // or a `)`, where the expression parser has already stopped.
+            Tok::LBrace => {
+                let entries = self.parse_map_entries()?;
+                Ok(Expr::MapLit { entries, line })
+            }
             other => Err(WispError::new(line, format!("unexpected {}", describe(&other)))),
         }
+    }
+
+    /// The entries of a map literal, after its `{`, through its `}`.
+    /// Outlined from `parse_primary` so that its locals are not paid at
+    /// every level of expression nesting.
+    #[inline(never)]
+    fn parse_map_entries(&mut self) -> Result<Vec<(Expr, Expr)>, WispError> {
+        let mut entries = Vec::new();
+        if !self.check(&Tok::RBrace) {
+            loop {
+                let key = self.parse_expr()?;
+                if !self.match_tok(&Tok::Colon) {
+                    return Err(WispError::new(
+                        self.peek_line(),
+                        format!("expected ':' after a map key, found {}", describe(self.peek())),
+                    ));
+                }
+                let value = self.parse_expr()?;
+                entries.push((key, value));
+                if self.match_tok(&Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(entries)
     }
 }
 

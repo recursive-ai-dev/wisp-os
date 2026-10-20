@@ -11,8 +11,8 @@ If a program only uses what's described here, it will run. The core
 language (v1) was deliberately **text and logic only**; v2 is landing in
 pieces: pixel/graphics primitives (their own section below, and in full
 depth `docs/WISP_GRAPHICS.md`), then `for` loops, slicing, string
-indexing and the string and list builtins. See "What's still not in
-WISP" at the end for what's deliberately missing.
+indexing and the string and list builtins, then maps. See "What's still
+not in WISP" at the end for what's deliberately missing.
 
 To try things out without writing a file, type `wisp` at the shell
 prompt: an interactive prompt that runs each line as you type it (see
@@ -79,7 +79,7 @@ Run it from the shell with `run guess.wisp` (or just `run guess` -- the
 
 ## Values
 
-Every value in WISP is one of exactly five types:
+Every value in WISP is one of exactly six types:
 
 - `nil` -- the absence of a value. The default value of a variable that
   hasn't been assigned; also what a function returns if it falls off the
@@ -89,11 +89,11 @@ Every value in WISP is one of exactly five types:
 - `string` -- an immutable UTF-8 text value. See "Strings" below.
 - `list` -- a growable, shared, mutable sequence of values. See "Lists"
   below.
+- `map` -- a shared, mutable table from keys (ints or strings) to
+  values. See "Maps" below.
 
-There is no map/struct/user-defined structured type in v1. Programs that
-need key-value data should use two parallel lists (a list of keys, a list
-of values, matched by index) or, for a small fixed set of fields, separate
-variables.
+There are no user-defined types: a map with fixed keys
+(`{"name": "ada", "hp": 12}`) is the way to group named fields.
 
 ## Lists
 
@@ -177,6 +177,65 @@ let grid = [[1, 2], [3, 4]];             # and nest
 - There is no `map`/`filter`: write the loop. (`oracle.wisp` predates
   `remove()` and still shows the older swap-with-last-then-`pop()` way
   of removing an arbitrary element, which is also the fastest.)
+
+## Maps
+
+```
+let hero = {"name": "ada", "hp": 12, "items": ["lamp"]};
+let empty = {};
+print(hero["name"]);          # ada
+hero["hp"] = hero["hp"] - 3;  # change an entry
+hero["gold"] = 5;             # add one
+for key in hero {
+    print(key, hero[key]);    # gold 5 / hp 9 / items ["lamp"] / name ada
+}
+```
+
+- **Keys** are ints or strings -- nothing else (a list or map can change
+  after it is put in, which a key must never do). `1` and `"1"` are
+  different keys. Values may be anything, including lists and other maps.
+- **Order.** A map keeps its entries sorted by key: all int keys first,
+  in numeric order, then all string keys, in the order `<` uses (byte
+  order, so `"B"` comes before `"a"`). That is the order `print`, `for`,
+  `keys()` and `values()` all use, whatever order the entries were added
+  in -- so a program's output never depends on its insertion history.
+- **A literal** `{key: value, ...}` builds a new map every time it runs,
+  evaluating each key and then its value, entry by entry, left to right.
+  The same key twice in one literal is a runtime error. There is no
+  trailing comma.
+- **Reading** `map[key]` gives the value stored under `key`. A key that is
+  not in the map is a runtime error, not `nil`: use `contains(map, key)`
+  to ask first, or `get(map, key)` / `get(map, key, default)`, which
+  answer `nil` / `default` for a missing key. A key of any other type
+  than int or string is a runtime error.
+- **Writing** `map[key] = value;` replaces the value under `key`, or adds
+  the entry if `key` is new. Chains mix freely with lists:
+  `world["rooms"][0]["exits"]["n"] = 1;`.
+- **`remove(map, key)`** takes `key`'s entry out and returns its value
+  (runtime error if there is none). **`len(map)`** is the number of
+  entries. **`keys(map)`** and **`values(map)`** are new lists, in key
+  order. See "Built-in functions".
+- Maps are **shared and mutable, not copied**, exactly like lists:
+  `let b = a;` and passing a map to a function give another handle to
+  the same map.
+- **Equality** is structural: two maps are `==` when they hold the same
+  keys with `==` values. Order cannot differ, since both are kept sorted.
+  `<` and the other comparisons are not defined for maps, and `+` does
+  not combine them.
+- `for key in map { ... }` visits the keys, in order, as they were when
+  the loop started: adding or removing entries inside the body does not
+  change what the loop visits. Read the value with `map[key]`.
+- **Display**: `print({"a": 1, 2: [3]})` prints `{2: [3], "a": 1}`, string
+  keys and values quoted as inside a list.
+- **Limits** are the same as lists': at most 32,768 entries in one map;
+  self-referential maps (`m["me"] = m;`) are allowed, compare by
+  structure, display as `{...}` past 64 levels, and are freed when the
+  program ends; `save()` stores a map like any other value, within the
+  same one-slot size limit.
+- Slicing (`m[1:2]`) is not defined for maps.
+
+`esp/APPS/words.wisp` -- a word counter that keeps every tally in one
+map -- is the worked example.
 
 ## Strings
 
@@ -283,7 +342,7 @@ From lowest to highest precedence:
 | 5 | `+` `-` | left |
 | 6 | `*` `/` `%` | left |
 | 7 | unary `not` `-` | right (prefix) |
-| 8 | `( )` grouping, function calls, `[ ]` list literals, indexing and slicing | -- |
+| 8 | `( )` grouping, function calls, `[ ]` list literals, `{ }` map literals, indexing and slicing | -- |
 
 Semantics:
 
@@ -295,8 +354,9 @@ Semantics:
   explicitly rather than relying on implicit coercion, so a typo'd
   variable doesn't silently concatenate the word "nil" into your output.
 - `==` `!=` compare same-typed values for equality (`int`/`int`,
-  `string`/`string`, `bool`/`bool`, `nil`/`nil`). Comparing different types
-  is always `false` for `==` and `true` for `!=` (never an error).
+  `string`/`string`, `bool`/`bool`, `nil`/`nil`, and lists and maps by
+  structure). Comparing different types is always `false` for `==` and
+  `true` for `!=` (never an error).
 - `< <= > >=` work on two `int`s, or two `string`s (lexicographic byte
   comparison). Comparing other combinations is a runtime error.
 - `and` / `or` / `not` operate on `bool`s only (no truthiness coercion of
@@ -309,14 +369,14 @@ Semantics:
 ```
 let NAME = EXPR;                 # declare + initialize
 NAME = EXPR;                     # reassign
-NAME[INDEX] = EXPR;              # list index assignment (chains: a[i][j] = EXPR;)
+NAME[INDEX] = EXPR;              # list element or map entry assignment (chains: a[i][j] = EXPR;)
 
 if EXPR { ... }
 if EXPR { ... } else { ... }
 if EXPR { ... } elif EXPR { ... } else { ... }   # any number of elif
 
 while EXPR { ... }
-for NAME in EXPR { ... }         # EXPR: a list or a string
+for NAME in EXPR { ... }         # EXPR: a list, a map or a string
 break;                           # exit innermost while/for
 continue;                        # skip to next iteration of innermost while/for
 
@@ -332,9 +392,11 @@ EXPR;                            # expression statement (e.g. a bare call: print
 body runs once per element, in order, with `x` holding that element; the
 loop visits the elements the list held when the loop *started* -- adding
 to or removing from the list inside the body does not change, or
-endlessly extend, the loop. If it is a string, the body runs once per
-character (not per byte), `x` a one-character string. Anything else is a
-runtime error. Each pass runs in its own fresh scope holding `x`, so
+endlessly extend, the loop. If it is a map, the body runs once per key,
+in key order, with `x` holding the key -- again the keys the map had when
+the loop started. If it is a string, the body runs once per character
+(not per byte), `x` a one-character string. Anything else is a runtime
+error. Each pass runs in its own fresh scope holding `x`, so
 `x` does not exist after the loop, and `let x` inside the body is an
 "already declared" error. `break` and `continue` work as in `while`.
 `for i in range(10) { ... }` is the counting loop.
@@ -372,12 +434,14 @@ by `fn`:
   commands.)
   Pressing Esc while `input()` is waiting stops the program instead of
   returning (see "Stopping a program").
-- `len(v)` -- number of bytes in `v` if it's a `string`, or number of
-  elements if it's a `list`. Runtime error for any other type.
+- `len(v)` -- number of bytes in `v` if it's a `string`, number of
+  elements if it's a `list`, or number of entries if it's a `map`.
+  Runtime error for any other type.
 - `str(v)` -- converts `v` (any type) to its `string` representation:
   ints print as decimal, `true`/`false` print as those words, `nil`
-  prints as `nil`, a `string` is returned unchanged, and a `list` renders
-  as `[elem, elem, ...]` (see "Lists").
+  prints as `nil`, a `string` is returned unchanged, a `list` renders
+  as `[elem, elem, ...]` (see "Lists") and a `map` as `{key: value, ...}`
+  (see "Maps").
 - `push(list, value)` -- appends `value` to the end of `list`, in place.
   Returns `nil`. Runtime error if the first argument isn't a `list`.
 - `pop(list)` -- removes and returns the last element of `list`, in
@@ -407,9 +471,10 @@ by `fn`:
   boot USB stick -- see `CHANGES.md`'s Phase 2, Part B entry), surviving a
   reboot. Overwrites any value already saved under that key. `key` must be
   a `string` of 32 bytes or fewer; `value` may be any WISP value --
-  `nil`/`bool`/`int`/`string` directly, or a `list` (nested lists are
-  supported, to the same 64-level depth limit as everything else
-  structural in this language). Saving `nil` deletes the key, freeing
+  `nil`/`bool`/`int`/`string` directly, or a `list` or `map` (nested
+  ones are supported, to the same 64-level depth limit as everything else
+  structural in this language; `load` gives back a new, independent copy
+  each time). Saving `nil` deletes the key, freeing
   its slot. Returns `nil`. Each save is atomic: if the machine crashes
   or loses power while `save()` is running, the key afterwards holds
   either its old value or the new one, never neither -- and once
@@ -468,7 +533,8 @@ string; none longer than 256 KiB):
   `s`, or `-1`. `find(list, value)` -- the index of the first element
   `== value`, or `-1`.
 - `contains(s, part)` / `contains(list, value)` -- `true` if `find` would
-  not return `-1`.
+  not return `-1`. `contains(map, key)` -- `true` if `map` has an entry
+  for `key` (see Maps below).
 - `replace(s, old, new)` -- `s` with every occurrence of the non-empty
   string `old` replaced by `new`.
 - `upper(s)` / `lower(s)` -- ASCII letters converted; every other
@@ -498,12 +564,27 @@ Lists (in place unless noted):
   most 32,768 elements.
 - `find`/`contains` -- see Strings above; both also search lists.
 
+Maps (see "Maps"; everything here is in key order):
+
+- `keys(map)` -- a new list of the map's keys.
+- `values(map)` -- a new list of the map's values (the values themselves,
+  shared as with any copy of a value: a list in it is the map's list).
+- `get(map, key)` -- the value under `key`, or `nil` if there is none;
+  `get(map, key, default)` -- the same, but `default` instead of `nil`.
+  The way to read a key that may be missing (`map[key]` would be an
+  error).
+- `contains(map, key)` -- `true` if `key` has an entry.
+- `remove(map, key)` -- takes `key`'s entry out and returns its value.
+  Runtime error if `key` has no entry.
+- `len(map)` -- the number of entries.
+
 Numbers and types:
 
 - `abs(n)` -- the absolute value of an int.
 - `min(a, b)` / `max(a, b)` -- the smaller/larger of two ints, or of two
   strings (in the order `<` uses).
-- `type(v)` -- `"nil"`, `"bool"`, `"int"`, `"string"` or `"list"`.
+- `type(v)` -- `"nil"`, `"bool"`, `"int"`, `"string"`, `"list"` or
+  `"map"`.
 
 ## Graphics
 
@@ -629,9 +710,8 @@ wisp> shout(names[0])
 Intentionally out of scope so far, to keep the interpreter small and
 solid while it grows:
 
-- No maps, sets, or user-defined structured types (see "Lists" for the
-  parallel-lists workaround; `find(keys, k)` gives the index to use in
-  the parallel list).
+- No sets (a map whose values are all `true` stands in for one) and no
+  user-defined types (a map with fixed keys groups named fields).
 - No closures, nested function definitions, or `map`/`filter`.
 - No floating point.
 - No string formatting beyond `+`, `str()`, `repeat()` and the string

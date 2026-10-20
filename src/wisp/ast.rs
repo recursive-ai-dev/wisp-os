@@ -62,10 +62,18 @@ pub enum Expr {
         items: Vec<Expr>,
         line: u32,
     },
-    /// `object[index]` -- a list element, or the character starting at
-    /// byte offset `index` of a string. `object` must evaluate to a list
-    /// or a string and `index` to an in-bounds `int`; both are checked at
-    /// runtime.
+    /// `{key: value, ...}` -- a map literal. Like a list literal, it
+    /// builds a fresh map every time it runs, evaluating each key and then
+    /// its value, entry by entry in source order.
+    MapLit {
+        entries: Vec<(Expr, Expr)>,
+        line: u32,
+    },
+    /// `object[index]` -- a list element, the value a map holds under the
+    /// key `index`, or the character starting at byte offset `index` of a
+    /// string. `object` must evaluate to a list, a map or a string, and
+    /// `index` to an in-bounds `int` (a key present in the map); both are
+    /// checked at runtime.
     Index {
         object: Box<Expr>,
         index: Box<Expr>,
@@ -94,6 +102,7 @@ impl Expr {
             | Expr::Binary { line, .. }
             | Expr::Call { line, .. }
             | Expr::ListLit { line, .. }
+            | Expr::MapLit { line, .. }
             | Expr::Index { line, .. }
             | Expr::Slice { line, .. } => Some(*line),
             Expr::IntLit(_) | Expr::StrLit(_) | Expr::BoolLit(_) | Expr::NilLit => None,
@@ -114,10 +123,10 @@ pub enum Stmt {
         line: u32,
     },
     ExprStmt(Expr),
-    /// `object[index] = value;` -- a list write. The only other way to
-    /// mutate a list's contents besides `push`/`pop`. All three of
-    /// `object`, `index`, and `value` are ordinary expressions,
-    /// (re-)evaluated fresh every time this statement runs.
+    /// `object[index] = value;` -- a list element write, or a map entry
+    /// write (adding the key if it is new). All three of `object`,
+    /// `index`, and `value` are ordinary expressions, (re-)evaluated fresh
+    /// every time this statement runs.
     IndexAssign {
         object: Expr,
         index: Expr,
@@ -144,7 +153,8 @@ pub enum Stmt {
     /// `for var in iter { body }`. `iter` is evaluated once, before the
     /// first pass; a list is looped over as it was at that moment (a
     /// snapshot of its elements), a string one character at a time. Each
-    /// pass runs `body` in a fresh scope holding `var`. `line` is the
+    /// pass runs `body` in a fresh scope holding `var`. A map is looped
+    /// over by its keys, as they were at that moment. `line` is the
     /// `for` keyword's, for the same reason as `While`'s.
     For {
         var: Rc<String>,
