@@ -322,6 +322,22 @@ fn nested_loops_inside_deep_recursion_are_a_clean_error() {
 }
 
 #[test]
+fn nested_for_loops_inside_deep_recursion_are_a_clean_error() {
+    // A `for` body's native frames are larger than a `while` body's; the
+    // interpreter charges it two nesting units so this still ends in a
+    // WISP error, not a stack overflow.
+    let body = format!("{}return f(n + 1);{}", "for x in [1] { ".repeat(60), "}".repeat(60));
+    let src = format!("fn f(n) {{ {body} return 0; }} f(0);");
+    let msg = on_small_stack(move || run_err(&src));
+    assert!(msg.contains("stack overflow"), "{msg}");
+    // And mixed with slices and string indexing in the recursion.
+    let body = format!("{}return f(n + 1)[0:1][0];{}", "for c in \"ab\"[0:1] { ".repeat(60), "}".repeat(60));
+    let src = format!("fn f(n) {{ {body} return \"z\"; }} f(0);");
+    let msg = on_small_stack(move || run_err(&src));
+    assert!(msg.contains("stack overflow"), "{msg}");
+}
+
+#[test]
 fn runaway_recursion_is_a_clean_error() {
     let msg = on_small_stack(|| run_err("fn f(n) { return f(n + 1); } f(0);"));
     assert!(msg.contains("stack overflow"), "{msg}");
@@ -406,7 +422,10 @@ fn probe_rejects_unsupported_versions_and_geometry() {
     unsafe { save_format::provision(&hba, hba.total_sectors()) }.unwrap();
     let mut sb = [0u8; SECTOR_SIZE as usize];
     unsafe { hba.read_sector(0, &mut sb) }.unwrap();
-    for (offset, value) in [(9usize, 2u8), (10, 63), (12, 0xFF)] {
+    // Version 0 and any version past the current one are unsupported; so
+    // is any other geometry. (Versions 1 and 2 are both read: see the
+    // save-format v2 tests below.)
+    for (offset, value) in [(9usize, 0u8), (9, 3), (9, 0xFF), (10, 63), (12, 0xFF)] {
         let mut bad = sb;
         bad[offset] = value;
         hba.seed(0, &bad);

@@ -31,13 +31,18 @@
 //! same reason `keyboard.rs`'s PS/2 decoder acts on make codes and
 //! ignores break codes.
 //!
-//! No key repeat is synthesized. The PS/2 path has never had one either
-//! (see `keyboard.rs`), so both input sources behave identically, which
-//! is worth more than the convenience.
+//! No key repeat is synthesized: holding a key types it once. (A PS/2
+//! keyboard repeats in its own hardware, by resending the make code, so
+//! a held key does repeat there; the USB boot protocol has no such thing,
+//! and a host-side repeat timer is not worth its complexity here.)
 
 use crate::sync::Locked;
 use crate::xhci::Xhci;
 use crate::keyboard::ESC;
+use crate::line_editor::{
+    KEY_DELETE as DEL, KEY_DOWN as DOWN, KEY_END as END, KEY_HOME as HOME, KEY_LEFT as LEFT,
+    KEY_RIGHT as RIGHT, KEY_UP as UP,
+};
 use crate::{debugcon, keyboard};
 
 /// ASCII carriage return, matching `shell.rs`'s and `keyboard.rs`'s
@@ -67,8 +72,8 @@ const UNSHIFTED: [u8; 0x68] = [
     b']', b'\\', 0,   b';', b'\'', b'`', b',', b'.', // 0x30-0x37 (0x32=non-US #)
     b'/', 0,    0,    0,    0,    0,    0,    0,    // 0x38-0x3F (0x39=CapsLock, 0x3A..=F1..)
     0,    0,    0,    0,    0,    0,    0,    0,    // 0x40-0x47
-    0,    0,    0,    0,    0,    0,    0,    0,    // 0x48-0x4F
-    0,    0,    0,    0,    b'/', b'*', b'-', b'+', // 0x50-0x57 (keypad / * - +)
+    0,    0,    HOME, 0,    DEL,  END,  0,    RIGHT, // 0x48-0x4F (0x4A=Home, 0x4C=Delete, 0x4D=End, 0x4F=Right)
+    LEFT, DOWN, UP,   0,    b'/', b'*', b'-', b'+', // 0x50-0x57 (Left, Down, Up, NumLock, keypad / * - +)
     ENTER, b'1', b'2', b'3', b'4', b'5', b'6', b'7', // 0x58-0x5F (keypad Enter, 1-7)
     b'8', b'9', b'0', b'.', 0,    0,    0,    0,    // 0x60-0x67 (keypad 8, 9, 0, .)
 ];
@@ -84,8 +89,8 @@ const SHIFTED: [u8; 0x68] = [
     b'}', b'|', 0,    b':', b'"', b'~', b'<', b'>',
     b'?', 0,    0,    0,    0,    0,    0,    0,
     0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    b'/', b'*', b'-', b'+',
+    0,    0,    HOME, 0,    DEL,  END,  0,    RIGHT,
+    LEFT, DOWN, UP,   0,    b'/', b'*', b'-', b'+',
     ENTER, b'1', b'2', b'3', b'4', b'5', b'6', b'7',
     b'8', b'9', b'0', b'.', 0,    0,    0,    0,
 ];

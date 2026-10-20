@@ -43,9 +43,15 @@ To build and run from source:
 At the `>` prompt: `help` lists shell commands, `ls APPS` shows the
 bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
-`stopwatch`, `primes`) runs one. **Esc stops any running program.**
+`stopwatch`, `primes`, `calc`) runs one. `wisp` opens an interactive
+WISP prompt that runs each line as you type it -- the way to try the
+language, or write a quick program, on the machine itself. Every line of
+input can be edited with the arrow keys, Home, End and Delete, and Up/Down
+recall earlier lines at the `>` and `wisp>` prompts.
+**Esc stops any running program.**
 `save`/`load` persist key/value pairs to the AHCI disk (after a one-time
-`format`, which names the disk and asks before erasing anything), `uptime` reports
+`format`, which names the disk and asks before erasing anything) -- each
+save is crash-atomic, and `keys`/`delete` list and remove them -- `uptime` reports
 elapsed time from the timer interrupt, `mem` shows heap and physical
 memory use, and `version` shows the kernel version and which hardware
 protections are live.
@@ -91,7 +97,8 @@ supported -- see `USB_INSTALL.md`.
 7. Brings up storage: finds an AHCI controller over PCI, resets it,
    IDENTIFYs the disk, and -- with a single read, never a write --
    mounts its own key/value save format if the disk already carries
-   one. A blank or foreign disk is left untouched; the shell's `format`
+   one. Saves are copy-on-write: a power cut mid-save leaves the old
+   value or the new one, never neither. A blank or foreign disk is left untouched; the shell's `format`
    command provisions it after showing the device and asking for
    confirmation. Any failure downgrades to "no persistence" with a
    message, never a hang.
@@ -120,8 +127,10 @@ src/                  the kernel (no_std, no_main)
   gfx.rs / font.rs            direct-framebuffer console, 8x16 bitmap font
   fs.rs                        FAT32 reads via UEFI protocols (pre-exit)
   shell.rs                      the `>` prompt and its commands
+  line_editor.rs                 cursor editing and history for every typed line
   libc_shims.rs                  freestanding `wcslen`
   wisp/                           lexer -> parser -> tree-walking interpreter
+                                   (one Session per program, or per `wisp` prompt)
 docs/
   WISP_LANGUAGE.md        the complete WISP language reference
   WISP_GRAPHICS.md         the pixel/graphics primitives
@@ -171,6 +180,11 @@ CHANGES.md                 engineering log: the specific decisions and why
   you press Esc (which wakes its `sleep_ms()` immediately).
 - **`primes.wisp`** -- prints primes as fast as it can, forever: a pure
   compute loop that only Esc can end.
+- **`calc.wisp`** -- an integer calculator with operator precedence and
+  parentheses (`2 + 3 * (4 + 6)` is 32), whose expression parser is
+  written in WISP itself: the worked example of `for` over a string,
+  string indexing, and the string builtins. Every bad expression is its
+  own message, and the calculator keeps running.
 
 ## Known rough edges (see CHANGES.md for the full story on each)
 

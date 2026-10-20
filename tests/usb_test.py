@@ -396,6 +396,29 @@ def scenario_usb_keyboard():
             "usb_esc_ok",
             f"{scenario} (prompt responsive after Esc over USB stopped a program)",
         )
+        # The editing keys over USB (HID usages 0x4A-0x52, decoded to the
+        # line editor's key codes): Left moves into the line, End returns,
+        # Up recalls it. Repeats are spaced past QEMU's 100 ms key hold --
+        # see Monitor.key.
+        mon.type_text("echo usbedit")
+        mon.key("left", 4, gap=0.25)
+        mon.type_text("_")
+        mon.key("end", gap=0.25)
+        mon.type_text("_ok")
+        mon.enter()
+        time.sleep(0.5)
+        mon.key("up", gap=0.25)
+        mon.key("backspace", 2, gap=0.25)
+        # Different letters, not a case change: tesseract reads "OK" as
+        # "ok" in this font.
+        mon.type_text("go")
+        mon.enter()
+        time.sleep(0.5)
+        acceptance_test.assert_ocr(
+            mon.screendump("03_usb_editing_keys"),
+            ["usb_edit_ok", "usb_edit_go"],
+            f"{scenario} (arrow/End editing and Up history over USB)",
+        )
         # Give the 100 Hz poll a few more windows before the VM is torn
         # down, so the first-keystroke marker is definitely flushed.
         time.sleep(0.5)
@@ -428,7 +451,8 @@ def scenario_usb_keyboard():
     print(
         f"==> PASS [{scenario}]: USB HID boot keyboard enumerated on port {port} "
         f"as slot {slot}, a real keystroke was delivered through the USB path, "
-        f"and Esc over USB stopped a running program"
+        f"Esc over USB stopped a running program, and the editing keys (Left, "
+        f"End, Up) edited and recalled lines"
     )
 
 

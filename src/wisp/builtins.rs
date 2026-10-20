@@ -4,11 +4,11 @@
 
 use alloc::format;
 use alloc::rc::Rc;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::interp::{Host, OUT_OF_MEMORY_MESSAGE, STOPPED_MESSAGE};
-use super::value::{Value, MAX_DISPLAY_LEN, MAX_LIST_LEN};
+use super::value::{self, List, ListRegistry, Value, MAX_DISPLAY_LEN, MAX_LIST_LEN, MAX_STR_LEN};
 use super::WispError;
 
 pub fn is_builtin(name: &str) -> bool {
@@ -34,14 +34,42 @@ pub fn is_builtin(name: &str) -> bool {
             | "rect"
             | "line"
             | "fill_screen"
+            | "split"
+            | "join"
+            | "find"
+            | "contains"
+            | "replace"
+            | "upper"
+            | "lower"
+            | "trim"
+            | "starts_with"
+            | "ends_with"
+            | "chr"
+            | "ord"
+            | "chars"
+            | "repeat"
+            | "insert"
+            | "remove"
+            | "sort"
+            | "reverse"
+            | "range"
+            | "abs"
+            | "min"
+            | "max"
+            | "type"
     )
 }
 
 // Never inlined into the interpreter: its frame (every builtin's locals)
 // would otherwise be paid at every level of WISP function recursion.
+//
+// `lists` is the running session's registry: every list a builtin creates
+// must be made through it, so that a cycle a script later builds out of
+// that list is still reclaimed when the session ends (see `ListRegistry`).
 #[inline(never)]
 pub fn call(
     host: &mut dyn Host,
+    lists: &mut ListRegistry,
     name: &str,
     args: Vec<Value>,
     line: u32,
@@ -79,6 +107,32 @@ pub fn call(
         "rect" => builtin_rect(host, &args, line),
         "line" => builtin_line(host, &args, line),
         "fill_screen" => builtin_fill_screen(host, &args, line),
+        "split" => builtin_split(host, lists, &args, line),
+        "join" => builtin_join(&args, line),
+        "find" => builtin_find(host, &args, line),
+        "contains" => builtin_contains(host, &args, line),
+        "replace" => builtin_replace(&args, line),
+        "upper" => builtin_case(&args, line, "upper", str::make_ascii_uppercase),
+        "lower" => builtin_case(&args, line, "lower", str::make_ascii_lowercase),
+        "trim" => builtin_trim(&args, line),
+        "starts_with" => builtin_affix(&args, line, "starts_with", |text, part| text.starts_with(part)),
+        "ends_with" => builtin_affix(&args, line, "ends_with", |text, part| text.ends_with(part)),
+        "chr" => builtin_chr(&args, line),
+        "ord" => builtin_ord(&args, line),
+        "chars" => builtin_chars(host, lists, &args, line),
+        "repeat" => builtin_repeat(&args, line),
+        "insert" => builtin_insert(&args, line),
+        "remove" => builtin_remove(&args, line),
+        "sort" => builtin_sort(&args, line),
+        "reverse" => builtin_reverse(&args, line),
+        "range" => builtin_range(lists, &args, line),
+        "abs" => builtin_abs(&args, line),
+        "min" => builtin_min_max(&args, line, "min"),
+        "max" => builtin_min_max(&args, line, "max"),
+        "type" => {
+            expect_arity(&args, 1, "type", line)?;
+            Ok(Value::Str(Rc::new(String::from(args[0].type_name()))))
+        }
         _ => unreachable!("is_builtin() must be checked before call()"),
     }
 }
@@ -336,10 +390,11 @@ fn builtin_sleep_ms(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Va
 }
 
 /// `save(key, value)`: persist `value` under `key` on the AHCI save disk,
-/// surviving a reboot (Phase 2, Part B). Always returns `nil` on success;
-/// the interesting failure modes (no save disk, key/value too large, out
-/// of slots) all surface as a normal WISP runtime error via `Err`, the
-/// same way any other builtin reports a problem.
+/// surviving a reboot (Phase 2, Part B); `save(key, nil)` deletes the
+/// key. Always returns `nil` on success; the interesting failure modes (no
+/// save disk, key/value too large, store full) all surface as a normal
+/// WISP runtime error via `Err`, the same way any other builtin reports a
+/// problem.
 fn builtin_save(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Value, WispError> {
     expect_arity(args, 2, "save", line)?;
     let key = match &args[0] {
@@ -515,4 +570,424 @@ fn builtin_fill_screen(host: &mut dyn Host, args: &[Value], line: u32) -> Result
     let color = expect_color(&args[0], "fill_screen", line)?;
     host.fill_screen(color);
     Ok(Value::Nil)
+}
+
+// ---- strings ---------------------------------------------------------------
+//
+// String offsets are byte offsets, the same unit `len()` counts in: they
+// index the exact UTF-8 text a script holds, whatever it contains. Every
+// builtin that builds a string refuses results over `MAX_STR_LEN` bytes
+// and allocates them fallibly, so a script that asks for too much gets a
+// WISP error, never a kernel halt -- the same contract as `+`.
+
+/// How many items `split()`/`chars()` build between checks of the host's
+/// heap reserve. Each item is a small string; checking every so often
+/// bounds what one call can allocate past the reserve to a few KiB, the
+/// same guarantee the interpreter's own per-iteration check gives a loop.
+const MEMORY_CHECK_INTERVAL: usize = 256;
+
+fn expect_str<'a>(v: &'a Value, fn_name: &str, arg_desc: &str, line: u32) -> Result<&'a Rc<String>, WispError> {
+    match v {
+        Value::Str(s) => Ok(s),
+        other => Err(WispError::new(
+            line,
+            format!("{fn_name}() expects a string for {arg_desc}, found {}", other.type_name()),
+        )),
+    }
+}
+
+fn expect_list<'a>(v: &'a Value, fn_name: &str, line: u32) -> Result<&'a List, WispError> {
+    match v {
+        Value::List(l) => Ok(l),
+        other => Err(WispError::new(
+            line,
+            format!("{fn_name}() expects a list as its first argument, found {}", other.type_name()),
+        )),
+    }
+}
+
+/// A new, empty string with room for `len` bytes -- or the "too long" /
+/// "out of memory" error a script should see instead.
+fn string_with_capacity(len: usize, fn_name: &str, line: u32) -> Result<String, WispError> {
+    if len > MAX_STR_LEN {
+        return Err(WispError::new(
+            line,
+            format!("{fn_name}(): the result would be {len} bytes; the limit is {MAX_STR_LEN}"),
+        ));
+    }
+    let mut out = String::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    Ok(out)
+}
+
+fn new_str(text: String) -> Value {
+    Value::Str(Rc::new(text))
+}
+
+/// Build a list of strings from `pieces` for `split()`/`chars()`: at most
+/// `MAX_LIST_LEN` of them, with the heap reserve checked as it grows.
+fn string_list<'a>(
+    host: &mut dyn Host,
+    lists: &mut ListRegistry,
+    pieces: impl Iterator<Item = &'a str>,
+    fn_name: &str,
+    line: u32,
+) -> Result<Value, WispError> {
+    let mut items: Vec<Value> = Vec::new();
+    for piece in pieces {
+        if items.len() >= MAX_LIST_LEN {
+            return Err(WispError::new(
+                line,
+                format!("{fn_name}(): the result would have more than {MAX_LIST_LEN} elements"),
+            ));
+        }
+        if items.len() % MEMORY_CHECK_INTERVAL == 0 && host.memory_low() {
+            return Err(WispError::new(line, OUT_OF_MEMORY_MESSAGE));
+        }
+        items
+            .try_reserve(1)
+            .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+        let mut text = String::new();
+        text.try_reserve_exact(piece.len())
+            .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+        text.push_str(piece);
+        items.push(new_str(text));
+    }
+    Ok(lists.new_list(items))
+}
+
+/// `split(text)` splits on runs of whitespace, dropping empty pieces --
+/// the natural reading of a typed command line. `split(text, sep)` splits
+/// on every occurrence of `sep`, keeping the empty pieces between adjacent
+/// separators, so `join(split(t, sep), sep)` always gives `t` back.
+fn builtin_split(host: &mut dyn Host, lists: &mut ListRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(WispError::new(line, format!("split() expects 1 or 2 arguments, got {}", args.len())));
+    }
+    let text = expect_str(&args[0], "split", "the text", line)?;
+    match args.get(1) {
+        None => string_list(host, lists, text.split_whitespace(), "split", line),
+        Some(sep) => {
+            let sep = expect_str(sep, "split", "the separator", line)?;
+            if sep.is_empty() {
+                return Err(WispError::new(line, "split(): the separator must not be empty"));
+            }
+            string_list(host, lists, text.split(sep.as_str()), "split", line)
+        }
+    }
+}
+
+fn builtin_join(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "join", line)?;
+    let list = expect_list(&args[0], "join", line)?;
+    let sep = expect_str(&args[1], "join", "the separator", line)?;
+    let items = list.borrow();
+    let mut total = sep.len().saturating_mul(items.len().saturating_sub(1));
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            Value::Str(s) => total = total.saturating_add(s.len()),
+            other => {
+                return Err(WispError::new(
+                    line,
+                    format!("join() expects a list of strings, but element {i} is {} (use str() first)", other.type_name()),
+                ))
+            }
+        }
+    }
+    let mut out = string_with_capacity(total, "join", line)?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        if let Value::Str(s) = item {
+            out.push_str(s);
+        }
+    }
+    Ok(new_str(out))
+}
+
+/// `find(text, part)`: the byte offset of the first occurrence of `part`
+/// in `text`; `find(list, value)`: the index of the first element equal
+/// to `value` (`==`'s structural equality). `-1` when there is none.
+fn builtin_find(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "find", line)?;
+    position(host, &args[0], &args[1], "find", line).map(|p| Value::Int(p.map_or(-1, |p| p as i64)))
+}
+
+fn builtin_contains(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "contains", line)?;
+    position(host, &args[0], &args[1], "contains", line).map(|p| Value::Bool(p.is_some()))
+}
+
+fn position(host: &mut dyn Host, haystack: &Value, needle: &Value, fn_name: &str, line: u32) -> Result<Option<usize>, WispError> {
+    match haystack {
+        Value::Str(text) => {
+            let part = expect_str(needle, fn_name, "the text to look for", line)?;
+            Ok(text.find(part.as_str()))
+        }
+        Value::List(list) => {
+            for (i, item) in list.borrow().iter().enumerate() {
+                // Each comparison may take up to `MAX_EQ_WORK` steps, and a
+                // list holds up to `MAX_LIST_LEN` elements: far too long to
+                // go without honouring Esc, so check it between elements as
+                // a loop would between iterations.
+                if host.stop_requested() {
+                    return Err(WispError::new(line, STOPPED_MESSAGE));
+                }
+                if value::try_equal(item, needle).map_err(|msg| WispError::new(line, msg))? {
+                    return Ok(Some(i));
+                }
+            }
+            Ok(None)
+        }
+        other => Err(WispError::new(
+            line,
+            format!("{fn_name}() expects a string or a list to search, found {}", other.type_name()),
+        )),
+    }
+}
+
+fn builtin_replace(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 3, "replace", line)?;
+    let text = expect_str(&args[0], "replace", "the text", line)?;
+    let from = expect_str(&args[1], "replace", "the text to replace", line)?;
+    let to = expect_str(&args[2], "replace", "the replacement", line)?;
+    if from.is_empty() {
+        return Err(WispError::new(line, "replace(): the text to replace must not be empty"));
+    }
+    let count = text.matches(from.as_str()).count();
+    let total = (text.len() - count * from.len()).saturating_add(count.saturating_mul(to.len()));
+    let mut out = string_with_capacity(total, "replace", line)?;
+    let mut last = 0;
+    for (at, _) in text.match_indices(from.as_str()) {
+        out.push_str(&text[last..at]);
+        out.push_str(to);
+        last = at + from.len();
+    }
+    out.push_str(&text[last..]);
+    Ok(new_str(out))
+}
+
+/// `upper(text)` / `lower(text)`: ASCII letters only -- the console font is
+/// ASCII, and every other character comes back unchanged, byte for byte.
+fn builtin_case(args: &[Value], line: u32, fn_name: &str, convert: fn(&mut str)) -> Result<Value, WispError> {
+    expect_arity(args, 1, fn_name, line)?;
+    let text = expect_str(&args[0], fn_name, "the text", line)?;
+    let mut out = string_with_capacity(text.len(), fn_name, line)?;
+    out.push_str(text);
+    convert(&mut out);
+    Ok(new_str(out))
+}
+
+fn builtin_trim(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "trim", line)?;
+    let text = expect_str(&args[0], "trim", "the text", line)?;
+    let trimmed = text.trim();
+    if trimmed.len() == text.len() {
+        return Ok(Value::Str(text.clone()));
+    }
+    let mut out = string_with_capacity(trimmed.len(), "trim", line)?;
+    out.push_str(trimmed);
+    Ok(new_str(out))
+}
+
+fn builtin_affix(args: &[Value], line: u32, fn_name: &str, test: fn(&str, &str) -> bool) -> Result<Value, WispError> {
+    expect_arity(args, 2, fn_name, line)?;
+    let text = expect_str(&args[0], fn_name, "the text", line)?;
+    let part = expect_str(&args[1], fn_name, "the text to look for", line)?;
+    Ok(Value::Bool(test(text, part)))
+}
+
+fn builtin_chr(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "chr", line)?;
+    let code = expect_int(&args[0], "chr", "the character code", line)?;
+    let ch = u32::try_from(code).ok().and_then(char::from_u32).ok_or_else(|| {
+        WispError::new(
+            line,
+            format!("chr() expects a Unicode code point (0 to 1114111, excluding 55296 to 57343), found {code}"),
+        )
+    })?;
+    Ok(new_str(ch.to_string()))
+}
+
+fn builtin_ord(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "ord", line)?;
+    let text = expect_str(&args[0], "ord", "the character", line)?;
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => Ok(Value::Int(i64::from(u32::from(ch)))),
+        _ => Err(WispError::new(
+            line,
+            format!("ord() expects a string of exactly one character, found {} bytes", text.len()),
+        )),
+    }
+}
+
+/// `chars(text)`: a list of `text`'s characters, each a one-character
+/// string (one to four bytes).
+fn builtin_chars(host: &mut dyn Host, lists: &mut ListRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "chars", line)?;
+    let text = expect_str(&args[0], "chars", "the text", line)?;
+    let pieces = text.char_indices().map(|(i, ch)| &text[i..i + ch.len_utf8()]);
+    string_list(host, lists, pieces, "chars", line)
+}
+
+fn builtin_repeat(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "repeat", line)?;
+    let text = expect_str(&args[0], "repeat", "the text", line)?;
+    let times = expect_int(&args[1], "repeat", "the count", line)?;
+    if times < 0 {
+        return Err(WispError::new(line, format!("repeat() expects a count of 0 or more, found {times}")));
+    }
+    // The size check below bounds the work only for a non-empty string:
+    // `repeat("", n)` is empty for every `n`, and must not loop `n` times.
+    if text.is_empty() {
+        return Ok(Value::Str(text.clone()));
+    }
+    let total = usize::try_from(times).unwrap_or(usize::MAX).saturating_mul(text.len());
+    let mut out = string_with_capacity(total, "repeat", line)?;
+    for _ in 0..times {
+        out.push_str(text);
+    }
+    Ok(new_str(out))
+}
+
+// ---- lists -----------------------------------------------------------------
+
+/// A position argument for `insert`/`remove`: an `int` in `0..=max`.
+fn expect_position(v: &Value, fn_name: &str, max: usize, len: usize, line: u32) -> Result<usize, WispError> {
+    let i = expect_int(v, fn_name, "the index", line)?;
+    if i < 0 || i as u64 > max as u64 {
+        return Err(WispError::new(line, format!("{fn_name}(): index {i} out of bounds (length {len})")));
+    }
+    Ok(i as usize)
+}
+
+/// `insert(list, index, value)`: `value` becomes element `index`, and the
+/// elements from there on move up one; `index` may be `len(list)`, which
+/// appends.
+fn builtin_insert(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 3, "insert", line)?;
+    let list = expect_list(&args[0], "insert", line)?;
+    let mut items = list.borrow_mut();
+    let at = expect_position(&args[1], "insert", items.len(), items.len(), line)?;
+    if items.len() >= MAX_LIST_LEN {
+        return Err(WispError::new(
+            line,
+            format!("insert(): list is full ({MAX_LIST_LEN} elements is the limit)"),
+        ));
+    }
+    items
+        .try_reserve(1)
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    items.insert(at, args[2].clone());
+    Ok(Value::Nil)
+}
+
+/// `remove(list, index)`: takes element `index` out of the list and
+/// returns it; the elements after it move down one.
+fn builtin_remove(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "remove", line)?;
+    let list = expect_list(&args[0], "remove", line)?;
+    let mut items = list.borrow_mut();
+    if items.is_empty() {
+        return Err(WispError::new(line, "remove() called on an empty list"));
+    }
+    let at = expect_position(&args[1], "remove", items.len() - 1, items.len(), line)?;
+    Ok(items.remove(at))
+}
+
+/// `sort(list)`: in place, ascending -- ints numerically, strings by byte
+/// (the same order `<` uses). Every element must be an int, or every
+/// element a string: there is no order between the two.
+fn builtin_sort(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "sort", line)?;
+    let list = expect_list(&args[0], "sort", line)?;
+    let mut items = list.borrow_mut();
+    if let Some(first) = items.first() {
+        if !matches!(first, Value::Int(_) | Value::Str(_)) {
+            return Err(WispError::new(
+                line,
+                format!("sort() needs a list of all ints or all strings, but element 0 is {}", first.type_name()),
+            ));
+        }
+        for (i, item) in items.iter().enumerate().skip(1) {
+            if !matches!((item, first), (Value::Int(_), Value::Int(_)) | (Value::Str(_), Value::Str(_))) {
+                return Err(WispError::new(
+                    line,
+                    format!(
+                        "sort() needs a list of all ints or all strings, but element 0 is {} and element {i} is {}",
+                        first.type_name(),
+                        item.type_name()
+                    ),
+                ));
+            }
+        }
+    }
+    // Unstable is indistinguishable here (equal ints or equal strings are
+    // equal values), and it sorts in place without allocating.
+    items.sort_unstable_by(|a, b| match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => x.as_str().cmp(y.as_str()),
+        _ => core::cmp::Ordering::Equal,
+    });
+    Ok(Value::Nil)
+}
+
+fn builtin_reverse(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "reverse", line)?;
+    expect_list(&args[0], "reverse", line)?.borrow_mut().reverse();
+    Ok(Value::Nil)
+}
+
+/// `range(n)`: `[0, 1, ..., n - 1]`; `range(a, b)`: `[a, ..., b - 1]`.
+/// Empty when the end is not past the start.
+fn builtin_range(lists: &mut ListRegistry, args: &[Value], line: u32) -> Result<Value, WispError> {
+    let (start, end) = match args {
+        [n] => (0, expect_int(n, "range", "the count", line)?),
+        [a, b] => (expect_int(a, "range", "the start", line)?, expect_int(b, "range", "the end", line)?),
+        _ => return Err(WispError::new(line, format!("range() expects 1 or 2 arguments, got {}", args.len()))),
+    };
+    let span = (i128::from(end) - i128::from(start)).max(0);
+    if span > MAX_LIST_LEN as i128 {
+        return Err(WispError::new(
+            line,
+            format!("range() would make {span} elements; the limit is {MAX_LIST_LEN}"),
+        ));
+    }
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(span as usize)
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    items.extend((0..span as i64).map(|k| Value::Int(start + k)));
+    Ok(lists.new_list(items))
+}
+
+// ---- numbers ---------------------------------------------------------------
+
+fn builtin_abs(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "abs", line)?;
+    let n = expect_int(&args[0], "abs", "the number", line)?;
+    n.checked_abs()
+        .map(Value::Int)
+        .ok_or_else(|| WispError::new(line, format!("integer overflow in 'abs({n})'")))
+}
+
+/// `min(a, b)` / `max(a, b)`: two ints, or two strings (in the order `<`
+/// uses). On a tie, the first argument.
+fn builtin_min_max(args: &[Value], line: u32, fn_name: &str) -> Result<Value, WispError> {
+    expect_arity(args, 2, fn_name, line)?;
+    let ordering = match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Str(a), Value::Str(b)) => a.as_str().cmp(b.as_str()),
+        (a, b) => {
+            return Err(WispError::new(
+                line,
+                format!("{fn_name}() expects two ints or two strings, found {} and {}", a.type_name(), b.type_name()),
+            ))
+        }
+    };
+    let pick_second = if fn_name == "min" { ordering.is_gt() } else { ordering.is_lt() };
+    Ok(args[usize::from(pick_second)].clone())
 }

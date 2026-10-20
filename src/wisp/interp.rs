@@ -1,9 +1,16 @@
 //! Tree-walking interpreter: `ast::Program` -> side effects (via `Host`) +
 //! a `Result<(), WispError>`.
 //!
+//! A [`Session`] holds everything a program builds up -- its globals, its
+//! functions, and the registry of every list it created -- and an
+//! [`Interp`] is one run of code against a session and a [`Host`]. A
+//! script run (`super::run_source`) is one session and one run; the
+//! shell's interactive `wisp` prompt keeps one session alive across many
+//! runs, one per line typed, so what one line defines the next can use.
+//!
 //! Scoping model: a single global scope, plus a *stack* of block-local
 //! scopes that grows and shrinks as execution enters and leaves `if`/
-//! `while` bodies and function calls:
+//! `while`/`for` bodies and function calls:
 //!
 //! - A function call starts a brand-new stack containing exactly one
 //!   frame (the parameters) -- it can never see the caller's locals, so
@@ -13,7 +20,8 @@
 //!   way out (however the block ended: falling off the end, `break`,
 //!   `continue`, or `return`). This means a `let` inside a loop body
 //!   declares a brand-new variable every iteration, rather than
-//!   colliding with the previous iteration's now-discarded one.
+//!   colliding with the previous iteration's now-discarded one. A `for`
+//!   body's fresh frame starts out holding the loop variable.
 //! - Top-level code (outside any function) runs against an initially
 //!   empty stack, so a top-level `let` not inside any block still
 //!   becomes a true global -- but a top-level `if`/`while` block gets
@@ -29,7 +37,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use super::ast::{BinaryOp, Expr, FuncDecl, Program, Stmt, TopItem, UnaryOp};
 use super::builtins;
-use super::value::{self, List, ListRegistry, Value};
+use super::value::{self, List, ListRegistry, Value, MAX_LIST_LEN};
 use super::WispError;
 
 /// Recursion guard: a user function calling itself (directly or via a
@@ -51,8 +59,10 @@ const MAX_CALL_DEPTH: usize = 256;
 /// `CHANGES.md`): the costliest chain of native frames between two
 /// consecutive units is ~750 bytes (a nested `if`/`while` body), so 1024
 /// units stay under ~770 KiB of the 1 MiB mainline stack (`gdt.rs`). A
-/// simple recursive function uses 4-5 units per call, so plain recursion
-/// still reaches 200-256 calls deep.
+/// `for` body's chain is ~1040 bytes, so a `for` statement is charged two
+/// units (see [`Interp::exec_for`]) to stay inside that bound. A simple
+/// recursive function uses 4-5 units per call, so plain recursion still
+/// reaches 200-256 calls deep.
 pub const MAX_NESTING: usize = 1024;
 
 /// Message for the error raised when the host reports the heap is down to
@@ -79,9 +89,10 @@ pub trait Host {
     fn rand_u64(&mut self) -> u64;
     /// Persist `value` under `key`, surviving a reboot -- backed by
     /// `save_format.rs` over the AHCI save disk (Phase 2, Part B).
-    /// Overwrites any value already saved under `key`. `Err` covers both
-    /// "no save disk available this boot" and every `save_format::save`
-    /// failure (key too long, value too large, all slots full).
+    /// Replaces any value already saved under `key`, crash-atomically;
+    /// saving `Value::Nil` deletes the key. `Err` covers both "no save
+    /// disk available this boot" and every `save_format::save` failure
+    /// (key too long, value too large, store full).
     fn save(&mut self, key: &str, value: &Value) -> Result<(), &'static str>;
     /// Look up a value previously saved under `key`. `Ok(None)` means
     /// `key` was never saved -- a normal, first-class outcome, not an
@@ -177,26 +188,28 @@ enum Flow {
     Return(Value),
 }
 
-pub struct Interp<'h> {
-    host: &'h mut dyn Host,
+/// Everything a program builds up that outlives one run of code: its
+/// globals, its functions, and every list it created. See the module doc
+/// comment for how runs and sessions relate.
+pub struct Session {
     globals: BTreeMap<String, Value>,
     functions: BTreeMap<String, Rc<FuncDecl>>,
-    call_depth: usize,
-    /// See [`MAX_NESTING`].
-    nesting: usize,
-    /// Every list this run creates; emptied when the interpreter is
+    /// Every list this session creates; emptied when the session is
     /// dropped, which is what frees cyclic lists. See [`ListRegistry`].
     lists: ListRegistry,
 }
 
-impl<'h> Interp<'h> {
-    pub fn new(host: &'h mut dyn Host) -> Self {
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Session {
+    pub fn new() -> Self {
         Self {
-            host,
             globals: BTreeMap::new(),
             functions: BTreeMap::new(),
-            call_depth: 0,
-            nesting: 0,
             lists: ListRegistry::new(),
         }
     }
@@ -204,7 +217,53 @@ impl<'h> Interp<'h> {
     /// Run a whole program: register every `fn` first (so forward
     /// references work regardless of source order), then execute the
     /// top-level statements in their original order.
-    pub fn run(&mut self, program: &Program) -> Result<(), WispError> {
+    pub fn run(&mut self, host: &mut dyn Host, program: &Program) -> Result<(), WispError> {
+        Interp { host, session: self, interactive: false, call_depth: 0, nesting: 0 }
+            .run_program(program)
+            .map(|_| ())
+    }
+
+    /// Run one piece of an interactive session -- what the user typed at
+    /// the `wisp` prompt -- against everything earlier pieces defined.
+    /// Differs from [`Session::run`] in exactly the ways a prompt needs:
+    /// a `fn` may replace a function an earlier piece defined, a
+    /// top-level `let` may re-declare a global (the old value is simply
+    /// replaced), and if the piece ends with a bare expression statement
+    /// its value is returned, for the prompt to echo.
+    pub fn run_interactive(&mut self, host: &mut dyn Host, program: &Program) -> Result<Option<Value>, WispError> {
+        Interp { host, session: self, interactive: true, call_depth: 0, nesting: 0 }.run_program(program)
+    }
+
+    /// Global variable names, in order -- for the interactive prompt's
+    /// `vars` listing.
+    pub fn global_names(&self) -> impl Iterator<Item = &str> {
+        self.globals.keys().map(String::as_str)
+    }
+
+    /// Function names, in order -- for the interactive prompt's `vars`
+    /// listing.
+    pub fn function_names(&self) -> impl Iterator<Item = &str> {
+        self.functions.keys().map(String::as_str)
+    }
+}
+
+/// One run of code against a [`Session`] and a [`Host`].
+pub struct Interp<'h, 's> {
+    host: &'h mut dyn Host,
+    session: &'s mut Session,
+    /// See [`Session::run_interactive`].
+    interactive: bool,
+    call_depth: usize,
+    /// See [`MAX_NESTING`].
+    nesting: usize,
+}
+
+impl Interp<'_, '_> {
+    /// Register `program`'s functions, then run its top-level statements.
+    /// Returns the value of a trailing bare expression statement when
+    /// interactive (see [`Session::run_interactive`]); `None` otherwise.
+    fn run_program(&mut self, program: &Program) -> Result<Option<Value>, WispError> {
+        let mut defined_here: Vec<&str> = Vec::new();
         for item in &program.items {
             if let TopItem::Func(f) = item {
                 if builtins::is_builtin(&f.name) {
@@ -213,41 +272,56 @@ impl<'h> Interp<'h> {
                         format!("'{}' is a built-in function and cannot be redefined", f.name),
                     ));
                 }
-                if self.functions.contains_key(f.name.as_str()) {
+                // Within one program a name may be defined once. An
+                // interactive session may redefine what an *earlier*
+                // piece defined -- that is how a typo gets fixed.
+                let earlier = self.session.functions.contains_key(f.name.as_str());
+                if defined_here.contains(&f.name.as_str()) || (earlier && !self.interactive) {
                     return Err(WispError::new(
                         f.line,
                         format!("function '{}' is already defined", f.name),
                     ));
                 }
-                self.functions.insert((*f.name).clone(), f.clone());
+                defined_here.push(f.name.as_str());
+            }
+        }
+        for item in &program.items {
+            if let TopItem::Func(f) = item {
+                self.session.functions.insert((*f.name).clone(), f.clone());
             }
         }
 
         // Top-level code starts with an empty scope stack: a bare `let`
-        // here writes straight into `self.globals`, while a top-level
-        // `if`/`while` block still gets its own pushed/popped frame.
+        // here writes straight into the session's globals, while a
+        // top-level `if`/`while`/`for` block still gets its own
+        // pushed/popped frame.
         let mut stack: ScopeStack = Vec::new();
 
-        for item in &program.items {
-            if let TopItem::Stmt(s) = item {
-                match self.exec_stmt(s, &mut stack)? {
-                    Flow::Normal => {}
-                    // A bare top-level `return;` is a documented way to
-                    // end the script early (e.g. after a "game over"
-                    // message) -- there's no function to return *from*,
-                    // but "stop running the rest of the program" is an
-                    // unambiguous, useful reading of it.
-                    Flow::Return(_) => return Ok(()),
-                    Flow::Break(line) => {
-                        return Err(WispError::new(line, "'break' outside of a loop"))
-                    }
-                    Flow::Continue(line) => {
-                        return Err(WispError::new(line, "'continue' outside of a loop"))
-                    }
+        let last_stmt = program.items.iter().rposition(|item| matches!(item, TopItem::Stmt(_)));
+        for (index, item) in program.items.iter().enumerate() {
+            let TopItem::Stmt(s) = item else { continue };
+            if self.interactive && Some(index) == last_stmt {
+                if let Stmt::ExprStmt(expr) = s {
+                    return self.eval_expr(expr, &stack).map(Some);
+                }
+            }
+            match self.exec_stmt(s, &mut stack)? {
+                Flow::Normal => {}
+                // A bare top-level `return;` is a documented way to
+                // end the script early (e.g. after a "game over"
+                // message) -- there's no function to return *from*,
+                // but "stop running the rest of the program" is an
+                // unambiguous, useful reading of it.
+                Flow::Return(_) => return Ok(None),
+                Flow::Break(line) => {
+                    return Err(WispError::new(line, "'break' outside of a loop"))
+                }
+                Flow::Continue(line) => {
+                    return Err(WispError::new(line, "'continue' outside of a loop"))
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     // ---- variable scope: global map + a stack of block-local frames ----
@@ -258,7 +332,7 @@ impl<'h> Interp<'h> {
                 return Some(v.clone());
             }
         }
-        self.globals.get(name).cloned()
+        self.session.globals.get(name).cloned()
     }
 
     #[inline(never)]
@@ -269,11 +343,15 @@ impl<'h> Interp<'h> {
         value: Value,
         line: u32,
     ) -> Result<(), WispError> {
+        // An interactive session may re-declare a global: each line is its
+        // own program, and `let x = ...;` typed twice is not a mistake
+        // there the way it is within one file.
+        let redeclare_ok = self.interactive && stack.is_empty();
         let target: &mut BTreeMap<String, Value> = match stack.last_mut() {
             Some(frame) => frame,
-            None => &mut self.globals,
+            None => &mut self.session.globals,
         };
-        if target.contains_key(name) {
+        if target.contains_key(name) && !redeclare_ok {
             return Err(WispError::new(
                 line,
                 format!("'{name}' is already declared in this scope"),
@@ -297,7 +375,7 @@ impl<'h> Interp<'h> {
                 return Ok(());
             }
         }
-        if let Some(slot) = self.globals.get_mut(name) {
+        if let Some(slot) = self.session.globals.get_mut(name) {
             *slot = value;
             return Ok(());
         }
@@ -374,6 +452,7 @@ impl<'h> Interp<'h> {
             }
             Stmt::If { branches, else_body } => self.exec_if(branches, else_body.as_deref(), stack),
             Stmt::While { cond, body, line } => self.exec_while(cond, body, *line, stack),
+            Stmt::For { var, iter, body, line } => self.exec_for(var, iter, body, *line, stack),
             Stmt::IndexAssign {
                 object,
                 index,
@@ -426,6 +505,101 @@ impl<'h> Interp<'h> {
         Ok(Flow::Normal)
     }
 
+    /// A `for` statement. Charged a second unit of [`MAX_NESTING`] on top
+    /// of the one `exec_stmt` charges every statement: the native frames
+    /// between one `for` body and the next nested statement measure ~1040
+    /// bytes on the UEFI target (this frame, `run_for_pass`, `exec_block`,
+    /// `exec_stmt`) against the ~750 the budget is sized for, so counting
+    /// it twice keeps the worst case per unit under that.
+    #[inline(never)]
+    fn exec_for(
+        &mut self,
+        var: &str,
+        iter: &Expr,
+        body: &[Stmt],
+        line: u32,
+        stack: &mut ScopeStack,
+    ) -> Result<Flow, WispError> {
+        self.enter(line)?;
+        let result = self.exec_for_inner(var, iter, body, line, stack);
+        self.nesting -= 1;
+        result
+    }
+
+    fn exec_for_inner(
+        &mut self,
+        var: &str,
+        iter: &Expr,
+        body: &[Stmt],
+        line: u32,
+        stack: &mut ScopeStack,
+    ) -> Result<Flow, WispError> {
+        match self.eval_expr(iter, stack)? {
+            Value::List(list) => {
+                // A snapshot of the element handles (cheap: refcount bumps,
+                // no deep copy), so changing the list inside the loop
+                // cannot change -- or endlessly extend -- what it visits.
+                let items = {
+                    let items = list.borrow();
+                    let mut snapshot = Vec::new();
+                    snapshot
+                        .try_reserve_exact(items.len())
+                        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+                    snapshot.extend(items.iter().cloned());
+                    snapshot
+                };
+                for item in items {
+                    match self.run_for_pass(var, item, body, line, stack)? {
+                        Flow::Break(_) => break,
+                        Flow::Continue(_) | Flow::Normal => {}
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                    }
+                }
+            }
+            Value::Str(text) => {
+                // Strings are immutable, so the loop walks the one it was
+                // given, one character per pass, without copying it.
+                let mut offset = 0;
+                while let Some(ch) = text[offset..].chars().next() {
+                    offset += ch.len_utf8();
+                    let item = Value::Str(Rc::new(ch.to_string()));
+                    match self.run_for_pass(var, item, body, line, stack)? {
+                        Flow::Break(_) => break,
+                        Flow::Continue(_) | Flow::Normal => {}
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                    }
+                }
+            }
+            other => {
+                return Err(WispError::new(
+                    iter.line().unwrap_or(line),
+                    format!("'for' loops over a list or a string, found {}", other.type_name()),
+                ))
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// One pass of a `for` loop: the cooperative checks, then `body` in a
+    /// fresh scope holding the loop variable.
+    #[inline(never)]
+    fn run_for_pass(
+        &mut self,
+        var: &str,
+        item: Value,
+        body: &[Stmt],
+        line: u32,
+        stack: &mut ScopeStack,
+    ) -> Result<Flow, WispError> {
+        self.check_interrupts(line)?;
+        let mut frame = BTreeMap::new();
+        frame.insert(var.to_string(), item);
+        stack.push(frame);
+        let result = self.exec_block(body, stack);
+        stack.pop();
+        result
+    }
+
     #[inline(never)]
     fn exec_index_assign(
         &mut self,
@@ -438,6 +612,12 @@ impl<'h> Interp<'h> {
         let obj = self.eval_expr(object, stack)?;
         let idx = self.eval_expr(index, stack)?;
         let v = self.eval_expr(value, stack)?;
+        if let Value::Str(_) = obj {
+            return Err(WispError::new(
+                line,
+                "cannot assign into a string: strings are immutable (build a new one with slices and '+')",
+            ));
+        }
         let (list, i) = index_target(&obj, &idx, line)?;
         list.borrow_mut()[i] = v;
         Ok(Flow::Normal)
@@ -488,6 +668,9 @@ impl<'h> Interp<'h> {
             Expr::Call { name, args, line } => self.eval_call(name, args, *line, stack),
             Expr::ListLit { items, line } => self.eval_list(items, *line, stack),
             Expr::Index { object, index, line } => self.eval_index(object, index, *line, stack),
+            Expr::Slice { object, start, end, line } => {
+                self.eval_slice(object, start.as_deref(), end.as_deref(), *line, stack)
+            }
         }
     }
 
@@ -532,16 +715,80 @@ impl<'h> Interp<'h> {
         for it in items {
             values.push(self.eval_expr(it, stack)?);
         }
-        Ok(self.lists.new_list(values))
+        Ok(self.session.lists.new_list(values))
     }
 
     #[inline(never)]
     fn eval_index(&mut self, object: &Expr, index: &Expr, line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
         let obj = self.eval_expr(object, stack)?;
         let idx = self.eval_expr(index, stack)?;
+        if let Value::Str(text) = &obj {
+            return char_at(text, &idx, line);
+        }
         let (list, i) = index_target(&obj, &idx, line)?;
         let v = list.borrow()[i].clone();
         Ok(v)
+    }
+
+    #[inline(never)]
+    fn eval_slice(
+        &mut self,
+        object: &Expr,
+        start: Option<&Expr>,
+        end: Option<&Expr>,
+        line: u32,
+        stack: &ScopeStack,
+    ) -> Result<Value, WispError> {
+        let obj = self.eval_expr(object, stack)?;
+        let start = match start {
+            Some(e) => Some(self.eval_expr(e, stack)?),
+            None => None,
+        };
+        let end = match end {
+            Some(e) => Some(self.eval_expr(e, stack)?),
+            None => None,
+        };
+        let len = match &obj {
+            Value::Str(text) => text.len(),
+            Value::List(list) => list.borrow().len(),
+            other => {
+                return Err(WispError::new(
+                    line,
+                    format!("cannot slice {} (only lists and strings can be sliced)", other.type_name()),
+                ))
+            }
+        };
+        let a = slice_bound(start.as_ref(), 0, "start", line)?;
+        let b = slice_bound(end.as_ref(), len, "end", line)?;
+        if b > len {
+            return Err(WispError::new(line, format!("slice end {b} out of bounds (length {len})")));
+        }
+        if a > b {
+            return Err(WispError::new(line, format!("slice start {a} is after its end {b}")));
+        }
+        match obj {
+            Value::Str(text) => {
+                for (offset, which) in [(a, "start"), (b, "end")] {
+                    if !text.is_char_boundary(offset) {
+                        return Err(inside_character(which, offset, line));
+                    }
+                }
+                let mut out = String::new();
+                out.try_reserve_exact(b - a)
+                    .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+                out.push_str(&text[a..b]);
+                Ok(Value::Str(Rc::new(out)))
+            }
+            Value::List(list) => {
+                let mut items = Vec::new();
+                items
+                    .try_reserve_exact(b - a)
+                    .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+                items.extend(list.borrow()[a..b].iter().cloned());
+                Ok(self.session.lists.new_list(items))
+            }
+            _ => unreachable!("non-sliceable values were rejected above"),
+        }
     }
 
     #[inline(never)]
@@ -596,10 +843,11 @@ impl<'h> Interp<'h> {
                     .map(Value::Int)
                     .ok_or_else(|| WispError::new(line, format!("integer overflow in '{a} + {b}'"))),
                 (Value::Str(a), Value::Str(b)) => concat(a, b, line),
+                (Value::List(a), Value::List(b)) => self.concat_lists(a, b, line),
                 _ => Err(WispError::new(
                     line,
                     format!(
-                        "'+' expects two ints or two strings, found {} and {}",
+                        "'+' expects two ints, two strings or two lists, found {} and {}",
                         lhs.type_name(),
                         rhs.type_name()
                     ),
@@ -630,6 +878,28 @@ impl<'h> Interp<'h> {
         }
     }
 
+    /// List `+`: a new list holding `a`'s elements then `b`'s (shared
+    /// handles, like any copy of a list element), refusing results over
+    /// [`MAX_LIST_LEN`] elements.
+    fn concat_lists(&mut self, a: &List, b: &List, line: u32) -> Result<Value, WispError> {
+        let (a, b) = (a.borrow(), b.borrow());
+        let len = a.len() + b.len();
+        if len > MAX_LIST_LEN {
+            return Err(WispError::new(
+                line,
+                format!("list is too long ({len} elements; the limit is {MAX_LIST_LEN})"),
+            ));
+        }
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(len)
+            .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+        items.extend(a.iter().cloned());
+        items.extend(b.iter().cloned());
+        drop((a, b));
+        Ok(self.session.lists.new_list(items))
+    }
+
     /// The cooperative checks run before every loop iteration and function
     /// call: the user's Esc, and the host's heap reserve.
     fn check_interrupts(&mut self, line: u32) -> Result<(), WispError> {
@@ -645,15 +915,15 @@ impl<'h> Interp<'h> {
     #[inline(never)]
     fn call_named(&mut self, name: &str, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
         if builtins::is_builtin(name) {
-            let result = builtins::call(&mut *self.host, name, args, line)?;
+            let result = builtins::call(&mut *self.host, &mut self.session.lists, name, args, line)?;
             if name == "load" {
                 // A list that arrives from the save disk becomes part of
-                // this run's object graph like any other.
-                self.lists.adopt(&result);
+                // this session's object graph like any other.
+                self.session.lists.adopt(&result);
             }
             return Ok(result);
         }
-        match self.functions.get(name).cloned() {
+        match self.session.functions.get(name).cloned() {
             Some(f) => self.call_function(&f, args, line),
             None => Err(WispError::new(line, format!("undefined function '{name}'"))),
         }
@@ -731,7 +1001,7 @@ fn index_target(
         other => {
             return Err(WispError::new(
                 line,
-                format!("cannot index into {} (expected a list)", other.type_name()),
+                format!("cannot index into {} (only lists and strings can be indexed)", other.type_name()),
             ))
         }
     };
@@ -752,6 +1022,52 @@ fn index_target(
         ));
     }
     Ok((list, i as usize))
+}
+
+/// `text[index]`: the character starting at byte offset `index`, as a new
+/// one-character string. Offsets are bytes, like `len()`; one that falls
+/// inside a multi-byte character is an error rather than half a character.
+fn char_at(text: &str, idx: &Value, line: u32) -> Result<Value, WispError> {
+    let i = match idx {
+        Value::Int(i) => *i,
+        other => {
+            return Err(WispError::new(
+                line,
+                format!("string index must be an int, found {}", other.type_name()),
+            ))
+        }
+    };
+    let len = text.len();
+    if i < 0 || i as usize >= len {
+        return Err(WispError::new(line, format!("string index {i} out of bounds (length {len})")));
+    }
+    let i = i as usize;
+    if !text.is_char_boundary(i) {
+        return Err(inside_character("index", i, line));
+    }
+    let ch = text[i..].chars().next().expect("i is a char boundary below len");
+    Ok(Value::Str(Rc::new(ch.to_string())))
+}
+
+/// A slice bound: absent means `default`; present, a non-negative `int`.
+fn slice_bound(v: Option<&Value>, default: usize, which: &str, line: u32) -> Result<usize, WispError> {
+    match v {
+        None => Ok(default),
+        Some(Value::Int(i)) if *i >= 0 => Ok(usize::try_from(*i).unwrap_or(usize::MAX)),
+        Some(Value::Int(i)) => Err(WispError::new(line, format!("slice {which} must not be negative, found {i}"))),
+        Some(other) => Err(WispError::new(
+            line,
+            format!("slice {which} must be an int, found {}", other.type_name()),
+        )),
+    }
+}
+
+#[cold]
+fn inside_character(which: &str, offset: usize, line: u32) -> WispError {
+    WispError::new(
+        line,
+        format!("string {which} {offset} falls inside a multi-byte character (string offsets are in bytes)"),
+    )
 }
 
 fn checked_int_binop(
@@ -808,6 +1124,7 @@ fn stmt_line(stmt: &Stmt) -> u32 {
         | Stmt::Assign { line, .. }
         | Stmt::IndexAssign { line, .. }
         | Stmt::While { line, .. }
+        | Stmt::For { line, .. }
         | Stmt::Break { line }
         | Stmt::Continue { line } => *line,
         Stmt::ExprStmt(e) | Stmt::Return { expr: Some(e) } => e.line().unwrap_or(0),

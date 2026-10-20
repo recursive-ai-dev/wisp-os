@@ -25,6 +25,27 @@ KEY_NAMES = {
     "_": "shift-minus",
     ".": "dot",
     "/": "slash",
+    # Punctuation WISP source needs, as QEMU qcodes on a US layout -- the
+    # same keys keyboard.rs's scancode tables decode them from.
+    "=": "equal",
+    "+": "shift-equal",
+    "*": "shift-8",
+    "(": "shift-9",
+    ")": "shift-0",
+    "%": "shift-5",
+    "!": "shift-1",
+    "#": "shift-3",
+    ",": "comma",
+    "<": "shift-comma",
+    ">": "shift-dot",
+    ";": "semicolon",
+    ":": "shift-semicolon",
+    "'": "apostrophe",
+    '"': "shift-apostrophe",
+    "[": "bracket_left",
+    "]": "bracket_right",
+    "{": "shift-bracket_left",
+    "}": "shift-bracket_right",
 }
 
 
@@ -76,6 +97,15 @@ class Monitor:
     def enter(self):
         self.cmd("sendkey ret")
         time.sleep(0.05)
+
+    def key(self, name: str, times: int = 1, gap: float = 0.05):
+        """Press a named key (a QEMU qcode: up, left, home, delete, ...)
+        `times` times. `gap` must exceed QEMU's 100 ms sendkey hold when
+        the same key repeats on a USB keyboard, whose boot reports carry
+        key *state*: two presses inside one hold read as one."""
+        for _ in range(times):
+            self.cmd(f"sendkey {name}")
+            time.sleep(gap)
 
     def backspace(self):
         self.cmd("sendkey backspace")
@@ -507,6 +537,44 @@ def main():
         )
         print("step 1b (paging + mainline stack active): debug log verified")
 
+        # The two-phase physical-memory handover (`pmm.rs`): boot-services
+        # memory -- where firmware's still-live page tables, stack and IDT
+        # sit -- is withheld while `paging::init` allocates and zeroes its
+        # tables, and released only after the switch onto our own tables
+        # and stack. Checked numerically, not just by the lines existing:
+        # every frame of firmware's live hierarchy must be inside the
+        # withheld memory, nothing may have been pinned (which would mean
+        # firmware state was typed conventional), and the release must
+        # free exactly what was withheld, after the stack switch.
+        log = assert_debug_log(
+            ["[pmm] released ", "[pmm] firmware's live paging hierarchy: "],
+            "step 1c (boot-services memory withheld until own tables live)",
+        )
+        withheld = re.search(r"\[pmm\] \d+ frames free; (\d+) boot-services frames withheld", log)
+        hierarchy = re.search(r"\[pmm\] firmware's live paging hierarchy: (\d+) frames, (\d+) of them in withheld", log)
+        released = re.search(r"\[pmm\] released (\d+) boot-services frames", log)
+        problems = []
+        if not (withheld and hierarchy and released):
+            problems.append("a [pmm] handover line did not match its expected format")
+        else:
+            if int(withheld.group(1)) == 0:
+                problems.append("no boot-services memory was withheld")
+            if int(hierarchy.group(1)) == 0 or hierarchy.group(1) != hierarchy.group(2):
+                problems.append(f"firmware's live page tables are not all in withheld memory ({hierarchy.group(0)!r})")
+            if released.group(1) != withheld.group(1):
+                problems.append(f"released {released.group(1)} frames but withheld {withheld.group(1)}")
+            stack_switch = log.find("[stack] running on the dedicated mainline stack")
+            if not (log.find("[paging] active, cr3=") < stack_switch < released.start()):
+                problems.append("the release did not happen after the CR3 and stack switches")
+        if "[pmm] WARNING" in log:
+            problems.append("live firmware state was found in conventional memory and pinned")
+        if problems:
+            raise RuntimeError(f"step 1c: {'; '.join(problems)}\nFull debug log:\n{log}")
+        print(
+            f"step 1c (two-phase frame handover): {withheld.group(1)} boot-services frames withheld "
+            f"(firmware's {hierarchy.group(1)} live table frames among them), released after the switch"
+        )
+
         mon.type_text("help")
         mon.enter()
         time.sleep(0.3)
@@ -542,7 +610,12 @@ def main():
 
         # Backspace test: type "abcXX" then backspace twice, then submit so
         # the resulting "unknown command: abc" line proves the trailing
-        # "XX" was actually deleted, not just visually obscured.
+        # "XX" was actually deleted, not just visually obscured. On a
+        # cleared screen: at the bottom of a full one, tesseract read this
+        # line as "abexX".
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
         mon.type_text("abcXX")
         time.sleep(0.1)
         shot = mon.screendump("05a_before_backspace")
@@ -550,7 +623,13 @@ def main():
         # sometimes misread as 'E'); "XX" alone is enough to prove both
         # trailing characters were actually typed before the backspace
         # test below proves they were then deleted.
-        assert_ocr(shot, "XX", "step 5a (before backspace)")
+        # Case-insensitively: the line editor's underline cursor sits right
+        # after the second "X", and tesseract then reads the first as "x"
+        # ("abcxX_"). What this step proves is that two characters were
+        # typed; step 5c proves they were deleted.
+        text = assert_ocr(shot, [], "step 5a (before backspace)")
+        if "xx" not in text.lower():
+            raise RuntimeError(f"step 5a (before backspace): typed 'XX' not on screen.\nOCR text:\n{text}")
         print("step 5a (before backspace):", shot, "-- OCR verified")
         mon.backspace()
         mon.backspace()
@@ -1113,7 +1192,11 @@ def main():
         assert_debug_log("[wisp] stopwatch.wisp stopped by Esc at line", "step 18b (stopwatch -- Esc stopped it)")
         assert_ocr(
             shot,
-            ["stopped (Esc pressed)", "stopwatch_done"],
+            # "stopped", not the full "stopped (Esc pressed)": tesseract
+            # drops or alters the parenthesized part depending on where
+            # the line lands (seen: "(Esc pressed", "{Ese pressed"). The
+            # stop itself is proven exactly by the debug-log line above.
+            ["stopped", "stopwatch_done"],
             "step 18b (stopwatch -- Esc interrupted sleep_ms(), prompt responsive, no stray keys)",
         )
         print("step 18b (stopwatch -- Esc interrupted sleep_ms(), prompt responsive):", shot, "-- OCR verified")
@@ -1136,6 +1219,162 @@ def main():
             must_not_contain=["leftover"],
         )
         print("step 19 (Esc at the prompt discards the typed line):", shot, "-- OCR verified")
+
+        # calc.wisp: an expression parser written in WISP, exercising the
+        # v2 language (for over a string, indexing, contains(), trim())
+        # on the real machine. A bad expression is calc's own message,
+        # and calc keeps running.
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("run calc")
+        mon.enter()
+        time.sleep(0.5)
+        # 32 with operator precedence, 50 without. (Not an answer like 11:
+        # tesseract reads "= 11" in this font as "- 1".)
+        mon.type_text("2 + 3 * (4 + 6)")
+        mon.enter()
+        time.sleep(0.5)
+        mon.type_text("10 / (5 - 5)")
+        mon.enter()
+        time.sleep(0.5)
+        shot = wait_for_text(mon, "20a_calc", "division by zero")
+        assert_ocr(shot, ["calc", "32", "division by zero"], "step 20a (run calc -- precedence and a caught error)")
+        print("step 20a (run calc -- 2 + 3 * (4 + 6) = 32, division by zero reported):", shot, "-- OCR verified")
+        mon.type_text("quit")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("echo calc_done")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("20b_calc_quit")
+        assert_ocr(shot, "calc_done", "step 20b (calc -- quit back to the shell prompt)")
+        print("step 20b (calc -- quit back to the shell prompt):", shot, "-- OCR verified")
+
+        # The interactive prompt: state carried between lines, a function
+        # typed over three lines, an error that leaves the session intact,
+        # Esc stopping a runaway line, `vars`, and `exit`.
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("wisp")
+        mon.enter()
+        time.sleep(0.3)
+        for line in [
+            'let names = split("ada grace alan")',
+            "sort(names)",
+            "names",
+            "fn shout(s) {",
+            '    return upper(s) + "!";',
+            "}",
+            'shout("hi")',
+            "nope + 1",
+        ]:
+            mon.type_text(line)
+            mon.enter()
+            time.sleep(0.3)
+        shot = wait_for_text(mon, "21a_wisp_prompt", "HI!")
+        text = assert_ocr(shot, ["HI!", "undefined variable"], "step 21a (wisp prompt -- definitions, multi-line fn, error)")
+        if not re.search(r"ada\W{0,8}alan\W{0,8}grace", text):
+            raise RuntimeError(f"step 21a: the sorted list was not echoed as ada, alan, grace.\nOCR text:\n{text}")
+        print("step 21a (wisp prompt -- sorted list echoed, 3-line fn defined and called, error reported):", shot, "-- OCR verified")
+
+        mon.type_text("clear()")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("while true { }")
+        mon.enter()
+        time.sleep(1.0)
+        mon.cmd("sendkey esc")
+        time.sleep(0.4)
+        assert_debug_log("[wisp] prompt input stopped by Esc at line 1", "step 21b (wisp prompt -- Esc stopped a runaway line)")
+        mon.type_text("vars")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("len(names) * 10")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("21b_wisp_vars")
+        assert_ocr(
+            shot,
+            # The stop is proven exactly by the debug-log line above; on
+            # screen only "stopped" is asserted, because tesseract reads
+            # this red "(Esc pressed)" as "{Ese pressed".
+            ["stopped", "globals: names", "functions: shout", "30"],
+            "step 21b (wisp prompt -- Esc, vars, session intact)",
+        )
+        print("step 21b (wisp prompt -- Esc stopped a runaway line, vars, session intact):", shot, "-- debug log + OCR verified")
+
+        mon.type_text("exit")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("echo prompt_done")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("21c_wisp_exit")
+        assert_ocr(shot, ["left the WISP prompt", "prompt_done"], "step 21c (wisp prompt -- exit back to the shell)")
+        assert_debug_log("[wisp] interactive prompt ended", "step 21c (wisp prompt -- exit back to the shell)")
+        print("step 21c (wisp prompt -- exit back to the shell):", shot, "-- debug log + OCR verified")
+
+        # The line editor: Up recalls the last command, which is edited
+        # mid-line before it runs; then Home/Right/Delete/End/Backspace
+        # edit a fresh line; then history at the wisp> prompt.
+        mon.type_text("clear")
+        mon.enter()
+        time.sleep(0.2)
+        mon.type_text("echo first_entry")
+        mon.enter()
+        time.sleep(0.2)
+        mon.key("up")
+        mon.key("left", 5)
+        mon.type_text("x_")
+        mon.enter()
+        time.sleep(0.2)
+        # Delete takes the "K" after "echo ", Backspace the trailing "X".
+        # (Words tesseract reads reliably in this font: "bcde" reads as
+        # "bede".)
+        mon.type_text("echo Kfirst_twoX")
+        mon.key("home")
+        mon.key("right", 5)
+        mon.key("delete")
+        mon.key("end")
+        mon.key("backspace")
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("22a_line_editing")
+        assert_ocr(
+            shot,
+            # The command's output line, pinned at both ends: a failed
+            # Delete would print "Kfirst_two", a failed Backspace
+            # "first_twoX". (Not the echoed command line: tesseract reads
+            # its "f" as "F".)
+            ["first_x_entry", "\nfirst_two\n"],
+            "step 22a (line editor -- history recall and mid-line edits)",
+            must_not_contain=["Kfirst", "twoX"],
+        )
+        print("step 22a (line editor -- Up recalled and edited a command; Home/Right/Delete/End/Backspace):", shot, "-- OCR verified")
+
+        mon.type_text("wisp")
+        mon.enter()
+        time.sleep(0.3)
+        mon.type_text("let n = 41")
+        mon.enter()
+        time.sleep(0.2)
+        mon.key("up")
+        mon.key("backspace")
+        mon.type_text("6")
+        mon.enter()
+        time.sleep(0.2)
+        # Echoed as a word: tesseract skips a bare two-digit line like "92".
+        mon.type_text('str(n) + "_ok"')
+        mon.enter()
+        time.sleep(0.3)
+        shot = mon.screendump("22b_wisp_history")
+        assert_ocr(shot, ["let n = 46", "46_ok"], "step 22b (wisp prompt -- Up recalled and edited a line)")
+        mon.type_text("exit")
+        mon.enter()
+        time.sleep(0.2)
+        print("step 22b (wisp prompt -- Up recalled 'let n = 41', edited to 46):", shot, "-- OCR verified")
 
         mon.quit()
     finally:

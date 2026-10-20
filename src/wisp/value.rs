@@ -145,6 +145,20 @@ impl Value {
         out
     }
 
+    /// How the interactive prompt shows a value: as
+    /// [`Value::to_display_string`] does, except that a string is quoted
+    /// even at the top level (as it already is inside a list), so the
+    /// string `"1"` and the int `1` look different. Bounded the same way.
+    pub fn to_echo_string(&self) -> String {
+        let mut out = DisplayBuf { text: String::new() };
+        let complete = self.write_nested(&mut out, 0);
+        let mut text = out.text;
+        if !complete {
+            text.push_str(TRUNCATION_MARKER);
+        }
+        text
+    }
+
     /// Like [`Value::to_display_string`], but `None` if the text would
     /// exceed [`MAX_DISPLAY_LEN`] -- for callers (`str()`) that must not
     /// silently hand back a shortened value as if it were complete.
