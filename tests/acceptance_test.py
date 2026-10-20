@@ -1144,7 +1144,7 @@ def main():
         shot = mon.screendump("16a_version")
         # "OS" alone is routinely OCR-misread as "0S"; the version string and
         # the networking line are the unambiguous parts.
-        assert_ocr(shot, ["v1.0.0", "networking: none", "NX on"], "step 16a (version)")
+        assert_ocr(shot, ["v1.1.0", "networking: none", "NX on"], "step 16a (version)")
         print("step 16a (version):", shot, "-- OCR verified")
 
         mon.type_text("mem")

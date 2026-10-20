@@ -20,7 +20,7 @@ All three follow the same two-step pattern and the same safety philosophy:
 
 `esp/EFI/BOOT/BOOTX64.EFI` must exist -- that's what gets copied onto the
 stick, along with everything in `esp/APPS/`. A release archive
-(`wisp-os-v1.0.0.tar.gz` / `.zip`) ships it prebuilt (check it with
+(`wisp-os-v1.1.0.tar.gz` / `.zip`) ships it prebuilt (check it with
 `sha256sum -c SHA256SUMS` in the extracted folder); from a source checkout,
 run `./build.sh` first (see the main `README`/`CHANGES.md`).
 

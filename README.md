@@ -1,4 +1,4 @@
-# WISP OS v1.0.0
+# WISP OS v1.1.0
 
 A freestanding x86_64 kernel that boots directly on UEFI firmware (or in
 QEMU/OVMF) and *becomes* the machine's whole environment: no underlying
@@ -24,7 +24,7 @@ was designed around: see `USB_INSTALL.md`'s "No networking, by design".
 
 ## Quick start
 
-A release archive (`wisp-os-v1.0.0.tar.gz` / `.zip`) already contains a
+A release archive (`wisp-os-v1.1.0.tar.gz` / `.zip`) already contains a
 prebuilt `esp/EFI/BOOT/BOOTX64.EFI`: to boot real hardware without
 installing Rust at all, copy the `esp/` directory onto a FAT32 USB stick
 (or use the installer scripts -- see `USB_INSTALL.md`). Verify the files
@@ -217,10 +217,10 @@ CHANGES.md                 engineering log: the specific decisions and why
 
 - Rust nightly with the `x86_64-unknown-uefi` target and `rust-src`
   component (`rust-toolchain.toml` selects the nightly channel; `rustup`
-  fetches it automatically the first time you build). v1.0.0 was built
-  and fully tested with `rustc 1.101.0-nightly (822182db4 2026-10-13)`;
+  fetches it automatically the first time you build). v1.1.0 was built
+  and fully tested with `rustc 1.101.0-nightly (07e526db9 2026-10-19)`;
   if a later nightly ever breaks the build, install that one with
-  `rustup toolchain install nightly-2026-10-14` and build with it -- or
+  `rustup toolchain install nightly-2026-10-20` and build with it -- or
   just use the prebuilt EFI from the release archive.
 - `qemu-system-x86_64` and an OVMF firmware image, to run/test without
   real hardware.
