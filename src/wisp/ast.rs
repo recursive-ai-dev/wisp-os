@@ -54,6 +54,14 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
+    /// `callee(args)` where `callee` is any expression other than a bare
+    /// name: `table[word](rest)`, `make()(3)`, `(f)(3)`. It must evaluate
+    /// to a function value. A bare `name(args)` is [`Expr::Call`].
+    CallValue {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        line: u32,
+    },
     /// `[a, b, c]` -- a list literal. Each element expression is
     /// evaluated in order to build a fresh list every time this
     /// expression runs (so `[1, 2]` inside a loop body makes a new list
@@ -101,6 +109,7 @@ impl Expr {
             | Expr::Unary { line, .. }
             | Expr::Binary { line, .. }
             | Expr::Call { line, .. }
+            | Expr::CallValue { line, .. }
             | Expr::ListLit { line, .. }
             | Expr::MapLit { line, .. }
             | Expr::Index { line, .. }

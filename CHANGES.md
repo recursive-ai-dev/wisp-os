@@ -2642,3 +2642,133 @@ does.
   The scripts were not changed.
 - **Still not exercised:** LA57 (no OVMF build enables it), real hardware,
   and the macOS and Windows installer scripts.
+
+## Functions as values
+
+The next gap after maps was the one the language reference listed beside
+them: no way to hand a function to another function. `adventure.wisp` and
+`words.wisp` both end in a chain of `if command == "..." { ... } elif ...`,
+and a list could be sorted only by its own elements. WISP now has a
+seventh value type, `func`. This is not closures -- see below.
+
+- **A function value is a name.** `Value::Func(Rc<String>)`. A bare
+  identifier that is not a variable evaluates to the function (user or
+  built-in) of that name, or is the same "undefined variable" error as
+  before. The name is resolved when the value is *called*, not when it is
+  made, so it holds no pointer into the session: it cannot take part in a
+  cycle, needs no `ObjectRegistry` entry, and a function redefined at the
+  `wisp>` prompt is the new one through every stored copy. The price is
+  that a value is only a name; there is still no captured environment, no
+  anonymous `fn`, and function bodies still see only their parameters,
+  locals and globals.
+- **Calling.** `name(args)` first looks for a *variable* `name` holding a
+  function (so a parameter `f` is what `f(x)` calls even when a global
+  function `f` exists), and otherwise calls the function `name`. A
+  variable holding anything else is ignored when a function of that name
+  exists -- every program written before this keeps its meaning -- and is
+  the error "cannot call 'x': it holds int, not a function" when none
+  does. `callee(args)` for any other callee is a new node,
+  `Expr::CallValue` (`table[word](rest)`, `pick()(3)`, `(f)(3)`), parsed
+  as a postfix suffix beside `[`.
+- **`map(f, list)`, `filter(f, list)`, `reduce(f, list, start)`,
+  `sort_by(list, f)`.** They live in `interp.rs`, not `builtins.rs`,
+  because they call back into the interpreter; `builtins::is_higher_order`
+  names them and `is_builtin` includes them, so they are reserved like
+  every other built-in. (A program that defined its own `fn map` or
+  `fn filter` would now fail to load; none of the bundled programs or the
+  documented examples does. Variables with those names are unaffected.)
+  Each works from a snapshot of the list's element handles, as `for`
+  does; each checks for Esc and low memory before every callback itself,
+  because a built-in used as the callback (`map(upper, words)`) never
+  passes through `call_function`'s check; each builds its result with
+  fallible reservations like the other list builders. `sort_by` computes
+  the key once per element, requires all-int or all-string keys, sorts
+  stably, rejects a callback that resized the list, and only then writes
+  the new order back -- a failed `sort_by` leaves the list untouched.
+- **Values elsewhere.** `==` compares names; display is `<fn name>`;
+  `type` is `"func"`; a function is not a map key; `save()` refuses a
+  value with a function anywhere inside it (`save_format` returns a
+  precise error rather than a tag, so the format and its version are
+  unchanged, and a name stored across a reboot would mean whatever
+  carries it then).
+- **`esp/APPS/tasks.wisp`**: a to-do list whose commands are
+  `let commands = {"add": cmd_add, ...}` and `commands[word](rest)`;
+  `filter`, `map`, `reduce` and a stable `sort_by` do the list work.
+
+### Native stack
+
+Measured on the UEFI target as before (`--emit=asm`, prologue sizes plus
+pushes, without the return address). The first draft of this change
+failed the measurement in three places, which is what the measurement is
+for:
+
+- `eval_expr` went from 136 to 168 bytes, `parse_postfix` from 344 to 376,
+  and the chain `eval_call -> call_named -> call_function` that every
+  WISP call pays grew. The `Var` arm is now outlined (`eval_var`, 120),
+  the call suffix (`parse_call_suffix`, 152) and the index/slice suffix
+  (`parse_index_suffix`, 216) are outlined from `parse_postfix`, which is
+  now 312 (smaller than before). `eval_expr` ends at 152 and `eval_call`
+  at 232 (was 216): the expression chain between two nesting units is
+  therefore about 16 bytes (2%) larger than before, ~784 bytes against
+  the ~750 `MAX_NESTING` was sized for -- 1024 units is still ~800 KiB of
+  the 1 MiB mainline stack. An attempt to move the variable lookup into
+  `call_named` instead only moved the same 16 bytes into that frame.
+- A higher-order call is `call_higher_order` (152) + the worker
+  (`hof_map` 376, `hof_filter` 344, `hof_reduce` 312, `hof_sort_by` 408)
+  + `call_named` (200) + `call_function` (328), about 1.1 KiB before the
+  callback's own unit is charged -- over the unit size, like a nested
+  `for`. It is therefore charged two units, exactly as `for` is. This
+  rests on the measurement alone: a mutant that charges one unit passes
+  every host test, because the host build's frames are smaller than the
+  UEFI target's and the recursion tests end at the call-depth or
+  nesting limit well inside a 640 KiB stack either way. (The test
+  `higher_order_calls_give_back_their_nesting_budget` does catch the
+  opposite mistake, charging more than is returned.)
+- `CallValue`: `eval_expr` + `eval_call_value` (264) is ~416 bytes per
+  level of `f(1)(1)(1)...`, well inside a unit; the parser charges one
+  syntax level per link, so a 5,000-link chain is a clean parse error.
+
+### Verification
+
+- `tests/host/tests/functions.rs` (43 tests): every construct and error
+  message; the shadowing and compatibility rules above; calls on indexes,
+  calls and parentheses; redefinition through the interactive prompt
+  (and that its echo shows `<fn f>`); function values in lists and maps
+  (display, `==`, `find`/`contains`); map keys and `save()` (a failed save
+  leaves the earlier value intact); `map`/`filter`/`reduce`/`sort_by` for
+  results, ordering of calls, snapshots when the callback grows the list,
+  and every argument error; `sort_by` stability on 300 elements (small
+  slices are sorted by an insertion sort that is stable regardless);
+  recursion through each higher-order built-in and through `g(g)` on a
+  640 KiB stack ends in a clean "stack overflow"; a 5,000-link call chain
+  is a clean error and a 40-link one works; Esc stops each of the four
+  with a *built-in* callback, which has no per-call check of its own; cycles
+  built from lists holding function values leak nothing across repeated
+  allocation-counted runs; 3,000 loop iterations of every higher-order call give back
+  their nesting budget; the documented examples run as written;
+  `tasks.wisp` driven through three scripted sessions (commands, stable
+  sort and clearing, and a run of malformed input).
+- Mutation testing: 11 deliberate bugs (no Esc check in `map`; the
+  nesting units not all given back; unstable `sort_by`; `filter`
+  accepting any value; a non-function variable hiding a function; a
+  function variable losing to a function name; no size check in
+  `sort_by`; `reduce` arguments swapped; no snapshot in `map`;
+  function `==` always false; a function saved as `nil`). Two survived
+  the first draft of the tests -- an unreturned nesting unit (it only
+  errors after ~1,000 calls in a loop) and unstable `sort_by` (tiny
+  inputs are sorted stably by accident) -- and each now has a test that
+  fails with the bug in. The "one unit instead of two" mutant survives
+  by design; see above.
+- All earlier suites unchanged: the 141 host tests still pass in
+  `--release`, and the kernel builds with zero warnings.
+
+### Not verified here
+
+This session had no QEMU, so `tests/acceptance_test.py` and the other
+three VM suites were not run, and no acceptance step was added for
+`tasks.wisp` (one that had never been run would be a guess). The host
+tests drive the same interpreter and the same `.wisp` file through a
+scripted host; the UEFI build, its warnings and its frame sizes were
+checked, but the new binary has not been booted. Version, `SHA256SUMS`
+and the release archives are untouched: this is work after v1.1.0, for
+the next release to pick up.

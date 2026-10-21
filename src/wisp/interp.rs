@@ -671,13 +671,11 @@ impl Interp<'_, '_> {
             Expr::StrLit(s) => Ok(Value::Str(s.clone())),
             Expr::BoolLit(b) => Ok(Value::Bool(*b)),
             Expr::NilLit => Ok(Value::Nil),
-            Expr::Var { name, line } => match self.get_var(stack, name) {
-                Some(v) => Ok(v),
-                None => Err(undefined_variable(name, *line)),
-            },
+            Expr::Var { name, line } => self.eval_var(name, *line, stack),
             Expr::Unary { op, expr, line } => self.eval_unary(*op, expr, *line, stack),
             Expr::Binary { op, lhs, rhs, line } => self.eval_binary(*op, lhs, rhs, *line, stack),
             Expr::Call { name, args, line } => self.eval_call(name, args, *line, stack),
+            Expr::CallValue { callee, args, line } => self.eval_call_value(callee, args, *line, stack),
             Expr::ListLit { items, line } => self.eval_list(items, *line, stack),
             Expr::MapLit { entries, line } => self.eval_map(entries, *line, stack),
             Expr::Index { object, index, line } => self.eval_index(object, index, *line, stack),
@@ -713,7 +711,70 @@ impl Interp<'_, '_> {
         for a in args {
             values.push(self.eval_expr(a, stack)?);
         }
-        self.call_named(name, values, line)
+        match self.call_target(name, stack, line)? {
+            Some(target) => self.call_named(&target, values, line),
+            None => self.call_named(name, values, line),
+        }
+    }
+
+    /// `callee(args)` for a callee that is not a bare name.
+    #[inline(never)]
+    fn eval_call_value(&mut self, callee: &Expr, args: &[Expr], line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
+        let target = match self.eval_expr(callee, stack)? {
+            Value::Func(name) => name,
+            other => {
+                return Err(WispError::new(
+                    line,
+                    format!("cannot call {}: only a function can be called", other.type_name()),
+                ))
+            }
+        };
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            values.push(self.eval_expr(a, stack)?);
+        }
+        self.call_named(&target, values, line)
+    }
+
+    /// A bare name: the nearest variable of that name, else the function
+    /// of that name. Outlined from `eval_expr_inner` for the same reason
+    /// as every other arm that does real work.
+    #[inline(never)]
+    fn eval_var(&self, name: &Rc<String>, line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
+        match self.get_var(stack, name) {
+            Some(v) => Ok(v),
+            None => self.function_value(name).ok_or_else(|| undefined_variable(name, line)),
+        }
+    }
+
+    /// Whether `name` is a user function or a built-in.
+    fn function_exists(&self, name: &str) -> bool {
+        builtins::is_builtin(name) || self.session.functions.contains_key(name)
+    }
+
+    /// The function value a bare name stands for when no variable of that
+    /// name exists: `apply(double, 3)`, `map(len, words)`.
+    #[inline(never)]
+    fn function_value(&self, name: &Rc<String>) -> Option<Value> {
+        self.function_exists(name).then(|| Value::Func(name.clone()))
+    }
+
+    /// What a call written `name(...)` calls. A variable holding a
+    /// function wins (so a parameter `f` is called as `f(x)` even if a
+    /// function named `f` also exists); a variable holding anything else
+    /// is ignored when a function of that name exists, so programs written
+    /// before functions were values keep working, and is an error when
+    /// none does.
+    #[inline(never)]
+    fn call_target(&self, name: &str, stack: &ScopeStack, line: u32) -> Result<Option<Rc<String>>, WispError> {
+        match self.get_var(stack, name) {
+            Some(Value::Func(target)) => Ok(Some(target)),
+            Some(other) if !self.function_exists(name) => Err(WispError::new(
+                line,
+                format!("cannot call '{name}': it holds {}, not a function", other.type_name()),
+            )),
+            _ => Ok(None),
+        }
     }
 
     #[inline(never)]
@@ -956,6 +1017,9 @@ impl Interp<'_, '_> {
 
     #[inline(never)]
     fn call_named(&mut self, name: &str, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        if builtins::is_higher_order(name) {
+            return self.call_higher_order(name, args, line);
+        }
         if builtins::is_builtin(name) {
             let result = builtins::call(&mut *self.host, &mut self.session.objects, name, args, line)?;
             if name == "load" {
@@ -1025,6 +1089,179 @@ impl Interp<'_, '_> {
             Flow::Break(line) => Err(WispError::new(line, "'break' outside of a loop")),
             Flow::Continue(line) => Err(WispError::new(line, "'continue' outside of a loop")),
         }
+    }
+}
+
+impl Interp<'_, '_> {
+    /// `map`, `filter`, `reduce` and `sort_by`: the built-ins that call a
+    /// WISP function per element. The chain of native frames from here to
+    /// the callback's own call (this, the worker, `call_named`,
+    /// `call_function`) is ~1.1 KiB, over the ~750 bytes a unit of
+    /// [`MAX_NESTING`] stands for, so they are charged two units, as `for`
+    /// is. Each works from a snapshot of the list's element handles, as
+    /// `for` does, so a callback that grows the list cannot make them run
+    /// on; each checks for Esc and low memory before every callback, since
+    /// a built-in used as the callback (`map(upper, words)`) would not.
+    #[inline(never)]
+    fn call_higher_order(&mut self, name: &str, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        self.enter(line)?;
+        if let Err(e) = self.enter(line) {
+            self.nesting -= 1;
+            return Err(e);
+        }
+        let result = match name {
+            "map" => self.hof_map(args, line),
+            "filter" => self.hof_filter(args, line),
+            "reduce" => self.hof_reduce(args, line),
+            _ => self.hof_sort_by(args, line),
+        };
+        self.nesting -= 2;
+        result
+    }
+
+    /// Check `args` is `want` long and pull out the function and list
+    /// argument (at `func_at` and `list_at`) for the `who` built-in.
+    fn hof_args(
+        args: &[Value],
+        who: &str,
+        want: usize,
+        func_at: usize,
+        list_at: usize,
+        line: u32,
+    ) -> Result<(Rc<String>, List), WispError> {
+        if args.len() != want {
+            return Err(WispError::new(line, format!("{who}() expects {want} arguments, got {}", args.len())));
+        }
+        let ordinal = |at: usize| ["first", "second", "third"][at];
+        let func = match &args[func_at] {
+            Value::Func(name) => name.clone(),
+            other => {
+                return Err(WispError::new(
+                    line,
+                    format!("{who}() expects a function as its {} argument, found {}", ordinal(func_at), other.type_name()),
+                ))
+            }
+        };
+        let list = match &args[list_at] {
+            Value::List(list) => list.clone(),
+            other => {
+                return Err(WispError::new(
+                    line,
+                    format!("{who}() expects a list as its {} argument, found {}", ordinal(list_at), other.type_name()),
+                ))
+            }
+        };
+        Ok((func, list))
+    }
+
+    fn hof_result_vec(len: usize, line: u32) -> Result<Vec<Value>, WispError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+        Ok(out)
+    }
+
+    fn hof_snapshot(list: &List, line: u32) -> Result<Vec<Value>, WispError> {
+        let items = list.borrow();
+        let mut snapshot = Self::hof_result_vec(items.len(), line)?;
+        snapshot.extend(items.iter().cloned());
+        Ok(snapshot)
+    }
+
+    #[inline(never)]
+    fn hof_map(&mut self, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        let (func, list) = Self::hof_args(&args, "map", 2, 0, 1, line)?;
+        let items = Self::hof_snapshot(&list, line)?;
+        let mut out = Self::hof_result_vec(items.len(), line)?;
+        for item in items {
+            self.check_interrupts(line)?;
+            out.push(self.call_named(&func, vec![item], line)?);
+        }
+        Ok(self.session.objects.new_list(out))
+    }
+
+    #[inline(never)]
+    fn hof_filter(&mut self, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        let (func, list) = Self::hof_args(&args, "filter", 2, 0, 1, line)?;
+        let items = Self::hof_snapshot(&list, line)?;
+        let mut out = Vec::new();
+        for item in items {
+            self.check_interrupts(line)?;
+            match self.call_named(&func, vec![item.clone()], line)? {
+                Value::Bool(true) => {
+                    out.try_reserve(1).map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+                    out.push(item);
+                }
+                Value::Bool(false) => {}
+                other => {
+                    return Err(WispError::new(
+                        line,
+                        format!("filter() needs '{func}' to return a bool, but it returned {}", other.type_name()),
+                    ))
+                }
+            }
+        }
+        Ok(self.session.objects.new_list(out))
+    }
+
+    /// `reduce(f, list, start)`: `start`, then `f(result, element)` for
+    /// each element in turn. An empty list gives `start`.
+    #[inline(never)]
+    fn hof_reduce(&mut self, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        let (func, list) = Self::hof_args(&args, "reduce", 3, 0, 1, line)?;
+        let mut acc = args[2].clone();
+        for item in Self::hof_snapshot(&list, line)? {
+            self.check_interrupts(line)?;
+            acc = self.call_named(&func, vec![acc, item], line)?;
+        }
+        Ok(acc)
+    }
+
+    /// `sort_by(list, f)`: reorders `list` in place by the key `f` gives
+    /// each element -- all ints or all strings, as `sort` needs. Stable:
+    /// elements with equal keys stay in their original order. `f` runs
+    /// once per element, and `list` may not change size while it does.
+    #[inline(never)]
+    fn hof_sort_by(&mut self, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        let (func, list) = Self::hof_args(&args, "sort_by", 2, 1, 0, line)?;
+        let items = Self::hof_snapshot(&list, line)?;
+        let mut keyed: Vec<(Value, Value)> = Vec::new();
+        keyed.try_reserve_exact(items.len()).map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+        for item in items {
+            self.check_interrupts(line)?;
+            let key = self.call_named(&func, vec![item.clone()], line)?;
+            if !matches!(key, Value::Int(_) | Value::Str(_)) {
+                return Err(WispError::new(
+                    line,
+                    format!("sort_by() needs '{func}' to return an int or a string, but it returned {}", key.type_name()),
+                ));
+            }
+            if let Some((first, _)) = keyed.first() {
+                if first.type_name() != key.type_name() {
+                    return Err(WispError::new(
+                        line,
+                        format!(
+                            "sort_by() needs keys that are all ints or all strings, but '{func}' returned {} and {}",
+                            first.type_name(),
+                            key.type_name()
+                        ),
+                    ));
+                }
+            }
+            keyed.push((key, item));
+        }
+        if list.borrow().len() != keyed.len() {
+            return Err(WispError::new(line, format!("'{func}' changed the size of the list being sorted")));
+        }
+        keyed.sort_by(|(a, _), (b, _)| match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            (Value::Str(x), Value::Str(y)) => x.as_str().cmp(y.as_str()),
+            _ => core::cmp::Ordering::Equal,
+        });
+        let mut sorted = list.borrow_mut();
+        for (slot, (_, item)) in sorted.iter_mut().zip(keyed) {
+            *slot = item;
+        }
+        Ok(Value::Nil)
     }
 }
 

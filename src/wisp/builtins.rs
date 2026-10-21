@@ -11,8 +11,15 @@ use super::interp::{Host, OUT_OF_MEMORY_MESSAGE, STOPPED_MESSAGE};
 use super::value::{self, List, Map, MapKey, ObjectRegistry, Value, MAX_DISPLAY_LEN, MAX_LIST_LEN, MAX_STR_LEN};
 use super::WispError;
 
+/// The built-ins that call back into the interpreter, so they live in
+/// `interp.rs` (`Interp::call_higher_order`) rather than in [`call`].
+pub fn is_higher_order(name: &str) -> bool {
+    matches!(name, "map" | "filter" | "reduce" | "sort_by")
+}
+
 pub fn is_builtin(name: &str) -> bool {
-    matches!(
+    is_higher_order(name)
+        || matches!(
         name,
         "print"
             | "input"
@@ -139,7 +146,7 @@ pub fn call(
         "keys" => builtin_keys_values(objects, &args, line, "keys"),
         "values" => builtin_keys_values(objects, &args, line, "values"),
         "get" => builtin_get(&args, line),
-        _ => unreachable!("is_builtin() must be checked before call()"),
+        _ => unreachable!("is_builtin() must be checked, and higher-order built-ins routed to the interpreter, before call()"),
     }
 }
 
