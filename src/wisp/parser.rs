@@ -383,31 +383,68 @@ impl<'t> Parser<'t> {
     fn parse_postfix(&mut self) -> Result<Expr, WispError> {
         let base = self.depth;
         let mut expr = self.parse_primary()?;
-        while self.check(&Tok::LBracket) {
+        while self.check(&Tok::LBracket) || self.check(&Tok::LParen) {
             let line = self.peek_line();
-            self.advance();
-            self.descend()?;
-            let first = if self.check(&Tok::Colon) { None } else { Some(Box::new(self.parse_expr()?)) };
-            if self.match_tok(&Tok::Colon) {
-                let end = if self.check(&Tok::RBracket) { None } else { Some(Box::new(self.parse_expr()?)) };
-                self.expect(Tok::RBracket)?;
-                expr = Expr::Slice {
-                    object: Box::new(expr),
-                    start: first,
-                    end,
-                    line,
-                };
-            } else {
-                self.expect(Tok::RBracket)?;
-                expr = Expr::Index {
-                    object: Box::new(expr),
-                    index: first.expect("an index expression was parsed: the token after '[' was not ':'"),
-                    line,
-                };
+            if self.match_tok(&Tok::LParen) {
+                expr = self.parse_call_suffix(expr, line)?;
+                continue;
             }
+            expr = self.parse_index_suffix(expr, line)?;
         }
         self.depth = base;
         Ok(expr)
+    }
+
+    /// An index or a slice of `object`, from its `[` through its `]`.
+    /// Outlined so that its locals are not paid at every level of
+    /// expression nesting.
+    #[inline(never)]
+    fn parse_index_suffix(&mut self, object: Expr, line: u32) -> Result<Expr, WispError> {
+        self.advance();
+        self.descend()?;
+        let first = if self.check(&Tok::Colon) { None } else { Some(Box::new(self.parse_expr()?)) };
+        if self.match_tok(&Tok::Colon) {
+            let end = if self.check(&Tok::RBracket) { None } else { Some(Box::new(self.parse_expr()?)) };
+            self.expect(Tok::RBracket)?;
+            Ok(Expr::Slice { object: Box::new(object), start: first, end, line })
+        } else {
+            self.expect(Tok::RBracket)?;
+            Ok(Expr::Index {
+                object: Box::new(object),
+                index: first.expect("an index expression was parsed: the token after '[' was not ':'"),
+                line,
+            })
+        }
+    }
+
+    /// A call on something that is not a bare name -- the result of an
+    /// index, a call or a parenthesized expression -- after its `(`.
+    /// (`name(` was taken by `parse_primary`.) Outlined so its locals are
+    /// not paid at every level of expression nesting.
+    #[inline(never)]
+    fn parse_call_suffix(&mut self, callee: Expr, line: u32) -> Result<Expr, WispError> {
+        self.descend()?;
+        let args = self.parse_call_args()?;
+        Ok(Expr::CallValue { callee: Box::new(callee), args, line })
+    }
+
+    /// A call's arguments, after its `(`, through its `)`. Outlined from
+    /// `parse_primary` so its locals are not paid at every level of
+    /// expression nesting.
+    #[inline(never)]
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, WispError> {
+        let mut args = Vec::new();
+        if !self.check(&Tok::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if self.match_tok(&Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(args)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, WispError> {
@@ -420,17 +457,7 @@ impl<'t> Parser<'t> {
             Tok::Nil => Ok(Expr::NilLit),
             Tok::Ident(name) => {
                 if self.match_tok(&Tok::LParen) {
-                    let mut args = Vec::new();
-                    if !self.check(&Tok::RParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if self.match_tok(&Tok::Comma) {
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                    self.expect(Tok::RParen)?;
+                    let args = self.parse_call_args()?;
                     Ok(Expr::Call { name, args, line })
                 } else {
                     Ok(Expr::Var { name, line })

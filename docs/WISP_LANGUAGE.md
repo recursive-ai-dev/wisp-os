@@ -79,7 +79,7 @@ Run it from the shell with `run guess.wisp` (or just `run guess` -- the
 
 ## Values
 
-Every value in WISP is one of exactly six types:
+Every value in WISP is one of exactly seven types:
 
 - `nil` -- the absence of a value. The default value of a variable that
   hasn't been assigned; also what a function returns if it falls off the
@@ -91,6 +91,7 @@ Every value in WISP is one of exactly six types:
   below.
 - `map` -- a shared, mutable table from keys (ints or strings) to
   values. See "Maps" below.
+- `func` -- a function, as a value. See "Functions as values" below.
 
 There are no user-defined types: a map with fixed keys
 (`{"name": "ada", "hp": 12}`) is the way to group named fields.
@@ -276,6 +277,85 @@ The string builtins (details under "Built-in functions"): `split`,
 `esp/APPS/calc.wisp` -- an arithmetic calculator whose expression parser
 is written in WISP -- is the worked example.
 
+## Functions as values
+
+A function's name, used where a value is expected, is that function. It
+can go in a variable, a list or a map, be passed to another function, or
+be returned from one:
+
+```
+fn double(x) { return x * 2; }
+fn twice(f, x) { return f(f(x)); }
+
+let f = double;
+print(f(21));            # 42
+print(twice(double, 5)); # 20
+print(f, type(f));       # <fn double> func
+
+let table = {"d": double, "len": len};
+print(table["d"](4));    # 8
+```
+
+- **Any built-in is a function value too** (`let n = len;`,
+  `map(upper, words)`), as are `map`, `filter`, `reduce` and `sort_by`.
+- **Calling.** `name(args)` calls the function a variable called `name`
+  holds, if there is one, else the function called `name`. `callee(args)`
+  calls any expression that evaluates to a function: `table[word](rest)`,
+  `pick()(3)`, `(f)(3)`. Calling anything that is not a function is a
+  runtime error naming what it was. The number of arguments is checked
+  against the function actually called, so a wrong count says which
+  function was meant.
+- **Variables and functions share one lookup, in this order:** the
+  nearest variable, then the function of that name. A parameter `f`
+  holding a function is therefore what `f(x)` calls, even if a function
+  named `f` also exists. A variable holding something *else* (`let f = 5;`)
+  does not hide a function of the same name when called: `f()` still
+  calls the function, as it did before functions were values.
+- **A function value is its name and nothing else.** There are no
+  closures and no anonymous functions: a function body still sees only
+  its parameters, its own locals and the globals. It is looked up when it
+  is called, so redefining a function at the `wisp>` prompt changes what
+  every stored copy of it does.
+- **Comparing and showing.** Two function values are `==` if they name the
+  same function. `print` and `str` show `<fn name>`; `type` says `"func"`.
+- **Not keys, and not saved.** A function cannot be a map key, and
+  `save()` refuses any value that holds one (a list or map with a
+  function inside included): the name would mean whatever happens to
+  carry it after a reboot.
+
+### Calling a function on every element
+
+These four built-ins take a function as an argument. Each works from a
+snapshot of the list as it was when the call began, so a function that
+grows the list cannot make the call run on. Pressing Esc stops them like
+any loop. An error inside the function you pass is reported at its own
+line.
+
+- `map(f, list)` -- a new list of `f(element)` for each element, in
+  order. The original is unchanged.
+- `filter(f, list)` -- a new list of the elements for which `f(element)`
+  is `true`, in their original order. `f` must return a `bool`.
+- `reduce(f, list, start)` -- folds the list from the left: the result is
+  `start`, then `f(result, element)` for each element in turn. An empty
+  list gives `start`.
+- `sort_by(list, f)` -- reorders `list` **in place**, ascending by the key
+  `f(element)`; `f` runs once per element, and every key must be an int,
+  or every key a string. The sort is stable: elements with equal keys stay
+  in their original order, so sorting by a second key first and the main
+  key last works as expected. If `f` changes the size of the list, or
+  returns an unusable key, the call is a runtime error and the list is
+  left as it was. Returns `nil`, as `sort` does.
+
+```
+fn square(x) { return x * x; }
+fn is_even(x) { return x % 2 == 0; }
+fn add(a, b) { return a + b; }
+print(reduce(add, filter(is_even, map(square, range(6))), 0));   # 0+4+16 = 20
+```
+
+`esp/APPS/tasks.wisp` is the worked example: a to-do list whose commands
+are a map from what you type to the function that handles it.
+
 ## Variables and scoping
 
 ```
@@ -287,7 +367,9 @@ x = x + 1;      # reassignment: no `let`
   Assigning to an undeclared name is a runtime error (this is deliberate:
   it catches typos instead of silently creating a new global, which is a
   common source of bugs in dynamically-typed toy languages).
-- **There are no closures and no nested function definitions.** A
+- **There are no closures and no nested function definitions** (a function
+  can be a value -- see "Functions as values" -- but it carries nothing
+  with it but its name). A
   function body can see:
   - its own parameters and any `let` it declares itself (including
     inside its own nested blocks -- see below), and
@@ -440,8 +522,8 @@ by `fn`:
 - `str(v)` -- converts `v` (any type) to its `string` representation:
   ints print as decimal, `true`/`false` print as those words, `nil`
   prints as `nil`, a `string` is returned unchanged, a `list` renders
-  as `[elem, elem, ...]` (see "Lists") and a `map` as `{key: value, ...}`
-  (see "Maps").
+  as `[elem, elem, ...]` (see "Lists"), a `map` as `{key: value, ...}`
+  (see "Maps") and a function as `<fn name>`.
 - `push(list, value)` -- appends `value` to the end of `list`, in place.
   Returns `nil`. Runtime error if the first argument isn't a `list`.
 - `pop(list)` -- removes and returns the last element of `list`, in
@@ -583,8 +665,11 @@ Numbers and types:
 - `abs(n)` -- the absolute value of an int.
 - `min(a, b)` / `max(a, b)` -- the smaller/larger of two ints, or of two
   strings (in the order `<` uses).
-- `type(v)` -- `"nil"`, `"bool"`, `"int"`, `"string"`, `"list"` or
-  `"map"`.
+- `type(v)` -- `"nil"`, `"bool"`, `"int"`, `"string"`, `"list"`, `"map"`
+  or `"func"`.
+
+Functions as arguments (see "Functions as values"): `map(f, list)`,
+`filter(f, list)`, `reduce(f, list, start)` and `sort_by(list, f)`.
 
 ## Graphics
 
@@ -712,7 +797,8 @@ solid while it grows:
 
 - No sets (a map whose values are all `true` stands in for one) and no
   user-defined types (a map with fixed keys groups named fields).
-- No closures, nested function definitions, or `map`/`filter`.
+- No closures, anonymous functions or nested function definitions (a
+  function can be passed around by name, but carries no variables).
 - No floating point.
 - No string formatting beyond `+`, `str()`, `repeat()` and the string
   builtins.

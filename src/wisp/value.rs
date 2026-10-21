@@ -1,5 +1,6 @@
 //! Runtime value representation. Per `docs/WISP_LANGUAGE.md`, WISP has
-//! six value types: `nil`, `bool`, `int`, `string`, `list` and `map`.
+//! seven value types: `nil`, `bool`, `int`, `string`, `list`, `map` and
+//! `func`.
 //!
 //! # Resource bounds
 //!
@@ -211,6 +212,13 @@ pub enum Value {
     /// A shared, mutable map from int or string keys to values, kept in
     /// key order (see [`MapKey`]). Shared on copy exactly as a list is.
     Map(Map),
+    /// A function used as a value: the *name* of a user function or
+    /// built-in. Looked up when it is called, not when it is made, so it
+    /// holds no reference into the session (it cannot take part in a
+    /// cycle, needs no registry entry, and a function redefined at the
+    /// `wisp>` prompt is the new one wherever it was stored). There are
+    /// no closures: it carries nothing but the name.
+    Func(Rc<String>),
 }
 
 impl Value {
@@ -222,6 +230,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::List(_) => "list",
             Value::Map(_) => "map",
+            Value::Func(_) => "func",
         }
     }
 
@@ -305,6 +314,7 @@ impl Value {
                 out.push("]")
             }
             Value::Map(entries) => write_map(entries, out, depth),
+            Value::Func(name) => out.push("<fn ") && out.push(name) && out.push(">"),
         }
     }
 }
@@ -411,6 +421,7 @@ fn values_eq(a: &Value, b: &Value, depth: u32, state: &mut EqState) -> Result<bo
             Ok(true)
         }
         (Value::Map(x), Value::Map(y)) => maps_eq(x, y, depth, state),
+        (Value::Func(x), Value::Func(y)) => Ok(x == y),
         _ => Ok(false),
     }
 }
