@@ -2612,3 +2612,33 @@ grew, the growth outlined:
   now samples up to five frames for the ball.
 - `tests/ahci_test.py`, `tests/fault_test.py` and `tests/usb_test.py`:
   all scenarios pass. Kernel builds with zero warnings.
+
+## v1.1.0: the release after v1.0.0
+
+Everything since the v1.0.0 archive -- the audit remediation, crash-atomic
+save format version 2, the firmware-memory fix, `for` loops and strings,
+the `wisp>` prompt, the line editor and maps -- had only ever been
+described here; no archive contained it, and the checksums in the
+repository root still described v1.0.0. This entry cuts the release that
+does.
+
+- **Version.** `Cargo.toml` (and so `Cargo.lock`, the boot banner and
+  `version`) is now 1.1.0; the README, `USB_INSTALL.md` archive names and
+  acceptance step 16a follow. A minor bump rather than a patch: the save
+  format moved to version 2 (a version-1 store is still read, and upgraded
+  in place by its first save, but a v1.0.0 kernel cannot read a store
+  that has been upgraded) and the language gained syntax.
+- **Pinned toolchain.** The README's fallback is now `rustc 1.101.0-nightly
+  (07e526db9 2026-10-19)`, installable as `nightly-2026-10-20`. That exact
+  toolchain was installed and used for this build.
+- **Verified on this build** (Ubuntu 24.04, QEMU 8.2.2, OVMF 4M images):
+  the 141 host tests pass; `tests/fault_test.py`, `tests/ahci_test.py` and
+  `tests/usb_test.py` pass every scenario; `tests/acceptance_test.py` runs
+  to its last step (second-boot map load) with every OCR check passing.
+  Ubuntu 24.04's `ovmf` package ships only split code/vars images, no
+  monolithic `OVMF.fd`, so the suites' `-bios` fallback path finds
+  nothing there. The run used `cat OVMF_VARS_4M.fd OVMF_CODE_4M.fd >
+  /usr/share/ovmf/OVMF.fd`, which is how monolithic images are formed.
+  The scripts were not changed.
+- **Still not exercised:** LA57 (no OVMF build enables it), real hardware,
+  and the macOS and Windows installer scripts.
