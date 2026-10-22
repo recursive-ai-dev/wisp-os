@@ -2772,3 +2772,166 @@ scripted host; the UEFI build, its warnings and its frame sizes were
 checked, but the new binary has not been booted. Version, `SHA256SUMS`
 and the release archives are untouched: this is work after v1.1.0, for
 the next release to pick up.
+
+## Closures
+
+`fn (params) { body }` is now an expression. Its value is a **closure**: a
+function that holds on to the scope it was written in. This lifts the
+language reference's "No closures, anonymous functions or nested function
+definitions" limit, except that a named `fn NAME(...)` declaration is
+still top-level only, hoisted, and sees only its parameters, locals and
+globals (a local helper is a closure in a `let`). Everything written
+before this keeps its meaning; no existing program or test changed.
+
+### Design
+
+- **Variables are shared, not copied.** The scope stack used to be a
+  `Vec<BTreeMap<String, Value>>` owned by the running code. It is now a
+  `Vec<Frame>` with `Frame = Rc<FrameCell>` (`FrameCell` wraps the same map
+  in a `RefCell`). A closure records a clone of the stack that was live
+  where its `fn` expression ran (refcount bumps, no copying of variables);
+  calling it runs the body on a copy of that vector with one new frame, for
+  the parameters, on top. Because the frames themselves are shared, the
+  closure sees what the code around it assigns afterwards and the reverse,
+  two closures made in one scope share its variables, and a name is
+  looked up when the closure is *called*. Capturing by copy was the
+  smaller change (no `RefCell`, no cycles) and was rejected: the counter
+  example (`n = n + 1` inside the returned closure) then updates a private
+  copy, and a getter/setter pair stops sharing -- the two things people
+  reach for closures to do.
+- **Loops get per-pass variables for free.** `while`/`if` bodies and each
+  `for` pass already pushed a fresh frame; now that a frame can outlive
+  the pass, closures made in different passes keep different `let`s.
+- **Named functions are untouched.** A call of a named function starts
+  from an empty stack, as before. A closure called from anywhere starts
+  from *its* stack, never the caller's.
+- **`Value::Closure(Rc<Closure>)`** is a second `func` representation
+  beside `Value::Func(name)`. `type` says `"func"` for both; display is
+  `<fn (a, b)>`; `==` is identity (`Rc::ptr_eq`); `save()` refuses it with
+  the same message as any function; it is not a map key. The `Value` enum
+  is still 16 bytes.
+- **Calling.** `Callee` (`Name(Rc<String>)` or `Closure(Rc<Closure>)`)
+  is what a call resolves to; `call_target`, `eval_call_value` and the
+  four higher-order built-ins all go through it, so a closure works
+  anywhere a function value does. `call_function` became `invoke(Target)`,
+  where `Target` is a declared function or a closure; the depth limit,
+  nesting budget, Esc and heap checks are the same code. Error text for a
+  closure says "the anonymous function" (`the anonymous function expects 2
+  argument(s), got 1`, `filter() needs the anonymous function to return a
+  bool`); for a named function it is unchanged.
+- **Parsing.** A top-level `fn` followed by `(` is an expression
+  statement; followed by a name, a declaration. A `fn NAME` anywhere else
+  (inside a block, in an expression) is a parse error that says to drop
+  the name, where it used to be a bare "unexpected 'fn'".
+
+### Cycles and teardown
+
+A closure stored in a variable it can see (`let f = fn () { return f; };`)
+is a cycle through a scope frame, and a plain reference count never frees
+it. The mechanism that already handles cyclic lists and maps was extended
+rather than replaced: `ObjectRegistry` also records a weak handle to every
+closure, and `reclaim()` releases the frames each one captured. Any cycle
+through a frame has to pass through a closure's captured frames (frames
+hold values; only closures hold frames), so letting go of those breaks all
+of them.
+
+Teardown stays iterative: `FrameCell` and `Closure` have a `Drop` that
+moves what they hold onto `release()`'s work stack, which now also unwraps
+closures and their frames. A chain of 50,000 closures (each in a scope
+holding the one before) is freed on a 640 KiB stack. `FrameCell`'s `Drop`
+skips the work stack unless a value in the frame is a list, map or closure,
+so the common frame (scalars and strings) pays nothing extra. No `RefCell`
+is ever borrowed across an evaluation or a drop (borrows end before the
+next `eval_expr`, and the `Drop` impls use `get_mut`), so the new
+`RefCell`s cannot panic on a re-entrant borrow.
+
+A closure's captured stack is as long as the *source* nesting around its
+`fn` (blocks and enclosing closure bodies), at most the parser's 128
+levels, however long the program runs; the test
+`recursion_through_closures_made_inside_closures_is_a_clean_error` pins
+that a closure made and called per level of recursion still ends at the
+call-depth limit.
+
+### Native stack
+
+Measured as before (`--emit=asm` on the UEFI target; prologue sizes plus
+pushes, without the return address). The first draft failed the
+measurement in two places, which is what the measurement is for:
+
+- `exec_stmt` grew on the host build (200 to 312, which overflowed
+  `nested_loops_inside_deep_recursion_are_a_clean_error`'s 640 KiB
+  stack). The `Let` and `Assign` arms are now outlined (`exec_let` 200,
+  `exec_assign` 184): `exec_stmt` is 232 (was 296) and the host's is 216.
+- `parse_postfix` grew from 312 to 488 when `parse_primary` (inlined into
+  it) called a function returning a whole `Result<Expr, _>`. The helper
+  now returns the small `Rc<Lambda>` and the `Expr` is built in
+  `parse_primary`: 312 again.
+
+Where it ended: the chain `eval_expr -> eval_call -> call_named ->
+invoke` (the one a plain recursive call pays) is 152 + 216 + 200 + 344 =
+912, against 152 + 232 + 200 + 328 = 912 before; a closure call
+(`eval_call_value` 248 + `call_closure` 56 + `invoke` 344) is smaller.
+`hof_map`, `hof_filter` and `hof_sort_by` grew by 16 to 32 bytes
+each; the worst higher-order call through a named callback is now 1,136
+bytes (1,088 before) against the ~1,500 the two units it is charged
+stand for.
+`MAX_NESTING` is unchanged. A `while` body (`exec_stmt` + `exec_while` +
+`exec_block_scoped` + `exec_block`) is 656 bytes, down from 720.
+
+### `esp/APPS/undo.wisp`
+
+A notebook of numbers with `set`, `add`, `del`, `undo`, `redo`, `show`,
+`top`, `find`, `sum` and `history`. Each change is an *edit*: a map
+holding a "do" and an "undo" closure built by `make_edit()`, which
+remember the name, the new value and the value replaced. `make_counter()`
+numbers the edits; `find` and `top` give `filter` and `sort_by` a closure
+that remembers the prefix or the notebook. History is capped at 50 edits.
+
+### Verification
+
+- `tests/host/tests/closures.rs` (45 tests): the documented examples as
+  written; the literal in every expression position (list, map, argument,
+  condition, immediately called, as a statement); capture of call, block
+  and loop variables, sharing between closures, assignment through a
+  closure and back, the nearest enclosing variable winning, globals
+  declared after the closure; per-pass loop scopes for `while` and `for`
+  over lists and strings; recursion through a variable and through a
+  parameter; the compatibility rules (a named function still sees no
+  caller's locals; a variable holding a closure is what `name(...)`
+  calls; a variable holding an int does not hide a function); arity,
+  call-of-non-function, break/continue not crossing a closure, early
+  return; identity equality, no map key, no `save()` (a failed save leaves
+  the earlier value); `map`/`filter`/`reduce`/`sort_by` with closures and
+  every error they raise; the interactive prompt across pieces (including
+  redefining a global or a function a closure uses); every syntax error;
+  300 levels of nested `fn` is a clean parse error; Esc inside a closure
+  loop and inside `map`; allocation-counted runs showing that cycles
+  through scopes, through lists and maps holding closures, and a prompt
+  session leak nothing; a 50,000-closure chain and a 30,000-deep chain of
+  lists-with-closures dropped on a 640 KiB stack; recursion shapes that
+  cost the most native stack per unit (`while`, `for`, `if`, nested
+  expressions) through a closure; and `undo.wisp` driven through five
+  scripted sessions (undo/redo of sets, overwrites and deletes, the redo
+  chain ending on a new edit, `find`/`top`/`sum`, the 50-edit cap and a
+  run of malformed input).
+- Mutation testing: 9 deliberate bugs. Eight were caught at once (no
+  capture; closures all equal; capture by copy; the higher-order
+  built-ins refusing closures; assignment reaching only the innermost
+  frame; `reclaim` not releasing closure scopes, in two forms; `release`
+  not unwrapping closures, which overflows the stack). One survived the
+  first draft of the tests -- the captured frames in reverse order, which
+  only matters when two enclosing scopes declare the same name -- and now
+  has `the_nearest_enclosing_variable_wins_and_is_the_one_assigned`.
+- All earlier suites unchanged: the 184 earlier host tests pass in
+  `--release` (229 with these), and the kernel builds with zero warnings.
+
+### Not verified here
+
+This session had no QEMU, so `tests/acceptance_test.py` and the other
+three VM suites were not run, and no acceptance step was added for
+`undo.wisp` (one that had never been run would be a guess). The host
+tests drive the same interpreter and the same `.wisp` file through a
+scripted host; the UEFI build, its warnings and its frame sizes were
+checked, but the new binary has not been booted. Version, `SHA256SUMS`
+and the release archives are untouched: this is work after v1.1.0, for the
+next release to pick up, together with functions as values.

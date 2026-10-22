@@ -11,8 +11,9 @@ If a program only uses what's described here, it will run. The core
 language (v1) was deliberately **text and logic only**; v2 is landing in
 pieces: pixel/graphics primitives (their own section below, and in full
 depth `docs/WISP_GRAPHICS.md`), then `for` loops, slicing, string
-indexing and the string and list builtins, then maps. See "What's still
-not in WISP" at the end for what's deliberately missing.
+indexing and the string and list builtins, then maps, then functions as
+values and closures. See "What's still not in WISP" at the end for what's
+deliberately missing.
 
 To try things out without writing a file, type `wisp` at the shell
 prompt: an interactive prompt that runs each line as you type it (see
@@ -91,7 +92,8 @@ Every value in WISP is one of exactly seven types:
   below.
 - `map` -- a shared, mutable table from keys (ints or strings) to
   values. See "Maps" below.
-- `func` -- a function, as a value. See "Functions as values" below.
+- `func` -- a function, as a value: a named function, a built-in, or a
+  closure. See "Functions as values" and "Closures" below.
 
 There are no user-defined types: a map with fixed keys
 (`{"name": "ada", "hp": 12}`) is the way to group named fields.
@@ -311,11 +313,11 @@ print(table["d"](4));    # 8
   named `f` also exists. A variable holding something *else* (`let f = 5;`)
   does not hide a function of the same name when called: `f()` still
   calls the function, as it did before functions were values.
-- **A function value is its name and nothing else.** There are no
-  closures and no anonymous functions: a function body still sees only
-  its parameters, its own locals and the globals. It is looked up when it
-  is called, so redefining a function at the `wisp>` prompt changes what
-  every stored copy of it does.
+- **A named function's value is its name and nothing else.** Its body
+  still sees only its parameters, its own locals and the globals. It is
+  looked up when it is called, so redefining a function at the `wisp>`
+  prompt changes what every stored copy of it does. (A function that
+  should remember variables is a closure; see "Closures".)
 - **Comparing and showing.** Two function values are `==` if they name the
   same function. `print` and `str` show `<fn name>`; `type` says `"func"`.
 - **Not keys, and not saved.** A function cannot be a map key, and
@@ -356,6 +358,79 @@ print(reduce(add, filter(is_even, map(square, range(6))), 0));   # 0+4+16 = 20
 `esp/APPS/tasks.wisp` is the worked example: a to-do list whose commands
 are a map from what you type to the function that handles it.
 
+## Closures
+
+`fn (parameters) { body }`, written where an expression is expected, is a
+function with no name -- and it remembers the variables that were in
+scope where it was written:
+
+```
+let double = fn (x) { return x * 2; };
+print(double(21));                  # 42
+print(double, type(double));        # <fn (x)> func
+print(fn (a, b) { return a + b; }(1, 2));   # 3
+
+fn make_counter() {
+    let n = 0;
+    return fn () {
+        n = n + 1;
+        return n;
+    };
+}
+let a = make_counter();
+let b = make_counter();
+print(a(), a(), a());   # 1 2 3
+print(b());             # 1 -- b has its own n
+```
+
+A closure is a value like any other function value (type `func`): it can
+go in a variable, a list or a map, be passed to `map`, `filter`, `reduce`
+and `sort_by`, be returned, and be called with `f(x)` or `callee(x)`.
+
+- **What it sees.** The body runs with the parameters first, then every
+  variable of every block and call that enclosed the `fn` expression,
+  innermost first, then the globals. This is ordinary lexical scoping.
+  Variables are **shared, not copied**: a closure sees what the code
+  around it assigns afterwards, and the code around it sees what the
+  closure assigns (`n = n + 1` above changes the one `n` that
+  `make_counter`'s call made). Two closures made in the same scope share
+  its variables, which is how a getter and a setter can work on one
+  value. A name is looked up when the closure is *called*, so it may even
+  be declared after the closure was made.
+- **Loops.** Every pass of a `while` or `for` body is a fresh scope, so
+  closures made in different passes each keep that pass's variables:
+  `for i in range(3) { push(fs, fn () { return i; }); }` gives three
+  closures returning 0, 1 and 2.
+- **Recursion.** A closure calls itself through any variable that holds
+  it (`let fact = fn (n) { ... fact(n - 1) ... };`) or through a
+  parameter. The ordinary limits apply: 256 nested calls, and the
+  combined nesting budget.
+- **Declarations are separate.** `fn NAME(...) { }` is still a declaration
+  that is only allowed at the top level, hoisted, and sees only its
+  parameters, locals and globals. `fn (` with no name is the expression.
+  At the start of a statement `fn (` begins an expression statement, so
+  `fn (x) { print(x); }(7);` runs. A named `fn` inside a block or an
+  expression is a parse error that says so.
+- **Calling.** The rules of "Functions as values" apply unchanged: a
+  variable holding a closure is what `name(args)` calls, a wrong argument
+  count is an error (`the anonymous function expects 2 argument(s), got
+  1`), and the higher-order built-ins name it the same way in their own
+  errors.
+- **Comparing and showing.** A closure is `==` only to itself (and to
+  copies of it, in a variable or a list): two `fn` expressions are
+  different functions even with the same text. `print` and `str` show
+  `<fn (x, y)>`, its parameters. Like any function it cannot be a map key
+  or be saved.
+- **Memory.** A closure keeps the variables it can see alive for as long
+  as it is. A closure stored in a variable that it can itself see (as in
+  the recursive example) is a cycle; like cyclic lists and maps, it is
+  reclaimed when the program ends. A very long chain of closures (each
+  holding the one before) is freed without deep recursion.
+
+`esp/APPS/undo.wisp` is the worked example: a notebook of numbers where
+each edit is a pair of closures that remember what that edit needs to be
+undone and redone.
+
 ## Variables and scoping
 
 ```
@@ -367,19 +442,15 @@ x = x + 1;      # reassignment: no `let`
   Assigning to an undeclared name is a runtime error (this is deliberate:
   it catches typos instead of silently creating a new global, which is a
   common source of bugs in dynamically-typed toy languages).
-- **There are no closures and no nested function definitions** (a function
-  can be a value -- see "Functions as values" -- but it carries nothing
-  with it but its name). A
-  function body can see:
+- **A `fn NAME(...)` declaration is top-level only** (not nested inside
+  other functions or blocks). Its body can see:
   - its own parameters and any `let` it declares itself (including
     inside its own nested blocks -- see below), and
   - every global (any `let` at the top level of the program, outside all
     functions and outside all blocks).
-  It **cannot** see local variables of the function that called it. This
-  is simpler than full lexical scoping and covers everything a small
-  game or utility script needs; it's called out explicitly here because
-  it's the one place WISP's scoping rules diverge most from languages
-  you may already know.
+  It **cannot** see local variables of the function that called it. For a
+  function that does see the variables around where it is written, use a
+  closure, `fn (...) { ... }` as an expression -- see "Closures".
 - **Blocks (`if`/`while` bodies) each get their own nested scope,**
   entered when the block starts and discarded the moment it ends --
   whether it ends normally, or via `break`, `continue`, or `return`.
@@ -424,7 +495,7 @@ From lowest to highest precedence:
 | 5 | `+` `-` | left |
 | 6 | `*` `/` `%` | left |
 | 7 | unary `not` `-` | right (prefix) |
-| 8 | `( )` grouping, function calls, `[ ]` list literals, `{ }` map literals, indexing and slicing | -- |
+| 8 | `( )` grouping, function calls, `[ ]` list literals, `{ }` map literals, `fn (...) { }` closures, indexing and slicing | -- |
 
 Semantics:
 
@@ -466,6 +537,8 @@ fn NAME(PARAM, PARAM, ...) {
     ...
     return EXPR;                 # or bare `return;` for nil, or fall off the end
 }
+
+fn (PARAM, PARAM, ...) { ... }   # an expression: a closure (see "Closures")
 
 EXPR;                            # expression statement (e.g. a bare call: print("hi");)
 ```
@@ -523,7 +596,8 @@ by `fn`:
   ints print as decimal, `true`/`false` print as those words, `nil`
   prints as `nil`, a `string` is returned unchanged, a `list` renders
   as `[elem, elem, ...]` (see "Lists"), a `map` as `{key: value, ...}`
-  (see "Maps") and a function as `<fn name>`.
+  (see "Maps"), a named function as `<fn name>` and a closure as
+  `<fn (params)>`.
 - `push(list, value)` -- appends `value` to the end of `list`, in place.
   Returns `nil`. Runtime error if the first argument isn't a `list`.
 - `pop(list)` -- removes and returns the last element of `list`, in
@@ -779,6 +853,9 @@ wisp> shout(names[0])
 - Unlike in a program file, `let` may re-declare a global and `fn` may
   redefine a function an earlier line defined -- that is how you fix a
   typo.
+- A closure made on one line (`let add = fn (a, b) { return a + b; }`)
+  keeps its variables for the lines after it, and sees a global that a
+  later line re-declares.
 - An error is reported in the usual form and the session carries on with
   everything it had.
 - Esc stops a running line, as it stops a program. At the `wisp>`
@@ -797,8 +874,10 @@ solid while it grows:
 
 - No sets (a map whose values are all `true` stands in for one) and no
   user-defined types (a map with fixed keys groups named fields).
-- No closures, anonymous functions or nested function definitions (a
-  function can be passed around by name, but carries no variables).
+- No nested `fn NAME` declarations (use a closure, `let helper = fn (x)
+  { ... };`, for a function local to another).
+- No anonymous-function shorthand: a closure's body is always a `{ }`
+  block with a `return`.
 - No floating point.
 - No string formatting beyond `+`, `str()`, `repeat()` and the string
   builtins.

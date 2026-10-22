@@ -77,6 +77,12 @@ pub enum Expr {
         entries: Vec<(Expr, Expr)>,
         line: u32,
     },
+    /// `fn (params) { body }` -- an anonymous function. Evaluating it makes
+    /// a closure: a function value that holds on to the variables in scope
+    /// where the expression ran (see `interp`'s module doc). The literal
+    /// itself is shared (`Rc`), so each evaluation costs a refcount bump
+    /// plus the captured scope, never a copy of the body.
+    Lambda(Rc<Lambda>),
     /// `object[index]` -- a list element, the value a map holds under the
     /// key `index`, or the character starting at byte offset `index` of a
     /// string. `object` must evaluate to a list, a map or a string, and
@@ -114,6 +120,7 @@ impl Expr {
             | Expr::MapLit { line, .. }
             | Expr::Index { line, .. }
             | Expr::Slice { line, .. } => Some(*line),
+            Expr::Lambda(lambda) => Some(lambda.line),
             Expr::IntLit(_) | Expr::StrLit(_) | Expr::BoolLit(_) | Expr::NilLit => None,
         }
     }
@@ -188,6 +195,15 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub struct FuncDecl {
     pub name: Rc<String>,
+    pub params: Vec<Rc<String>>,
+    pub body: Vec<Stmt>,
+    pub line: u32,
+}
+
+/// An anonymous function: the parameters and body of an `fn (...) { ... }`
+/// expression. `line` is the `fn` keyword's own.
+#[derive(Debug)]
+pub struct Lambda {
     pub params: Vec<Rc<String>>,
     pub body: Vec<Stmt>,
     pub line: u32,
