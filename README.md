@@ -43,7 +43,7 @@ To build and run from source:
 At the `>` prompt: `help` lists shell commands, `ls APPS` shows the
 bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
-`stopwatch`, `primes`, `calc`, `words`, `tasks`) runs one. `wisp` opens an interactive
+`stopwatch`, `primes`, `calc`, `words`, `tasks`, `undo`) runs one. `wisp` opens an interactive
 WISP prompt that runs each line as you type it -- the way to try the
 language, or write a quick program, on the machine itself. Every line of
 input can be edited with the arrow keys, Home, End and Delete, and Up/Down
@@ -194,6 +194,11 @@ CHANGES.md                 engineering log: the specific decisions and why
   type to the function that handles it (`commands[word](rest)`): the
   worked example of functions as values, with `filter`, `map`, `reduce`
   and a stable `sort_by` doing the list work.
+- **`undo.wisp`** -- a notebook of numbers with undo and redo: each edit is
+  a pair of closures (`fn (...) { ... }` as an expression) that remember
+  the name, the new value and the value they replaced. The worked example
+  of closures, which also hand out edit numbers, and give `filter` and
+  `sort_by` the prefix or the notebook they work on.
 
 ## Known rough edges (see CHANGES.md for the full story on each)
 

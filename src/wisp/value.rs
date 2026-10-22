@@ -1,6 +1,6 @@
 //! Runtime value representation. Per `docs/WISP_LANGUAGE.md`, WISP has
 //! seven value types: `nil`, `bool`, `int`, `string`, `list`, `map` and
-//! `func`.
+//! `func` (a named function, or a closure -- both are `func`).
 //!
 //! # Resource bounds
 //!
@@ -16,10 +16,11 @@
 //! - dropping a list or map is iterative ([`release`]), so a deeply
 //!   nested chain is freed without recursing on the kernel stack.
 //!
-//! Cycles (`let a = []; push(a, a);`, `m["me"] = m;`) are allowed, and are
-//! reclaimed when the script ends: every list and map a run creates is
-//! recorded in its [`ObjectRegistry`], and [`ObjectRegistry::reclaim`]
-//! empties them all.
+//! Cycles (`let a = []; push(a, a);`, `m["me"] = m;`, and a closure stored
+//! in a variable it captured: `let f = fn () { return f; };`) are allowed,
+//! and are reclaimed when the script ends: every list, map and closure a
+//! run creates is recorded in its [`ObjectRegistry`], and
+//! [`ObjectRegistry::reclaim`] empties them all.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -27,7 +28,10 @@ use alloc::rc::{Rc, Weak};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::mem;
 use core::ops::Deref;
+
+use super::ast::Lambda;
 
 /// Recursion guard for structural operations over nested lists and maps (equality,
 /// display, serialization): bounding how deep they descend keeps a
@@ -169,6 +173,102 @@ impl Drop for MapCell {
 /// A map handle, as stored in `Value::Map`.
 pub type Map = Rc<MapCell>;
 
+/// One scope frame -- the variables of one block, or of one call's
+/// parameters -- shared between the running code and every closure made
+/// inside it. That sharing is what lets a closure see (and assign to) the
+/// variables it captured, and lets two closures made in one scope share
+/// them. A newtype for the same iterative-`Drop` reason as [`ListCell`]: a
+/// frame holding a closure holding a frame holding a closure ... must not
+/// be freed by recursion.
+#[derive(Default)]
+pub struct FrameCell(RefCell<BTreeMap<String, Value>>);
+
+impl FrameCell {
+    pub fn new(vars: BTreeMap<String, Value>) -> Frame {
+        Rc::new(Self(RefCell::new(vars)))
+    }
+}
+
+impl Deref for FrameCell {
+    type Target = RefCell<BTreeMap<String, Value>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for FrameCell {
+    fn drop(&mut self) {
+        // Most frames hold only scalars and strings, which need no
+        // unwinding work: skip allocating a work stack for them.
+        let vars = mem::take(self.0.get_mut());
+        if vars.values().any(needs_release) {
+            release(vars.into_values().collect());
+        }
+    }
+}
+
+/// A scope frame handle, as stored on a scope stack and in a [`Closure`].
+pub type Frame = Rc<FrameCell>;
+
+/// A function value that remembers where it was made: the literal
+/// (`fn (x) { ... }`) plus the scope stack that was live when the
+/// expression ran. Calling it runs the body on a copy of that stack with a
+/// new frame for the parameters on top, so the body sees the variables of
+/// every block and call that enclosed the literal, by reference.
+pub struct Closure {
+    pub lambda: Rc<Lambda>,
+    env: RefCell<Vec<Frame>>,
+}
+
+impl Closure {
+    /// The captured frames, outermost first (cheap: refcount bumps), in a
+    /// vector with room for the one frame a call adds.
+    pub fn env_with_room(&self) -> Vec<Frame> {
+        let env = self.env.borrow();
+        let mut stack = Vec::with_capacity(env.len() + 1);
+        stack.extend(env.iter().cloned());
+        stack
+    }
+}
+
+impl core::fmt::Debug for Closure {
+    // Not derived: the environment can contain this very closure.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Closure(line {})", self.lambda.line)
+    }
+}
+
+impl Drop for Closure {
+    fn drop(&mut self) {
+        release_frames(mem::take(self.env.get_mut()));
+    }
+}
+
+/// Whether dropping `value` can set off further drops that the default
+/// recursive drop would nest.
+fn needs_release(value: &Value) -> bool {
+    matches!(value, Value::List(_) | Value::Map(_) | Value::Closure(_))
+}
+
+/// Move the contents of `frame` onto `pending` if this was its last owner.
+fn take_frame(frame: Frame, pending: &mut Vec<Value>) {
+    if let Ok(mut cell) = Rc::try_unwrap(frame) {
+        pending.extend(mem::take(cell.0.get_mut()).into_values());
+    }
+}
+
+/// Drop `frames` without recursing, as [`release`] does for values.
+fn release_frames(frames: Vec<Frame>) {
+    let mut pending = Vec::new();
+    for frame in frames {
+        take_frame(frame, &mut pending);
+    }
+    if !pending.is_empty() {
+        release(pending);
+    }
+}
+
 /// Drop `pending` without recursing. A list or map in it that this was the
 /// last owner of is unwrapped and its contents moved onto the same work
 /// stack, so the cell itself is then dropped empty -- its own `drop` has
@@ -184,6 +284,13 @@ fn release(mut pending: Vec<Value>) {
             Value::Map(rc) => {
                 if let Ok(mut cell) = Rc::try_unwrap(rc) {
                     pending.extend(core::mem::take(cell.0.get_mut()).into_values());
+                }
+            }
+            Value::Closure(rc) => {
+                if let Ok(mut closure) = Rc::try_unwrap(rc) {
+                    for frame in mem::take(closure.env.get_mut()) {
+                        take_frame(frame, &mut pending);
+                    }
                 }
             }
             _ => {}
@@ -216,9 +323,12 @@ pub enum Value {
     /// built-in. Looked up when it is called, not when it is made, so it
     /// holds no reference into the session (it cannot take part in a
     /// cycle, needs no registry entry, and a function redefined at the
-    /// `wisp>` prompt is the new one wherever it was stored). There are
-    /// no closures: it carries nothing but the name.
+    /// `wisp>` prompt is the new one wherever it was stored). It carries
+    /// nothing but the name; see `Closure` for a function that does.
     Func(Rc<String>),
+    /// An anonymous function together with the scope it was made in. Of
+    /// type `func`, like `Func`. Shared on copy; equal only to itself.
+    Closure(Rc<Closure>),
 }
 
 impl Value {
@@ -230,7 +340,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::List(_) => "list",
             Value::Map(_) => "map",
-            Value::Func(_) => "func",
+            Value::Func(_) | Value::Closure(_) => "func",
         }
     }
 
@@ -315,6 +425,20 @@ impl Value {
             }
             Value::Map(entries) => write_map(entries, out, depth),
             Value::Func(name) => out.push("<fn ") && out.push(name) && out.push(">"),
+            Value::Closure(closure) => {
+                if !out.push("<fn (") {
+                    return false;
+                }
+                for (i, param) in closure.lambda.params.iter().enumerate() {
+                    if i > 0 && !out.push(", ") {
+                        return false;
+                    }
+                    if !out.push(param) {
+                        return false;
+                    }
+                }
+                out.push(")>")
+            }
         }
     }
 }
@@ -422,6 +546,7 @@ fn values_eq(a: &Value, b: &Value, depth: u32, state: &mut EqState) -> Result<bo
         }
         (Value::Map(x), Value::Map(y)) => maps_eq(x, y, depth, state),
         (Value::Func(x), Value::Func(y)) => Ok(x == y),
+        (Value::Closure(x), Value::Closure(y)) => Ok(Rc::ptr_eq(x, y)),
         _ => Ok(false),
     }
 }
@@ -482,6 +607,7 @@ pub struct ObjectRegistry {
 enum Tracked {
     List(Weak<ListCell>),
     Map(Weak<MapCell>),
+    Closure(Weak<Closure>),
 }
 
 impl Tracked {
@@ -489,6 +615,7 @@ impl Tracked {
         match self {
             Tracked::List(w) => w.strong_count() > 0,
             Tracked::Map(w) => w.strong_count() > 0,
+            Tracked::Closure(w) => w.strong_count() > 0,
         }
     }
 }
@@ -512,6 +639,13 @@ impl ObjectRegistry {
         let map = Rc::new(MapCell::new(entries));
         self.track(Tracked::Map(Rc::downgrade(&map)));
         Value::Map(map)
+    }
+
+    /// Create a closure owned by this run, capturing `env`.
+    pub fn new_closure(&mut self, lambda: Rc<Lambda>, env: Vec<Frame>) -> Value {
+        let closure = Rc::new(Closure { lambda, env: RefCell::new(env) });
+        self.track(Tracked::Closure(Rc::downgrade(&closure)));
+        Value::Closure(closure)
     }
 
     /// Record `value`, and every list and map reachable from it, as owned
@@ -551,8 +685,10 @@ impl ObjectRegistry {
         self.objects.push(object);
     }
 
-    /// Empty every list and map this run created that is still alive,
-    /// freeing all of the run's cyclic garbage. Dropping the moved-out
+    /// Empty every list and map this run created that is still alive, and
+    /// release the scope every closure captured, freeing all of the run's
+    /// cyclic garbage. (A cycle through a scope frame must pass through a
+    /// closure's captured frames, so letting go of those breaks it.) Dropping the moved-out
     /// contents may free other lists and maps outright; [`release`] keeps
     /// that from recursing, and their registry entries simply fail to
     /// upgrade when reached.
@@ -573,6 +709,13 @@ impl ObjectRegistry {
                         let mut values = Vec::new();
                         values.extend(entries.into_values());
                         release(values);
+                    }
+                }
+                Tracked::Closure(weak) => {
+                    if let Some(closure) = weak.upgrade() {
+                        let env = mem::take(&mut *closure.env.borrow_mut());
+                        drop(closure);
+                        release_frames(env);
                     }
                 }
             }

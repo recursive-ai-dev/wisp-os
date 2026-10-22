@@ -9,7 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::ast::{BinaryOp, Expr, FuncDecl, Program, Stmt, TopItem, UnaryOp};
+use super::ast::{BinaryOp, Expr, FuncDecl, Lambda, Program, Stmt, TopItem, UnaryOp};
 use super::lexer::{Tok, Token};
 use super::WispError;
 
@@ -26,7 +26,8 @@ pub fn parse(tokens: &[Token]) -> Result<Program, WispError> {
     let mut p = Parser { tokens, pos: 0, depth: 0 };
     let mut items = Vec::new();
     while !p.is_eof() {
-        if p.check(&Tok::Fn) {
+        // `fn name` declares; `fn (` starts an expression statement.
+        if p.check(&Tok::Fn) && !matches!(p.peek_at(1), Tok::LParen) {
             items.push(TopItem::Func(alloc::rc::Rc::new(p.parse_func_decl()?)));
         } else {
             items.push(TopItem::Stmt(p.parse_stmt()?));
@@ -128,6 +129,18 @@ impl<'t> Parser<'t> {
         let line = self.peek_line();
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
+        let (params, body) = self.parse_params_and_body()?;
+        Ok(FuncDecl {
+            name,
+            params,
+            body,
+            line,
+        })
+    }
+
+    /// `(a, b) { ... }`: what a named declaration and an anonymous function
+    /// share after the `fn` (and the name, for the former).
+    fn parse_params_and_body(&mut self) -> Result<(Vec<alloc::rc::Rc<String>>, Vec<Stmt>), WispError> {
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
         if !self.check(&Tok::RParen) {
@@ -141,12 +154,25 @@ impl<'t> Parser<'t> {
         }
         self.expect(Tok::RParen)?;
         let body = self.parse_block()?;
-        Ok(FuncDecl {
-            name,
-            params,
-            body,
-            line,
-        })
+        Ok((params, body))
+    }
+
+    /// An anonymous function, after its `fn`. Outlined from
+    /// `parse_primary` so that its locals are not paid at every level of
+    /// expression nesting.
+    #[inline(never)]
+    fn parse_lambda(&mut self, line: u32) -> Result<alloc::rc::Rc<Lambda>, WispError> {
+        if let Tok::Ident(name) = self.peek() {
+            return Err(WispError::new(
+                self.peek_line(),
+                format!(
+                    "'fn {name}' is a declaration and can only appear at the top level of a program \
+                     (for a function value here, write 'fn (parameters) {{ ... }}' with no name)"
+                ),
+            ));
+        }
+        let (params, body) = self.parse_params_and_body()?;
+        Ok(alloc::rc::Rc::new(Lambda { params, body, line }))
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, WispError> {
@@ -450,6 +476,7 @@ impl<'t> Parser<'t> {
     fn parse_primary(&mut self) -> Result<Expr, WispError> {
         let line = self.peek_line();
         match self.advance().tok {
+            Tok::Fn => Ok(Expr::Lambda(self.parse_lambda(line)?)),
             Tok::Int(v) => Ok(Expr::IntLit(v)),
             Tok::Str(s) => Ok(Expr::StrLit(s)),
             Tok::True => Ok(Expr::BoolLit(true)),

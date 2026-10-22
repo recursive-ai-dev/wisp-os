@@ -12,9 +12,14 @@
 //! scopes that grows and shrinks as execution enters and leaves `if`/
 //! `while`/`for` bodies and function calls:
 //!
-//! - A function call starts a brand-new stack containing exactly one
-//!   frame (the parameters) -- it can never see the caller's locals, so
-//!   there are no closures.
+//! - A call of a *named* function starts a brand-new stack containing
+//!   exactly one frame (the parameters) -- it can never see the caller's
+//!   locals. A call of a *closure* (an `fn (...) { ... }` expression's
+//!   value) starts from the stack that was live where the expression ran,
+//!   and adds a frame for the parameters on top. Frames are shared, not
+//!   copied, so the closure and the code that made it see and assign the
+//!   same variables; and since a frame is made per block entry (and per
+//!   loop pass), each pass of a loop gives its closures their own `let`s.
 //! - Entering an `if`-branch body or a `while`-loop body pushes a fresh,
 //!   empty frame onto the *current* stack, and pops it back off on the
 //!   way out (however the block ended: falling off the end, `break`,
@@ -35,9 +40,9 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use super::ast::{BinaryOp, Expr, FuncDecl, Program, Stmt, TopItem, UnaryOp};
+use super::ast::{BinaryOp, Expr, FuncDecl, Lambda, Program, Stmt, TopItem, UnaryOp};
 use super::builtins;
-use super::value::{self, List, MapKey, ObjectRegistry, Value, MAX_LIST_LEN, MAX_MAP_LEN};
+use super::value::{self, Closure, Frame, FrameCell, List, MapKey, ObjectRegistry, Value, MAX_LIST_LEN, MAX_MAP_LEN};
 use super::WispError;
 
 /// Recursion guard: a user function calling itself (directly or via a
@@ -71,7 +76,40 @@ pub const OUT_OF_MEMORY_MESSAGE: &str = "out of memory (the script used up the h
 
 /// A stack of block-local scope frames, innermost last. See the module
 /// doc comment above for the full scoping model.
-type ScopeStack = Vec<BTreeMap<String, Value>>;
+type ScopeStack = Vec<Frame>;
+
+/// A function a call resolved to: a user function or built-in by name, or
+/// a closure.
+enum Callee {
+    Name(Rc<String>),
+    Closure(Rc<Closure>),
+}
+
+impl Callee {
+    /// The callee a value stands for, or `None` if it is not a function.
+    fn of(value: &Value) -> Option<Callee> {
+        match value {
+            Value::Func(name) => Some(Callee::Name(name.clone())),
+            Value::Closure(closure) => Some(Callee::Closure(closure.clone())),
+            _ => None,
+        }
+    }
+
+    /// How an error message refers to it: `'name'`, or "the anonymous
+    /// function".
+    fn quoted(&self) -> String {
+        match self {
+            Callee::Name(name) => format!("'{name}'"),
+            Callee::Closure(_) => String::from("the anonymous function"),
+        }
+    }
+}
+
+/// The function a call runs: a declared one, or a closure.
+enum Target<'a> {
+    Declared(&'a FuncDecl),
+    Closure(&'a Closure),
+}
 
 /// Everything the interpreter needs from the outside world. The shell
 /// implements this against the real screen/keyboard/timer; keeping it as
@@ -331,7 +369,7 @@ impl Interp<'_, '_> {
     #[inline(never)]
     fn get_var(&self, stack: &ScopeStack, name: &str) -> Option<Value> {
         for frame in stack.iter().rev() {
-            if let Some(v) = frame.get(name) {
+            if let Some(v) = frame.borrow().get(name) {
                 return Some(v.clone());
             }
         }
@@ -350,17 +388,12 @@ impl Interp<'_, '_> {
         // own program, and `let x = ...;` typed twice is not a mistake
         // there the way it is within one file.
         let redeclare_ok = self.interactive && stack.is_empty();
-        let target: &mut BTreeMap<String, Value> = match stack.last_mut() {
-            Some(frame) => frame,
-            None => &mut self.session.globals,
+        let replaced = match stack.last() {
+            Some(frame) => declare_in(&mut frame.borrow_mut(), name, value, redeclare_ok, line)?,
+            None => declare_in(&mut self.session.globals, name, value, redeclare_ok, line)?,
         };
-        if target.contains_key(name) && !redeclare_ok {
-            return Err(WispError::new(
-                line,
-                format!("'{name}' is already declared in this scope"),
-            ));
-        }
-        target.insert(name.to_string(), value);
+        // Dropped only now that no frame is borrowed.
+        drop(replaced);
         Ok(())
     }
 
@@ -372,9 +405,12 @@ impl Interp<'_, '_> {
         value: Value,
         line: u32,
     ) -> Result<(), WispError> {
-        for frame in stack.iter_mut().rev() {
-            if let Some(slot) = frame.get_mut(name) {
-                *slot = value;
+        for frame in stack.iter().rev() {
+            let mut vars = frame.borrow_mut();
+            if let Some(slot) = vars.get_mut(name) {
+                let old = core::mem::replace(slot, value);
+                drop(vars);
+                drop(old);
                 return Ok(());
             }
         }
@@ -411,7 +447,7 @@ impl Interp<'_, '_> {
         stmts: &[Stmt],
         stack: &mut ScopeStack,
     ) -> Result<Flow, WispError> {
-        stack.push(BTreeMap::new());
+        stack.push(FrameCell::new(BTreeMap::new()));
         let result = self.exec_block(stmts, stack);
         stack.pop();
         result
@@ -439,16 +475,8 @@ impl Interp<'_, '_> {
     // Arms outlined for the same stack-frame reason as `eval_expr_inner`.
     fn exec_stmt_inner(&mut self, stmt: &Stmt, stack: &mut ScopeStack) -> Result<Flow, WispError> {
         match stmt {
-            Stmt::Let { name, expr, line } => {
-                let v = self.eval_expr(expr, stack)?;
-                self.declare_var(stack, name, v, *line)?;
-                Ok(Flow::Normal)
-            }
-            Stmt::Assign { name, expr, line } => {
-                let v = self.eval_expr(expr, stack)?;
-                self.assign_var(stack, name, v, *line)?;
-                Ok(Flow::Normal)
-            }
+            Stmt::Let { name, expr, line } => self.exec_let(name, expr, *line, stack),
+            Stmt::Assign { name, expr, line } => self.exec_assign(name, expr, *line, stack),
             Stmt::ExprStmt(expr) => {
                 self.eval_expr(expr, stack)?;
                 Ok(Flow::Normal)
@@ -472,6 +500,20 @@ impl Interp<'_, '_> {
                 Ok(Flow::Return(v))
             }
         }
+    }
+
+    #[inline(never)]
+    fn exec_let(&mut self, name: &str, expr: &Expr, line: u32, stack: &mut ScopeStack) -> Result<Flow, WispError> {
+        let v = self.eval_expr(expr, stack)?;
+        self.declare_var(stack, name, v, line)?;
+        Ok(Flow::Normal)
+    }
+
+    #[inline(never)]
+    fn exec_assign(&mut self, name: &str, expr: &Expr, line: u32, stack: &mut ScopeStack) -> Result<Flow, WispError> {
+        let v = self.eval_expr(expr, stack)?;
+        self.assign_var(stack, name, v, line)?;
+        Ok(Flow::Normal)
     }
 
     #[inline(never)]
@@ -590,9 +632,9 @@ impl Interp<'_, '_> {
         stack: &mut ScopeStack,
     ) -> Result<Flow, WispError> {
         self.check_interrupts(line)?;
-        let mut frame = BTreeMap::new();
-        frame.insert(var.to_string(), item);
-        stack.push(frame);
+        let mut vars = BTreeMap::new();
+        vars.insert(var.to_string(), item);
+        stack.push(FrameCell::new(vars));
         let result = self.exec_block(body, stack);
         stack.pop();
         result
@@ -676,6 +718,7 @@ impl Interp<'_, '_> {
             Expr::Binary { op, lhs, rhs, line } => self.eval_binary(*op, lhs, rhs, *line, stack),
             Expr::Call { name, args, line } => self.eval_call(name, args, *line, stack),
             Expr::CallValue { callee, args, line } => self.eval_call_value(callee, args, *line, stack),
+            Expr::Lambda(lambda) => Ok(self.eval_lambda(lambda, stack)),
             Expr::ListLit { items, line } => self.eval_list(items, *line, stack),
             Expr::MapLit { entries, line } => self.eval_map(entries, *line, stack),
             Expr::Index { object, index, line } => self.eval_index(object, index, *line, stack),
@@ -712,28 +755,33 @@ impl Interp<'_, '_> {
             values.push(self.eval_expr(a, stack)?);
         }
         match self.call_target(name, stack, line)? {
-            Some(target) => self.call_named(&target, values, line),
+            Some(target) => self.call_callee(&target, values, line),
             None => self.call_named(name, values, line),
         }
+    }
+
+    /// `fn (...) { ... }`: a closure over the scope stack as it is now.
+    #[inline(never)]
+    fn eval_lambda(&mut self, lambda: &Rc<Lambda>, stack: &ScopeStack) -> Value {
+        self.session.objects.new_closure(lambda.clone(), stack.clone())
     }
 
     /// `callee(args)` for a callee that is not a bare name.
     #[inline(never)]
     fn eval_call_value(&mut self, callee: &Expr, args: &[Expr], line: u32, stack: &ScopeStack) -> Result<Value, WispError> {
-        let target = match self.eval_expr(callee, stack)? {
-            Value::Func(name) => name,
-            other => {
-                return Err(WispError::new(
-                    line,
-                    format!("cannot call {}: only a function can be called", other.type_name()),
-                ))
-            }
+        let callee = self.eval_expr(callee, stack)?;
+        let Some(target) = Callee::of(&callee) else {
+            return Err(WispError::new(
+                line,
+                format!("cannot call {}: only a function can be called", callee.type_name()),
+            ));
         };
+        drop(callee);
         let mut values = Vec::with_capacity(args.len());
         for a in args {
             values.push(self.eval_expr(a, stack)?);
         }
-        self.call_named(&target, values, line)
+        self.call_callee(&target, values, line)
     }
 
     /// A bare name: the nearest variable of that name, else the function
@@ -766,14 +814,17 @@ impl Interp<'_, '_> {
     /// before functions were values keep working, and is an error when
     /// none does.
     #[inline(never)]
-    fn call_target(&self, name: &str, stack: &ScopeStack, line: u32) -> Result<Option<Rc<String>>, WispError> {
+    fn call_target(&self, name: &str, stack: &ScopeStack, line: u32) -> Result<Option<Callee>, WispError> {
         match self.get_var(stack, name) {
-            Some(Value::Func(target)) => Ok(Some(target)),
-            Some(other) if !self.function_exists(name) => Err(WispError::new(
-                line,
-                format!("cannot call '{name}': it holds {}, not a function", other.type_name()),
-            )),
-            _ => Ok(None),
+            Some(value) => match Callee::of(&value) {
+                Some(target) => Ok(Some(target)),
+                None if !self.function_exists(name) => Err(WispError::new(
+                    line,
+                    format!("cannot call '{name}': it holds {}, not a function", value.type_name()),
+                )),
+                None => Ok(None),
+            },
+            None => Ok(None),
         }
     }
 
@@ -1030,28 +1081,44 @@ impl Interp<'_, '_> {
             return Ok(result);
         }
         match self.session.functions.get(name).cloned() {
-            Some(f) => self.call_function(&f, args, line),
+            Some(f) => self.invoke(Target::Declared(&f), args, line),
             None => Err(WispError::new(line, format!("undefined function '{name}'"))),
         }
     }
 
+    /// Call whatever `callee` is.
+    #[inline]
+    fn call_callee(&mut self, callee: &Callee, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        match callee {
+            Callee::Name(name) => self.call_named(name, args, line),
+            Callee::Closure(closure) => self.call_closure(closure, args, line),
+        }
+    }
+
+    /// Call a closure: its body runs on the stack it captured, with the
+    /// parameters in a new frame on top.
     #[inline(never)]
-    fn call_function(
-        &mut self,
-        func: &FuncDecl,
-        args: Vec<Value>,
-        line: u32,
-    ) -> Result<Value, WispError> {
+    fn call_closure(&mut self, closure: &Rc<Closure>, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        self.invoke(Target::Closure(closure), args, line)
+    }
+
+    /// Run a function body: the cooperative checks, the arity check, the
+    /// depth limits, then the body on the stack the call gets (see below).
+    #[inline(never)]
+    fn invoke(&mut self, target: Target, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        let (params, body) = match target {
+            Target::Declared(f) => (&f.params, &f.body),
+            Target::Closure(c) => (&c.lambda.params, &c.lambda.body),
+        };
         self.check_interrupts(line)?;
-        if args.len() != func.params.len() {
+        if args.len() != params.len() {
+            let who = match target {
+                Target::Declared(f) => format!("'{}'", f.name),
+                Target::Closure(_) => String::from("the anonymous function"),
+            };
             return Err(WispError::new(
                 line,
-                format!(
-                    "'{}' expects {} argument(s), got {}",
-                    func.name,
-                    func.params.len(),
-                    args.len()
-                ),
+                format!("{who} expects {} argument(s), got {}", params.len(), args.len()),
             ));
         }
 
@@ -1064,18 +1131,23 @@ impl Interp<'_, '_> {
             ));
         }
 
-        // A function call gets a brand-new stack, seeded with one frame
-        // holding its parameters -- it cannot see any of the caller's
-        // scope frames (no closures), only true globals beyond that.
-        let mut frame = BTreeMap::new();
-        for (param, arg) in func.params.iter().zip(args.into_iter()) {
-            frame.insert((**param).clone(), arg);
+        // A call gets a stack of its own, never the caller's: the closure's
+        // captured stack (empty for a named function, which therefore sees
+        // only its parameters, its locals and the globals) plus one frame
+        // holding the parameters.
+        let mut vars = BTreeMap::new();
+        for (param, arg) in params.iter().zip(args.into_iter()) {
+            vars.insert((**param).clone(), arg);
         }
-        let mut stack: ScopeStack = vec![frame];
+        let mut stack = match target {
+            Target::Declared(_) => Vec::with_capacity(1),
+            Target::Closure(c) => c.env_with_room(),
+        };
+        stack.push(FrameCell::new(vars));
 
         let result = match self.enter(line) {
             Ok(()) => {
-                let r = self.exec_block(&func.body, &mut stack);
+                let r = self.exec_block(body, &mut stack);
                 self.nesting -= 1;
                 r
             }
@@ -1128,19 +1200,20 @@ impl Interp<'_, '_> {
         func_at: usize,
         list_at: usize,
         line: u32,
-    ) -> Result<(Rc<String>, List), WispError> {
+    ) -> Result<(Callee, List), WispError> {
         if args.len() != want {
             return Err(WispError::new(line, format!("{who}() expects {want} arguments, got {}", args.len())));
         }
         let ordinal = |at: usize| ["first", "second", "third"][at];
-        let func = match &args[func_at] {
-            Value::Func(name) => name.clone(),
-            other => {
-                return Err(WispError::new(
-                    line,
-                    format!("{who}() expects a function as its {} argument, found {}", ordinal(func_at), other.type_name()),
-                ))
-            }
+        let Some(func) = Callee::of(&args[func_at]) else {
+            return Err(WispError::new(
+                line,
+                format!(
+                    "{who}() expects a function as its {} argument, found {}",
+                    ordinal(func_at),
+                    args[func_at].type_name()
+                ),
+            ));
         };
         let list = match &args[list_at] {
             Value::List(list) => list.clone(),
@@ -1174,7 +1247,7 @@ impl Interp<'_, '_> {
         let mut out = Self::hof_result_vec(items.len(), line)?;
         for item in items {
             self.check_interrupts(line)?;
-            out.push(self.call_named(&func, vec![item], line)?);
+            out.push(self.call_callee(&func, vec![item], line)?);
         }
         Ok(self.session.objects.new_list(out))
     }
@@ -1186,7 +1259,7 @@ impl Interp<'_, '_> {
         let mut out = Vec::new();
         for item in items {
             self.check_interrupts(line)?;
-            match self.call_named(&func, vec![item.clone()], line)? {
+            match self.call_callee(&func, vec![item.clone()], line)? {
                 Value::Bool(true) => {
                     out.try_reserve(1).map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
                     out.push(item);
@@ -1195,7 +1268,7 @@ impl Interp<'_, '_> {
                 other => {
                     return Err(WispError::new(
                         line,
-                        format!("filter() needs '{func}' to return a bool, but it returned {}", other.type_name()),
+                        format!("filter() needs {} to return a bool, but it returned {}", func.quoted(), other.type_name()),
                     ))
                 }
             }
@@ -1211,7 +1284,7 @@ impl Interp<'_, '_> {
         let mut acc = args[2].clone();
         for item in Self::hof_snapshot(&list, line)? {
             self.check_interrupts(line)?;
-            acc = self.call_named(&func, vec![acc, item], line)?;
+            acc = self.call_callee(&func, vec![acc, item], line)?;
         }
         Ok(acc)
     }
@@ -1228,11 +1301,15 @@ impl Interp<'_, '_> {
         keyed.try_reserve_exact(items.len()).map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
         for item in items {
             self.check_interrupts(line)?;
-            let key = self.call_named(&func, vec![item.clone()], line)?;
+            let key = self.call_callee(&func, vec![item.clone()], line)?;
             if !matches!(key, Value::Int(_) | Value::Str(_)) {
                 return Err(WispError::new(
                     line,
-                    format!("sort_by() needs '{func}' to return an int or a string, but it returned {}", key.type_name()),
+                    format!(
+                        "sort_by() needs {} to return an int or a string, but it returned {}",
+                        func.quoted(),
+                        key.type_name()
+                    ),
                 ));
             }
             if let Some((first, _)) = keyed.first() {
@@ -1240,7 +1317,8 @@ impl Interp<'_, '_> {
                     return Err(WispError::new(
                         line,
                         format!(
-                            "sort_by() needs keys that are all ints or all strings, but '{func}' returned {} and {}",
+                            "sort_by() needs keys that are all ints or all strings, but {} returned {} and {}",
+                            func.quoted(),
                             first.type_name(),
                             key.type_name()
                         ),
@@ -1250,7 +1328,7 @@ impl Interp<'_, '_> {
             keyed.push((key, item));
         }
         if list.borrow().len() != keyed.len() {
-            return Err(WispError::new(line, format!("'{func}' changed the size of the list being sorted")));
+            return Err(WispError::new(line, format!("{} changed the size of the list being sorted", func.quoted())));
         }
         keyed.sort_by(|(a, _), (b, _)| match (a, b) {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
@@ -1263,6 +1341,22 @@ impl Interp<'_, '_> {
         }
         Ok(Value::Nil)
     }
+}
+
+/// Declare `name` in `target`: an error if it is already there (unless
+/// `redeclare_ok`), else the value it replaced, if any, for the caller to
+/// drop once nothing is borrowed.
+fn declare_in(
+    target: &mut BTreeMap<String, Value>,
+    name: &str,
+    value: Value,
+    redeclare_ok: bool,
+    line: u32,
+) -> Result<Option<Value>, WispError> {
+    if target.contains_key(name) && !redeclare_ok {
+        return Err(WispError::new(line, format!("'{name}' is already declared in this scope")));
+    }
+    Ok(target.insert(name.to_string(), value))
 }
 
 /// Shared bounds/type checking for both `object[index]` (a read, in

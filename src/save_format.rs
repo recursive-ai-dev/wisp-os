@@ -270,7 +270,7 @@ fn serialize_value(value: &Value, depth: u32, out: &mut Vec<u8>) -> Result<(), &
         // A function is a name, meaningful only to the program that holds
         // it; stored, it would read back after a reboot as a reference to
         // whatever happens to carry that name then.
-        Value::Func(_) => return Err("save_format: a function cannot be saved"),
+        Value::Func(_) | Value::Closure(_) => return Err("save_format: a function cannot be saved"),
         Value::Bool(b) => put(out, &[TAG_BOOL, u8::from(*b)])?,
         Value::Int(i) => {
             put(out, &[TAG_INT])?;
