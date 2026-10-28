@@ -29,12 +29,14 @@ mod ahci;
 mod allocator;
 mod clock;
 mod debugcon;
+mod disk_layout;
 mod fs;
 mod font;
 mod gdt;
 mod gfx;
 mod idt;
 mod ioapic;
+mod installer;
 mod keyboard;
 mod lapic;
 mod libc_shims;
@@ -133,13 +135,17 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         idt::init();
     }
 
-    // Read every `APPS/*.wisp` file into memory now: this is the last use
-    // of Boot Services (and of `bs`/`image`) in the whole program. Once
+    // Read every `APPS/*.wisp` file into memory before the installer and
+    // the kernel handoff. Once
     // `exit_boot_services` returns, the Simple File System protocol this
     // depends on is gone for good -- see `fs::snapshot_apps`'s doc comment
     // and `CHANGES.md` for why a real post-exit block-device driver is
     // separate, out-of-scope future work for this phase.
     let apps = fs::snapshot_apps(bs, image);
+
+    // The installer uses firmware input and BlockIO while they are still
+    // available; all handles close before the kernel takes ownership.
+    installer::boot_menu(&mut st, bs, image, &mut console, &apps);
 
     // Where the firmware's PE loader put this image, and how big it is --
     // `paging::init` needs it to map the kernel's own sections under W^X
@@ -704,9 +710,9 @@ fn report_apic_fallback(console: &mut Console, msg: &'static str) {
 /// turning "did every step succeed" into a single `Option`, logging
 /// exactly where the chain stopped either way.
 ///
-/// Boot never writes to the disk. A blank or foreign disk is reported and
-/// left untouched; the shell's `format` command is the only way to
-/// provision one, and it asks first. (Earlier versions formatted any
+/// This storage probe never writes to the disk. A blank or foreign disk
+/// is reported and left untouched; provisioning requires the installer
+/// or the shell's `format`, both with explicit confirmation. (Earlier versions formatted any
 /// unrecognized disk automatically and ran a write/read-back/restore
 /// self-test against its last sector -- both destroyed data that did not
 /// belong to WISP.)
@@ -778,7 +784,7 @@ fn bring_up_save_disk(console: &mut Console) -> Option<save_format::SaveDisk> {
             "[save_format] disk is blank; left untouched (not mounted)",
         ),
         Ok(save_format::Probe::Foreign) => (
-            "AHCI disk holds non-WISP data. Left untouched; save/load unavailable ('format' would ERASE it).",
+            "AHCI disk holds non-WISP data. Left untouched; save/load unavailable ('format' checks disk ownership).",
             "[save_format] disk holds foreign data; left untouched (not mounted)",
         ),
         Ok(save_format::Probe::Unsupported) => (

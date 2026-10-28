@@ -53,6 +53,13 @@ fn make_path(path: &str) -> Result<CString16> {
 /// -- a truncated program is not silently run as if complete), or isn't
 /// valid UTF-8 (`COMPROMISED_DATA`).
 pub fn read_file_to_string(bs: &BootServices, image: Handle, path: &str, max_bytes: usize) -> Result<String> {
+    String::from_utf8(read_file_to_bytes(bs, image, path, max_bytes)?)
+        .map_err(|_| Error::new(Status::COMPROMISED_DATA, ()))
+}
+
+/// Read an original on-disk binary, rather than its relocated in-memory
+/// PE image. Used by the live installer while firmware file access exists.
+pub fn read_file_to_bytes(bs: &BootServices, image: Handle, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let mut fs = bs.get_image_file_system(image)?;
     let mut root: Directory = fs.open_volume()?;
     let cpath = make_path(path)?;
@@ -84,7 +91,7 @@ pub fn read_file_to_string(bs: &BootServices, image: Handle, path: &str, max_byt
         total += n;
     }
 
-    String::from_utf8(buf).map_err(|_| Error::new(Status::COMPROMISED_DATA, ()))
+    Ok(buf)
 }
 
 /// Walk `APPS/` on the boot volume and read every `*.wisp` file into

@@ -2,26 +2,23 @@
 //! sector read/write -- Build Order Step 8 of the Phase 2 plan, and the
 //! only way a WISP program's `save`/`load` data survives a reboot.
 //!
-//! # Why not a real filesystem
-//!
-//! Writable FAT32 needs synchronized dual FAT tables, cluster-chain
-//! allocation, and long-filename directory entries -- real engineering
-//! effort with no user-visible payoff yet: nothing needs a hierarchical
-//! filesystem, and apps are still served from `fs::snapshot_apps`'s
-//! read-only RAM snapshot of the boot USB stick (which this format never
-//! touches -- it lives entirely on the second, AHCI-attached disk). A flat
-//! key/value store of fixed-size slots is the simplest thing that can
-//! actually hold a script's save data across a reboot, and is trivial to
-//! reason about: no allocation graph, no fragmentation, just a linear scan.
+//! Apps are served from the boot volume's read-only in-memory snapshot.
+//! Saves use a small copy-on-write store, either on a legacy raw AHCI disk
+//! or inside the dedicated WISP GPT save partition created by the installer.
+//! Partition discovery validates the GPT before constructing a bounded view;
+//! the boot partition and unrelated partitions are never save-write targets.
 //!
 //! # On-disk layout (format version 2)
 //!
 //! ```text
-//! LBA 0:                superblock (this sector only)
-//! LBA 1 .. 1+64*8:       64 fixed-size slots, 8 sectors (4 KiB) each
+//! Relative LBA 0:           superblock (this sector only)
+//! Relative LBA 1 ..= 512:   64 fixed-size slots, 8 sectors (4 KiB) each
 //! ```
 //!
-//! **Superblock** (512 bytes, LBA 0):
+//! LBAs are relative to the selected save region: sector zero of a raw
+//! store, or the first sector of a validated WISP save partition.
+//!
+//! **Superblock** (512 bytes, relative LBA 0):
 //! - bytes 0..9:   magic, [`MAGIC`] (`"WISPSAVE1"`)
 //! - byte  9:      format version ([`FORMAT_VERSION`]; 1 is still read)
 //! - bytes 10..12: slot count, `u16` little-endian ([`SLOT_COUNT`])
@@ -81,14 +78,14 @@
 //!
 //! # Ownership: probe at boot, provision only on request
 //!
-//! Boot only ever *reads* LBA 0 ([`probe`]). A disk is used for saves
-//! only if it already carries a complete, valid superblock. A blank or
-//! foreign disk is left byte-for-byte untouched and persistence stays
-//! unavailable until the user explicitly runs the shell's `format`
-//! command, which shows the device's identity and the exact sector range
-//! it will overwrite and asks for confirmation before calling
-//! [`provision`]. Every sector access goes through [`region_lba`], which
-//! rejects anything outside the `REGION_SECTORS` this format owns.
+//! Boot only reads metadata ([`probe`]). A region is used for saves only
+//! if it already carries a complete, valid superblock. Blank and foreign
+//! disks are left byte-for-byte untouched. The shell's `format` command
+//! shows the device identity and exact physical sector range, then asks
+//! for confirmation before calling [`provision`]. Partitioned disks with
+//! no valid WISP save partition are refused. Every save-sector access
+//! goes through [`region_lba`] before translation into a physical LBA,
+//! rejecting anything outside the [`REGION_SECTORS`] this format owns.
 //!
 //! # Value encoding
 //!
@@ -170,7 +167,8 @@ const LEGACY_VALUE_MAX_LEN: usize = SLOT_SIZE as usize - LEGACY_HEADER_LEN;
 const SUPERBLOCK_LBA: u64 = 0;
 const SLOTS_START_LBA: u64 = 1;
 /// Every sector this format owns: the superblock plus all slots
-/// (LBA 0 ..= 512). Nothing outside this range is ever read or written.
+/// (relative LBA 0 ..= 512). Metadata discovery may read the partition table;
+/// save data operations never leave this region.
 pub const REGION_SECTORS: u64 = SLOTS_START_LBA + SLOT_COUNT as u64 * SECTORS_PER_SLOT as u64;
 
 const TAG_NIL: u8 = 0;
@@ -197,12 +195,75 @@ fn region_lba(lba: u64) -> Result<u64, &'static str> {
     }
 }
 
-unsafe fn read_region_sector(hba: &Hba, lba: u64, out: &mut [u8; SECTOR]) -> Result<(), &'static str> {
-    unsafe { hba.read_sector(region_lba(lba)?, out) }
+unsafe fn read_region_sector(hba: &Region<'_>, lba: u64, out: &mut [u8; SECTOR]) -> Result<(), &'static str> {
+    unsafe { hba.read_sector(lba, out) }
 }
 
-unsafe fn write_region_sector(hba: &Hba, lba: u64, data: &[u8; SECTOR]) -> Result<(), &'static str> {
-    unsafe { hba.write_sector(region_lba(lba)?, data) }
+unsafe fn write_region_sector(hba: &Region<'_>, lba: u64, data: &[u8; SECTOR]) -> Result<(), &'static str> {
+    unsafe { hba.write_sector(lba, data) }
+}
+
+/// A view that maps relative save sectors onto one validated disk region.
+/// Internal operations cannot address the GPT, ESP or adjacent partitions.
+struct Region<'a> {
+    hba: &'a Hba,
+    start: u64,
+}
+
+impl<'a> Region<'a> {
+    unsafe fn discover(hba: &'a Hba, total_sectors: u64) -> Result<Option<Self>, &'static str> {
+        if total_sectors < REGION_SECTORS {
+            return Err("save_format: disk is too small to hold the save-format region");
+        }
+        let mut sector0 = [0u8; SECTOR];
+        unsafe { hba.read_sector(0, &mut sector0)? };
+        // Existing raw stores take precedence, including unsupported versions.
+        if &sector0[..MAGIC.len()] == MAGIC {
+            return Ok(Some(Self { hba, start: 0 }));
+        }
+        let mut sector1 = [0u8; SECTOR];
+        unsafe { hba.read_sector(1, &mut sector1)? };
+        if sector0[510..512] != [0x55, 0xaa] && &sector1[..8] != b"EFI PART" {
+            // An unpartitioned disk may be provisioned only after consent.
+            return Ok(Some(Self { hba, start: 0 }));
+        }
+        let found = crate::disk_layout::find_save_region(total_sectors, |lba, out| unsafe {
+            hba.read_sector(lba, out)
+        })?;
+        match found {
+            Some((start, len))
+                if len >= REGION_SECTORS
+                    && start.checked_add(len).is_some_and(|end| end <= total_sectors) =>
+            {
+                Ok(Some(Self { hba, start }))
+            }
+            Some(_) => Err("save_format: invalid or undersized WISP save partition"),
+            None => Ok(None),
+        }
+    }
+
+    unsafe fn identified(hba: &'a Hba) -> Result<Self, &'static str> {
+        let sectors = hba.info().ok_or("save_format: disk has not been identified")?.total_sectors;
+        unsafe { Self::discover(hba, sectors)? }
+            .ok_or("save_format: partitioned disk has no WISP save partition")
+    }
+
+    fn physical_lba(&self, lba: u64) -> Result<u64, &'static str> {
+        self.start.checked_add(region_lba(lba)?)
+            .ok_or("save_format: sector address overflow")
+    }
+
+    unsafe fn read_sector(&self, lba: u64, out: &mut [u8; SECTOR]) -> Result<(), &'static str> {
+        unsafe { self.hba.read_sector(self.physical_lba(lba)?, out) }
+    }
+
+    unsafe fn write_sector(&self, lba: u64, data: &[u8; SECTOR]) -> Result<(), &'static str> {
+        unsafe { self.hba.write_sector(self.physical_lba(lba)?, data) }
+    }
+
+    unsafe fn flush_cache(&self) -> Result<(), &'static str> {
+        unsafe { self.hba.flush_cache() }
+    }
 }
 
 fn key_field(key: &str) -> [u8; KEY_MAX_LEN] {
@@ -413,18 +474,18 @@ fn deserialize_value(bytes: &[u8], depth: u32) -> Result<(Value, usize), &'stati
     }
 }
 
-/// What [`probe`] found at LBA 0.
+/// What [`probe`] found in the selected save region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Probe {
     /// A complete superblock this driver understands (version 2, or
     /// version 1, which the first save upgrades): save/load may use the
     /// disk.
     Formatted,
-    /// LBA 0 is all zeros: nothing recognizable, including an interrupted
+    /// The region's superblock is all zeros, including an interrupted
     /// earlier `format` (the superblock is written last).
     Blank,
-    /// LBA 0 holds data that is not a WISP superblock (a partition table,
-    /// another filesystem, ...). Never touched without explicit consent.
+    /// The region holds non-WISP data, or a partitioned disk has no WISP
+    /// save partition. Foreign partitions are never reformatted.
     Foreign,
     /// A WISP superblock whose version or geometry this driver does not
     /// understand.
@@ -447,26 +508,27 @@ fn superblock_version(sb: &[u8; SECTOR]) -> Result<u8, Probe> {
 }
 
 /// Read-only check of whether `hba`'s disk already carries a valid,
-/// complete save-format superblock. Issues exactly one sector read and no
-/// writes, whatever it finds -- boot calls this, never [`provision`].
+/// complete save-format superblock, either on a legacy raw disk or inside a
+/// validated WISP GPT partition. Never writes -- boot calls this, never
+/// [`provision`].
 ///
 /// # Safety
 /// Same contract as [`Hba::read_sector`].
 pub unsafe fn probe(hba: &Hba, total_sectors: u64) -> Result<Probe, &'static str> {
-    if total_sectors < REGION_SECTORS {
-        return Err("save_format: disk is too small to hold the save-format region");
-    }
+    let Some(region) = (unsafe { Region::discover(hba, total_sectors)? }) else {
+        return Ok(Probe::Foreign);
+    };
     let mut sb = [0u8; SECTOR];
-    unsafe { read_region_sector(hba, SUPERBLOCK_LBA, &mut sb)? };
+    unsafe { read_region_sector(&region, SUPERBLOCK_LBA, &mut sb)? };
     Ok(match superblock_version(&sb) {
         Ok(_) => Probe::Formatted,
         Err(verdict) => verdict,
     })
 }
 
-/// Format `hba`'s disk for save/load use, destroying LBA 0 ..
-/// [`REGION_SECTORS`] - 1. Only ever called after the user explicitly
-/// confirmed it (the shell's `format` command) -- never from boot.
+/// Format `hba`'s selected save region, destroying exactly
+/// [`REGION_SECTORS`] sectors starting at the raw store or WISP partition.
+/// Only ever called after the user explicitly confirmed it (the shell's `format` command) -- never from boot.
 ///
 /// Ordered so that an interruption at any point leaves a disk [`probe`]
 /// does not accept as formatted:
@@ -477,9 +539,9 @@ pub unsafe fn probe(hba: &Hba, total_sectors: u64) -> Result<Probe, &'static str
 /// # Safety
 /// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
 pub unsafe fn provision(hba: &Hba, total_sectors: u64) -> Result<(), &'static str> {
-    if total_sectors < REGION_SECTORS {
-        return Err("save_format: disk is too small to hold the save-format region");
-    }
+    let region = unsafe { Region::discover(hba, total_sectors)? }
+        .ok_or("save_format: partitioned disk has no WISP save partition; format refused")?;
+    let hba = &region;
     let zero = [0u8; SECTOR];
     unsafe {
         write_region_sector(hba, SUPERBLOCK_LBA, &zero)?;
@@ -580,7 +642,7 @@ struct Scan {
 impl Scan {
     /// # Safety
     /// Same contract as [`Hba::read_sector`].
-    unsafe fn read(hba: &Hba) -> Result<Self, &'static str> {
+    unsafe fn read(hba: &Region<'_>) -> Result<Self, &'static str> {
         let mut slots = Vec::with_capacity(SLOT_COUNT as usize);
         let mut sector = [0u8; SECTOR];
         for slot_index in 0..SLOT_COUNT {
@@ -632,7 +694,7 @@ impl Scan {
 ///
 /// # Safety
 /// Same contract as [`Hba::write_sector`].
-unsafe fn free_slot(hba: &Hba, slot_index: u16) -> Result<(), &'static str> {
+unsafe fn free_slot(hba: &Region<'_>, slot_index: u16) -> Result<(), &'static str> {
     unsafe { write_region_sector(hba, slot_lba(slot_index), &[0u8; SECTOR]) }
 }
 
@@ -641,7 +703,7 @@ unsafe fn free_slot(hba: &Hba, slot_index: u16) -> Result<(), &'static str> {
 ///
 /// # Safety
 /// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
-unsafe fn reclaim_stale(hba: &Hba, scan: &mut Scan) -> Result<(), &'static str> {
+unsafe fn reclaim_stale(hba: &Region<'_>, scan: &mut Scan) -> Result<(), &'static str> {
     let stale = scan.stale();
     if stale.is_empty() {
         return Ok(());
@@ -659,7 +721,7 @@ unsafe fn reclaim_stale(hba: &Hba, scan: &mut Scan) -> Result<(), &'static str> 
 ///
 /// # Safety
 /// Same contract as [`Hba::read_sector`].
-unsafe fn read_copy(hba: &Hba, slot_index: u16, h: &Header) -> Result<Vec<u8>, &'static str> {
+unsafe fn read_copy(hba: &Region<'_>, slot_index: u16, h: &Header) -> Result<Vec<u8>, &'static str> {
     let used = h.used_len()?;
     let mut raw = Vec::new();
     raw.try_reserve_exact(used.div_ceil(SECTOR) * SECTOR)
@@ -700,7 +762,7 @@ unsafe fn read_copy(hba: &Hba, slot_index: u16, h: &Header) -> Result<Vec<u8>, &
 /// # Safety
 /// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
 unsafe fn write_copy(
-    hba: &Hba,
+    hba: &Region<'_>,
     slot_index: u16,
     key: &str,
     encoded: &[u8],
@@ -741,7 +803,7 @@ unsafe fn write_copy(
 /// # Safety
 /// Same contract as [`Hba::read_sector`]/[`Hba::write_sector`]/
 /// [`Hba::flush_cache`].
-unsafe fn ensure_current_version(hba: &Hba) -> Result<(), &'static str> {
+unsafe fn ensure_current_version(hba: &Region<'_>) -> Result<(), &'static str> {
     let mut sb = [0u8; SECTOR];
     unsafe { read_region_sector(hba, SUPERBLOCK_LBA, &mut sb)? };
     match superblock_version(&sb) {
@@ -772,10 +834,10 @@ unsafe fn ensure_current_version(hba: &Hba) -> Result<(), &'static str> {
 /// Same contract as [`Hba::read_sector`]/[`Hba::write_sector`]. The caller
 /// must have confirmed [`probe`] returned [`Probe::Formatted`] (or run
 /// [`provision`]) on this same `Hba`.
-pub unsafe fn save(hba: &Hba, key: &str, value: &Value) -> Result<(), &'static str> {
+unsafe fn save_in(hba: &Region<'_>, key: &str, value: &Value) -> Result<(), &'static str> {
     validate_key(key)?;
     if matches!(value, Value::Nil) {
-        return unsafe { delete(hba, key) }.map(|_| ());
+        return unsafe { delete_in(hba, key) }.map(|_| ());
     }
     let encoded = encode(value)?;
 
@@ -826,7 +888,7 @@ pub unsafe fn save(hba: &Hba, key: &str, value: &Value) -> Result<(), &'static s
 ///
 /// # Safety
 /// Same contract as [`save`].
-pub unsafe fn delete(hba: &Hba, key: &str) -> Result<bool, &'static str> {
+unsafe fn delete_in(hba: &Region<'_>, key: &str) -> Result<bool, &'static str> {
     validate_key(key)?;
     let mut scan = unsafe { Scan::read(hba)? };
     unsafe { reclaim_stale(hba, &mut scan)? };
@@ -856,7 +918,7 @@ pub unsafe fn delete(hba: &Hba, key: &str) -> Result<bool, &'static str> {
 /// Same contract as [`Hba::read_sector`]. The caller must have already
 /// confirmed [`probe`] returned [`Probe::Formatted`] (or run
 /// [`provision`]) on this same `Hba`.
-pub unsafe fn load(hba: &Hba, key: &str) -> Result<Option<Value>, &'static str> {
+unsafe fn load_in(hba: &Region<'_>, key: &str) -> Result<Option<Value>, &'static str> {
     validate_key(key)?;
     let scan = unsafe { Scan::read(hba)? };
     let Some((slot_index, header)) = scan.winner(&key_field(key)) else {
@@ -876,7 +938,7 @@ pub unsafe fn load(hba: &Hba, key: &str) -> Result<Option<Value>, &'static str> 
 ///
 /// # Safety
 /// Same contract as [`load`].
-pub unsafe fn keys(hba: &Hba) -> Result<Vec<(String, usize)>, &'static str> {
+unsafe fn keys_in(hba: &Region<'_>) -> Result<Vec<(String, usize)>, &'static str> {
     let scan = unsafe { Scan::read(hba)? };
     let mut out = Vec::new();
     for (index, slot) in scan.slots.iter().enumerate() {
@@ -887,6 +949,38 @@ pub unsafe fn keys(hba: &Hba) -> Result<Vec<(String, usize)>, &'static str> {
         }
     }
     Ok(out)
+}
+
+/// Store a value in the discovered raw store or WISP GPT save partition.
+///
+/// # Safety
+/// The HBA must be identified and the selected region must have been mounted.
+pub unsafe fn save(hba: &Hba, key: &str, value: &Value) -> Result<(), &'static str> {
+    unsafe { save_in(&Region::identified(hba)?, key, value) }
+}
+
+/// Delete a saved value from the discovered store.
+///
+/// # Safety
+/// Same contract as [`save`].
+pub unsafe fn delete(hba: &Hba, key: &str) -> Result<bool, &'static str> {
+    unsafe { delete_in(&Region::identified(hba)?, key) }
+}
+
+/// Read a value from the discovered store.
+///
+/// # Safety
+/// Same contract as [`save`].
+pub unsafe fn load(hba: &Hba, key: &str) -> Result<Option<Value>, &'static str> {
+    unsafe { load_in(&Region::identified(hba)?, key) }
+}
+
+/// List the discovered store's saved values.
+///
+/// # Safety
+/// Same contract as [`save`].
+pub unsafe fn keys(hba: &Hba) -> Result<Vec<(String, usize)>, &'static str> {
+    unsafe { keys_in(&Region::identified(hba)?) }
 }
 
 /// The save disk as the shell sees it: the AHCI device, its size, and
@@ -912,6 +1006,14 @@ impl SaveDisk {
 
     pub fn total_sectors(&self) -> u64 {
         self.total_sectors
+    }
+
+    /// Inclusive physical sector range that an explicit format may overwrite.
+    /// Foreign or malformed partition tables are rejected before confirmation.
+    pub fn format_range(&self) -> Result<(u64, u64), &'static str> {
+        let region = unsafe { Region::discover(&self.hba, self.total_sectors)? }
+            .ok_or("save_format: partitioned disk has no WISP save partition; format refused")?;
+        Ok((region.start, region.physical_lba(REGION_SECTORS - 1)?))
     }
 
     pub fn is_mounted(&self) -> bool {

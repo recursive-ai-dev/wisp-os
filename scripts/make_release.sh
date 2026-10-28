@@ -9,7 +9,7 @@
 #     esp/EFI/BOOT/BOOTX64.EFI                  prebuilt, ready to copy to a stick
 #     SHA256SUMS                                checksums of every file above
 #
-# plus dist/SHA256SUMS covering the two archives themselves.
+# plus dist/SHA256SUMS covering the archives and optional live ISO.
 #
 # The version comes from Cargo.toml, the single source of truth that the
 # kernel banner and `version` command also read (via CARGO_PKG_VERSION), so
@@ -20,18 +20,21 @@
 # (default: the newest modification time among the packaged files, so an
 # unchanged tree repackages to byte-identical archives).
 #
-# Usage: scripts/make_release.sh [--skip-build]
+# Usage: scripts/make_release.sh [--skip-build] [--iso]
 #   --skip-build   package the BOOTX64.EFI already in esp/EFI/BOOT instead
 #                  of rebuilding (it must exist).
+#   --iso          also build the live ISO (needs xorriso).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 SKIP_BUILD=0
+INCLUDE_ISO=0
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
+        --iso) INCLUDE_ISO=1 ;;
         -h|--help)
             sed -n '2,27p' "$0"
             exit 0
@@ -42,6 +45,11 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+if [[ "$INCLUDE_ISO" -eq 1 ]] && ! command -v xorriso >/dev/null 2>&1; then
+    printf 'error: --iso needs xorriso\n' >&2
+    exit 1
+fi
 
 for tool in tar gzip sha256sum python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -81,6 +89,11 @@ done < <(find ./src ./docs ./scripts ./tools ./esp/APPS -type f \
 while IFS= read -r -d '' f; do
     FILES+=("${f#./}")
 done < <(find ./tests -maxdepth 1 -type f -name '*.py' -print0)
+# Ship the host test crate too; source archives should run the same checks
+# as a checkout, without generated target/ trees or test output images.
+while IFS= read -r -d '' f; do
+    FILES+=("${f#./}")
+done < <(find ./tests/host -type f -not -path './tests/host/target/*' -print0)
 FILES+=("$EFI")
 
 DIST="$ROOT/dist"
@@ -138,13 +151,20 @@ with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
             z.writestr(info, fh.read(), compresslevel=9)
 PY
 
+if [[ "$INCLUDE_ISO" -eq 1 ]]; then
+    scripts/make_iso.sh --skip-build
+fi
+
 (
     cd "$DIST"
-    sha256sum "$NAME.tar.gz" "$NAME.zip" > SHA256SUMS
+    artifacts=("$NAME.tar.gz" "$NAME.zip")
+    if [[ "$INCLUDE_ISO" -eq 1 ]]; then artifacts+=("$NAME-live.iso"); fi
+    sha256sum "${artifacts[@]}" > SHA256SUMS
 )
 
 echo "==> Release $NAME"
 echo "    $(du -h "$DIST/$NAME.tar.gz" | cut -f1)  dist/$NAME.tar.gz"
 echo "    $(du -h "$DIST/$NAME.zip" | cut -f1)  dist/$NAME.zip"
+if [[ "$INCLUDE_ISO" -eq 1 ]]; then echo "    dist/$NAME-live.iso"; fi
 echo "    dist/SHA256SUMS:"
 sed 's/^/      /' "$DIST/SHA256SUMS"

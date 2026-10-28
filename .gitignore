@@ -19,13 +19,17 @@ __pycache__/
 # rather than one seeded with whatever a previous run happened to save.
 /save.img
 
+# Installer development destination; separate from legacy save.img.
+/install.img
+
 # Test-harness scratch output (screenshots, per-run debug logs, isolated
 # build/ESP dirs for tests/fault_test.py and tests/ahci_test.py).
 /tests/out/
 /tests/out_fault/
 /tests/out_ahci/
+/tests/out_installer/
 
-# Release archives from scripts/make_release.sh.
+# Release archives, live ISOs and checksums from the release/build scripts.
 /dist/
 
 # USB test-suite scratch output.

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Boots ./esp in QEMU under OVMF. Run ./build.sh first.
+# WISP_ISO=dist/wisp-os-v<version>-live.iso boots live installation media.
+# WISP_INSTALL_DISK=install.img selects its destination image (created at 128M).
+# WISP_BOOT_DISK=install.img boots the installed disk without live media.
 #
 # By default this runs headless (-display none), which is what the sandbox
 # this project was built in requires; the shell is still fully interactive
@@ -10,7 +13,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [[ ! -f esp/EFI/BOOT/BOOTX64.EFI ]]; then
+if [[ -n "${WISP_ISO:-}" && -n "${WISP_BOOT_DISK:-}" ]]; then
+    printf 'error: choose WISP_ISO or WISP_BOOT_DISK, not both\n' >&2
+    exit 2
+fi
+if [[ -n "${WISP_INSTALL_DISK:-}" && -z "${WISP_ISO:-}" ]]; then
+    printf 'error: WISP_INSTALL_DISK requires WISP_ISO\n' >&2
+    exit 2
+fi
+if [[ -n "${WISP_ISO:-}" && ! -f "$WISP_ISO" ]]; then
+    printf 'error: live ISO missing: %s\n' "$WISP_ISO" >&2
+    exit 1
+fi
+if [[ -n "${WISP_BOOT_DISK:-}" && ( ! -f "$WISP_BOOT_DISK" || -L "$WISP_BOOT_DISK" ) ]]; then
+    printf 'error: WISP_BOOT_DISK must name an existing regular disk image\n' >&2
+    exit 1
+fi
+if [[ -z "${WISP_ISO:-}" && -z "${WISP_BOOT_DISK:-}" && ! -f esp/EFI/BOOT/BOOTX64.EFI ]]; then
     echo "error: esp/EFI/BOOT/BOOTX64.EFI not found -- run ./build.sh first" >&2
     exit 1
 fi
@@ -68,9 +87,30 @@ fi
 # fresh checkout gets a fresh, empty disk rather than one seeded with
 # whatever a previous run happened to write.
 SAVE_IMG="$(dirname "$0")/save.img"
-if [[ ! -f "$SAVE_IMG" ]]; then
-    echo "==> Creating $SAVE_IMG (64M, raw)"
-    qemu-img create -f raw "$SAVE_IMG" 64M >/dev/null
+disk_size=64M
+if [[ -n "${WISP_ISO:-}" ]]; then
+    SAVE_IMG="${WISP_INSTALL_DISK:-$(dirname "$0")/install.img}"
+    disk_size=128M
+fi
+if [[ -z "${WISP_BOOT_DISK:-}" ]]; then
+    if [[ -e "$SAVE_IMG" || -L "$SAVE_IMG" ]]; then
+        [[ -f "$SAVE_IMG" && ! -L "$SAVE_IMG" ]] || { printf 'error: destination must be a regular disk image\n' >&2; exit 1; }
+    else
+        printf '==> Creating %s (%s, raw)\n' "$SAVE_IMG" "$disk_size"
+        qemu-img create -f raw "$SAVE_IMG" "$disk_size" >/dev/null
+    fi
+fi
+
+boot_args=(-drive format=raw,file=fat:esp,if=none,id=stick,readonly=on
+           -usb -device usb-storage,drive=stick)
+disk_args=(-drive "id=savedisk,if=none,format=raw,file=${SAVE_IMG//,/,,}"
+           -device ahci,id=ahci0 -device ide-hd,drive=savedisk,bus=ahci0.0)
+if [[ -n "${WISP_ISO:-}" ]]; then
+    boot_args=(-cdrom "$WISP_ISO" -boot order=d)
+elif [[ -n "${WISP_BOOT_DISK:-}" ]]; then
+    boot_args=()
+    disk_args=(-drive "id=system,if=none,format=raw,file=${WISP_BOOT_DISK//,/,,}"
+               -device ahci,id=ahci0 -device ide-hd,drive=system,bus=ahci0.0)
 fi
 
 # The ESP is mounted through QEMU's vvfat driver READ-ONLY (`fat:esp`, not
@@ -134,12 +174,9 @@ fi
 # way it does to a plain disk.
 exec qemu-system-x86_64 \
     -bios "$OVMF_CODE" \
-    -drive format=raw,file=fat:esp,if=none,id=stick,readonly=on \
-    -usb -device usb-storage,drive=stick \
+    "${boot_args[@]}" \
     "${usb_args[@]}" \
-    -drive id=savedisk,if=none,format=raw,file="$SAVE_IMG" \
-    -device ahci,id=ahci0 \
-    -device ide-hd,drive=savedisk,bus=ahci0.0 \
+    "${disk_args[@]}" \
     -net none \
     -m 256M \
     -vga std \

@@ -548,6 +548,15 @@ impl Shell {
             console.set_fg(gfx::FOREGROUND);
             return;
         };
+        let (first_sector, last_sector) = match disk.format_range() {
+            Ok(range) => range,
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = write!(console, "format: {msg}\n");
+                console.set_fg(gfx::FOREGROUND);
+                return;
+            }
+        };
         let (model, serial) = match disk.hba().info() {
             Some(info) => (info.model(), info.serial()),
             None => ("?", "?"),
@@ -556,11 +565,10 @@ impl Shell {
         console.set_fg(gfx::ERROR);
         let _ = write!(
             console,
-            "format: this ERASES sectors 0-{} ({} KiB, including any partition table) of:\n\
+            "format: this ERASES sectors {first_sector}-{last_sector} ({} KiB) of:\n\
              \x20 AHCI port {}  model '{model}'  serial '{serial}'  {} MiB\n\
              {}\
              Type ERASE to continue, anything else to cancel: ",
-            save_format::REGION_SECTORS - 1,
             save_format::REGION_SECTORS * u64::from(ahci::SECTOR_SIZE) / 1024,
             disk.hba().port(),
             total * u64::from(ahci::SECTOR_SIZE) / (1024 * 1024),

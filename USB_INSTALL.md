@@ -1,4 +1,71 @@
-# Installing onto a USB stick
+# Live installation and USB boot media
+
+## Install the live system onto a disk
+
+Wisp's boot menu offers **T — Try Wisp** and **I — Install Wisp** before
+the kernel exits UEFI Boot Services. Waiting at the menu selects Try. The
+installer uses firmware disk access, so it can copy the live system onto
+eligible SATA, USB or NVMe disks without a host OS.
+
+Build the live ISO from a source checkout:
+
+```bash
+./scripts/make_iso.sh
+```
+
+This needs Python 3 and `xorriso`, plus the usual Rust build tools. Use
+`--skip-build` to package an existing `esp/EFI/BOOT/BOOTX64.EFI`, or
+`--output /path/wisp-live.iso` to choose the output file. No root access,
+mount operation or additional Python packages are needed. The default
+output is `dist/wisp-os-v1.1.0-live.iso` and its `.sha256` file. The ISO has
+both an EFI El Torito entry for optical/VM boot and a GPT EFI partition
+for USB image-writing tools. Secure Boot requirements still apply.
+
+For a VM trial with a separate, disposable image destination:
+
+```bash
+UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.1.0-live.iso ./run.sh
+```
+
+The runner creates `install.img` at 128 MiB if missing. Select another
+image with `WISP_INSTALL_DISK=/path/destination.img`. It never passes a host
+block device to QEMU. To start the installed system without its live ISO:
+
+```bash
+UEFI_SHELL_DISPLAY=gui WISP_BOOT_DISK=install.img ./run.sh
+```
+
+Installation replaces the selected disk's partition table and files.
+Back up anything needed from it first. The installer:
+
+1. Lists writable **whole disks** with 512-byte logical sectors and at
+   least 80 MiB capacity. It excludes the boot source and refuses to
+   proceed if the source cannot be identified safely.
+2. Shows the selected disk's identity and capacity, then asks for the
+   exact text `ERASE <number>`. Esc or a different answer cancels without
+   writing.
+3. Creates primary and backup GPT tables, a 64 MiB FAT32 EFI System
+   Partition at the 1 MiB boundary, and a separate Wisp save partition.
+4. Copies `EFI/BOOT/BOOTX64.EFI` and the live `APPS/*.wisp` programs,
+   including their long filenames; initializes the save store; flushes
+   and reads back the written sectors before reporting success.
+5. Offers **R** to reboot or **T** to continue the live session. Remove
+   the live medium and select the installed disk in firmware to boot it.
+
+This is a whole-disk installer; it does not resize existing partitions or
+set up dual boot. An interrupted installation may leave an unbootable
+target; boot the live medium and install again. It installs the standard
+`\EFI\BOOT\BOOTX64.EFI` fallback file and does not alter firmware NVRAM
+boot entries. Some firmware requires choosing that file using its
+“boot from EFI file” facility on an internal disk.
+
+The installed save store mounts automatically on supported AHCI disks.
+`format` resets only that save region, preserving the boot partition.
+Firmware may install and boot Wisp on NVMe or USB even though the kernel
+still needs AHCI for persistence after Boot Services ends. The installer
+does not add networking or online updates.
+
+## Prepare a USB stick from another OS
 
 `scripts/` contains three installers -- one per host OS you might be
 running the build/copy step from -- that turn a USB flash drive into a
@@ -11,7 +78,8 @@ containing `EFI/BOOT/BOOTX64.EFI` and the `APPS/*.wisp` programs.
 | macOS | `scripts/install_usb_macos.sh` | `diskutil` |
 | Windows | `scripts/install_usb_windows.ps1` | PowerShell `Storage` module |
 
-All three follow the same two-step pattern and the same safety philosophy:
+All three prepare live media with the boot menu above. They follow the
+same two-step pattern and the same safety philosophy:
 
 ```
 <script> list                     # read-only: shows candidate disks

@@ -13,3 +13,6 @@ pub mod save_format;
 
 #[path = "../../../src/line_editor.rs"]
 pub mod line_editor;
+
+#[path = "../../../src/disk_layout.rs"]
+pub mod disk_layout;

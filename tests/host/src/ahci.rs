@@ -13,6 +13,10 @@ use std::collections::BTreeMap;
 pub const SECTOR_SIZE: u32 = 512;
 type Sector = [u8; SECTOR_SIZE as usize];
 
+pub struct DiskInfo {
+    pub total_sectors: u64,
+}
+
 pub struct Hba {
     media: RefCell<Vec<Sector>>,
     cache: RefCell<BTreeMap<u64, Sector>>,
@@ -49,6 +53,10 @@ impl Hba {
             flushes: Cell::new(0),
             ops: Cell::new(0),
         }
+    }
+
+    pub fn info(&self) -> Option<DiskInfo> {
+        Some(DiskInfo { total_sectors: self.total_sectors() })
     }
 
     pub fn total_sectors(&self) -> u64 {

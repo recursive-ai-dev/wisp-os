@@ -407,11 +407,11 @@ fn lookups_read_one_sector_per_slot() {
     put(&hba, "big", s(&"x".repeat(4000)));
     hba.reads.set(0);
     get(&hba, "big");
-    // 64 header sectors, then the 8 sectors of the one matching copy.
-    assert_eq!(hba.reads.get(), 64 + 8);
+    // One region-discovery sector, 64 headers, then the matching copy.
+    assert_eq!(hba.reads.get(), 1 + 64 + 8);
     hba.reads.set(0);
     assert!(get(&hba, "missing").is_none());
-    assert_eq!(hba.reads.get(), 64);
+    assert_eq!(hba.reads.get(), 1 + 64);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # The WISP OS Manual
 
-**Covers WISP OS v1.1.0 and the work merged after it (functions as values and closures).**
+**Covers WISP OS v1.1.0 and the work merged after it (functions, closures and live installation).**
 **Companion roadmap: Part VI.**
 
 > WISP OS is a freestanding x86_64 kernel that boots straight from UEFI firmware
@@ -399,6 +399,40 @@ The suites need Python 3, `Pillow` (screenshots) and `pytesseract` with the
 
 ## 8. Installing on a USB stick
 
+### Live installation
+
+The boot menu now offers **T** to try Wisp (also selected after a short
+timeout) or **I** to install the live system. Build its hybrid UEFI ISO
+with `./scripts/make_iso.sh` (Python 3 and `xorriso` required), then boot
+the ISO as optical media or write it to USB with an image-writing tool.
+The existing host USB scripts below also produce media with this menu.
+
+The installer lists writable whole disks with 512-byte sectors and at
+least 80 MiB capacity. It excludes the live boot source and asks for the
+exact confirmation `ERASE <number>` before writing. It replaces that disk
+with primary/backup GPT tables, a 64 MiB FAT32 EFI System Partition, the
+live EFI binary and apps, and an initialized Wisp save partition. It
+flushes and verifies the sectors before reporting success. It does not
+resize existing partitions, arrange dual boot or change firmware NVRAM
+entries. Remove the live medium after installation and select the disk
+or its `\EFI\BOOT\BOOTX64.EFI` file in firmware.
+
+For an isolated VM trial:
+
+```bash
+./scripts/make_iso.sh
+UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.1.0-live.iso ./run.sh
+# After installing onto the automatically created 128 MiB install.img:
+UEFI_SHELL_DISPLAY=gui WISP_BOOT_DISK=install.img ./run.sh
+```
+
+Firmware can install and boot from NVMe or USB, but persistence after
+Boot Services still needs a supported AHCI disk. An interrupted install
+can leave its target unbootable; rerun installation from live media.
+See [USB_INSTALL.md](../USB_INSTALL.md) for the complete procedure.
+
+### Preparing live USB media from a host OS
+
 Three installers do the same job on three host operating systems: make a
 GPT-partitioned, FAT32-formatted stick containing `EFI/BOOT/BOOTX64.EFI` and
 `APPS/*.wisp`. `esp/EFI/BOOT/BOOTX64.EFI` must exist first (from a release archive,
@@ -446,6 +480,7 @@ Partitioning is destructive, so every script is built around the same safety rul
 
 | Installer | Exercised |
 |---|---|
+| Live boot installer | QEMU: cancellation and small targets leave images unchanged; every copied file matches; installed disk boots without live media, runs apps, excludes itself from targets and preserves saves across reboot. Real hardware remains untested. |
 | Linux | Partition and format steps verified end to end against a loopback image (`parted print`, `blkid`, `fsck.fat`). The final mount-and-copy step could not be verified in the build sandbox (no `vfat` kernel driver), though it is standard. |
 | macOS | **Never run** on a real Mac. Written against documented `diskutil` behaviour. Creates a "Microsoft Basic Data" FAT32 partition rather than one tagged with the ESP type GUID, which works because firmware's removable-media path ignores the type GUID. |
 | Windows | **Never run** on a real Windows machine. Sets the ESP type GUID explicitly. |
@@ -483,12 +518,13 @@ APPS/hello.wisp          (and any other .wisp files)
 
 ### Before you boot on a machine with disks you care about
 
-Booting never writes, and the only command that writes outside an existing save
-store is `format`, which asks first. Even so, the careful path on an unproven
-machine is to **disconnect SATA disks you cannot afford to lose** for the first run.
-The kernel selects the first usable device on the AHCI controller for its save
-store, and `format` would erase LBA 0-512 of *that* disk, including any partition
-table. Read the device model and serial that `format` prints before you type `ERASE`.
+Choosing Try Wisp never provisions a disk. Installation requires the
+separate `ERASE <number>` confirmation. The kernel selects the first
+usable AHCI device for persistence, mounts a valid Wisp save partition
+or legacy raw store, and otherwise leaves the disk alone. `format` shows
+the device and range and asks for `ERASE`; it refuses foreign partition
+tables rather than overwriting boot files. Read each displayed target
+carefully before confirming.
 
 ## 10. Troubleshooting boot
 
@@ -769,8 +805,9 @@ available. `primes.wisp` and `stopwatch.wisp` exist to be stopped this way.
 
 ### The model
 
-Persistent data lives on a **second disk**, attached through AHCI, that is separate
-from the boot stick. The boot stick is read once and never written. The save disk
+Persistent data lives in a **Wisp save partition** on an installed AHCI
+disk, or in a legacy raw store on a separate AHCI disk when booted live.
+The live boot medium is read once and never written. The save region
 holds a **key/value store**:
 
 - keys are strings of 1 to 32 bytes (no NUL bytes);
@@ -787,8 +824,9 @@ right call and exactly how a save survives a power cut.
 
 ### First-time setup: `format`
 
-A new disk is blank, and boot never writes, so `save`/`load` are unavailable until you
-run `format`:
+The live installer initializes its save partition, so installed AHCI
+systems can use `save`/`load` immediately. A separate blank disk used by a
+live session must first be provisioned with `format`:
 
 ```text
 > format
@@ -807,6 +845,12 @@ formatted (save/load available)`.
 then clears the slots, then publishes the new superblock last. A power cut at any
 point therefore leaves a disk the next boot reports as blank or foreign, never one
 it accepts with garbage in it.
+
+On an installed disk, `format` displays the save partition's physical
+sector range instead. It erases only the save store, preserving GPT and
+the EFI files. A partitioned foreign disk with no valid Wisp save
+partition is refused; create a Wisp installation on an intentionally
+selected whole disk using the boot menu instead.
 
 ### Using it from the shell
 
@@ -2986,6 +3030,7 @@ implement it with explicit bounds and typed errors, add host tests, document it 
 ```bash
 scripts/make_release.sh              # builds, then packages
 scripts/make_release.sh --skip-build # package the existing esp/EFI/BOOT/BOOTX64.EFI
+scripts/make_release.sh --iso        # also build the hybrid live ISO (xorriso)
 ```
 
 It writes `dist/wisp-os-v<version>.tar.gz` and `.zip` (source, docs, scripts, test harnesses,
@@ -2994,6 +3039,13 @@ two archives. The version comes from `Cargo.toml`, the single source of truth th
 `version` and the archive name all read. Archives are reproducible: entries sorted, owners
 zeroed, timestamps pinned to `SOURCE_DATE_EPOCH` (default: the newest modification time among
 the packaged files).
+
+`scripts/make_iso.sh [--skip-build] [--output PATH]` builds just the live
+ISO plus a `.sha256` file. Its EFI boot image is generated by
+`tools/make_esp.py` using only Python's standard library, with long
+filenames and deterministic FAT metadata. It requires neither root nor
+a mounted filesystem. Release source archives now include the complete
+`tests/host` crate so the host checks can run from an extracted release.
 
 ### Release checklist
 
@@ -3014,11 +3066,29 @@ the packaged files).
 
 | Layer | Where | Count | Runs on |
 |---|---|---|---|
-| Host unit and behaviour tests | `tests/host/tests/*.rs` | 229 | any PC, seconds |
+| Host unit and behaviour tests | `tests/host/tests/*.rs` | 240 | any PC, seconds |
 | Fault injection | `tests/fault_test.py` | 6 hook scenarios | QEMU |
 | Storage | `tests/ahci_test.py` | `no_controller`, `controller_no_disk`, `full_stack`, `foreign_disk_untouched`, `legacy_v1_store` | QEMU |
 | Interrupts and USB | `tests/usb_test.py` | `apic`, `no_xhci`, `xhci_no_device`, `usb_keyboard` | QEMU |
 | End to end | `tests/acceptance_test.py` | 55 numbered checks: steps 1-24 plus second-boot persistence | QEMU |
+| ISO image | `tests/iso_test.py` | FAT chains, long names, source bounds, output protection | host Python |
+| Live installer | `tests/installer_test.py` | cancellation, small targets, byte comparisons, standalone boot, source protection, persistence | QEMU |
+| Console capture | `tests/console_capture_test.py` | exact glyphs, cursor handling, PPM boundaries | host Python |
+
+`python3 tests/iso_test.py` needs only Python's standard library. It
+decodes the generated image independently of the writer and verifies
+the EFI binary, app payloads, directory chains, duplicate-name handling,
+snapshot budgets and refusal to replace a device/symlink output.
+
+Run `python3 tests/installer_test.py` for a complete live installation
+trial. It builds the kernel and ISO, creates disposable disk images under
+`tests/out_installer`, and checks installation followed by two boots
+without live media. `--skip-build` reuses the current EFI binary and ISO.
+It compares GPT checksums, FAT directory chains and every installed app
+and executable byte independently of the installer. Screen assertions
+decode `src/font.rs` directly using `tests/console_capture.py`, so this
+suite needs neither Pillow nor Tesseract. Other QEMU suites retain their
+existing image/OCR dependencies.
 
 ### Host tests
 
@@ -3031,6 +3101,8 @@ the packaged files).
 | `regressions.rs` | 29 | The audit findings: shared graphs, cycles, deep syntax, UTF-8, memory accounting |
 | `save_format_v2.rs` | 20 | Crash-atomicity over every write/flush boundary and subset, v1 upgrade |
 | `line_editor.rs` | 8 | Editing against a simulated character grid, keystroke by keystroke |
+| `disk_layout.rs` | 7 | GPT/FAT32 and long names, installation IDs, validation before writes, interrupted writes, readback corruption |
+| `save_partition.rs` | 4 | Save-partition isolation, raw API offsets, foreign MBR and malformed GPT refusal |
 
 The tests use a **counting global allocator** to assert that runs return to the same live-byte
 count (leak detection) and run deep-recursion cases on a deliberately small thread stack, which
@@ -3091,7 +3163,9 @@ What has been exercised, and what has not, as of this manual.
 
 | Claim | Evidence |
 |---|---|
-| 229 host tests pass | Run for this manual: all seven files green (45+43+41+8+43+29+20). |
+| 240 host tests pass | Original 229 language/save/editor tests plus seven disk-layout and four save-partition tests. |
+| Live ISO installs a standalone system | `tests/installer_test.py`: cancelled and undersized targets unchanged, EFI/apps byte-identical, GPT/FAT validated, installed disk boots and runs `xor_brain`, saves survive reboot, boot disk excluded from install targets. |
+| Current AHCI storage stack passes QEMU checks | All five `tests/ahci_test.py` scenarios passed, using exact bitmap text decoding for screenshots: missing controller, empty controller, full stack, foreign disk untouched and legacy-v1 upgrade. |
 | The kernel builds with zero warnings | Run for this manual with `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`: `./build.sh` finished, no warnings, `BOOTX64.EFI` 308 KB. |
 | v1.1.0 passes the QEMU suites | Recorded in `CHANGES.md`: fault, ahci and usb suites pass every scenario; acceptance runs to its last step with every OCR check passing (nightly 2026-10-19). |
 | The bundled programs print what this manual shows | `hello`, `guess`, `calc`, `words`, `tasks`, `undo`, `adventure`, `tamer`, `xor_brain` were run through the real interpreter for this manual. |
@@ -3105,7 +3179,7 @@ What has been exercised, and what has not, as of this manual.
 | Item | Why it matters |
 |---|---|
 | **Any real hardware** | No physical machine has run this. All hardware claims are QEMU/OVMF. Biggest open risk. |
-| **QEMU run of the post-v1.1.0 binary** | Functions as values and closures (and `tasks`, `undo`) are covered by host tests but the resulting binary has never been booted; no acceptance step covers them. |
+| **`tasks` and `undo` in QEMU** | Functions and closures have host coverage; the installed binary boots in QEMU and runs `xor_brain`, but these two apps still lack a QEMU acceptance step. |
 | macOS and Windows installers | Never executed on real systems. |
 | LA57 / 5-level paging path | No OVMF build enables it. |
 | xHCI behaviour with real keyboards of every descriptor shape | QEMU's `usb-kbd` only. |

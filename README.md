@@ -40,6 +40,35 @@ To build and run from source:
                      # UEFI_SHELL_USB_KBD=1 ./run.sh to attach a USB keyboard)
 ```
 
+To build the live installer ISO (Python 3 and `xorriso` required):
+
+```bash
+./scripts/make_iso.sh
+UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.1.0-live.iso ./run.sh
+```
+
+This creates a separate 128 MiB `install.img` destination for the VM. At
+the boot menu, press **T** to try Wisp or **I** to install the running
+system. Installation shows eligible disks and requires the exact typed
+confirmation `ERASE <number>` before replacing a disk's contents. It copies
+the live EFI binary and apps, creates a GPT/FAT32 boot partition and a
+separate save-data partition, and verifies the written sectors. Remove the
+live media after installation; for the VM, boot the result with:
+
+```bash
+UEFI_SHELL_DISPLAY=gui WISP_BOOT_DISK=install.img ./run.sh
+```
+
+The ISO boots x86_64 UEFI optical media and includes an EFI partition for
+USB image-writing tools. The existing host USB scripts also produce media
+with the same boot menu. See [USB_INSTALL.md](USB_INSTALL.md) for supported
+targets, firmware boot selection and the destructive-install details.
+
+Run `python3 tests/installer_test.py` to build and verify the full ISO-to-disk
+flow in QEMU using disposable image files. It checks cancellation, target
+filtering, copied file bytes, standalone boot, apps and saves across reboot.
+Its framebuffer checks use the embedded font directly and need no OCR packages.
+
 At the `>` prompt: `help` lists shell commands, `ls APPS` shows the
 bundled WISP programs, and `run hello` (or `guess`, `oracle`,
 `adventure`, `xor_brain`, `tamer`, `counter`, `bounce`, `canvas`,
@@ -62,6 +91,9 @@ per-file `SHA256SUMS`), reproducibly -- an unchanged tree repackages to
 byte-identical archives, and `BOOTX64.EFI` itself builds byte-identically
 from the same source and toolchain (`.cargo/config.toml`), so the
 prebuilt binary can be checked against your own build.
+Pass `--iso` to `scripts/make_release.sh` to include the live ISO and its
+checksum in the release output. The source archives include the host test
+crate as well as the QEMU suites.
 
 To put this on a real USB stick and boot it on physical x86_64 hardware
 -- including exactly what the machine has to provide, and what is not
@@ -73,7 +105,9 @@ how each layer works, and the roadmap of expansion -- see `docs/MANUAL.md`.
 ## What it actually does at boot
 
 1. Starts as a UEFI application: opens GOP, reads `APPS/*.wisp` off the
-   FAT volume through UEFI's file protocols, locates the ACPI RSDP.
+   FAT volume and offers Try or Install. Try starts automatically after
+   four seconds; Install copies the live system only after confirmation.
+   It then locates the ACPI RSDP.
 2. Snapshots everything it will need, then calls `exit_boot_services()`.
    From this line on, nothing from the firmware is running: the RSDP
    address, the framebuffer pointer and the in-memory `APPS` snapshot
@@ -129,6 +163,8 @@ src/                  the kernel (no_std, no_main)
   save_format.rs             the hand-designed key/value store on disk
   gfx.rs / font.rs            direct-framebuffer console, 8x16 bitmap font
   fs.rs                        FAT32 reads via UEFI protocols (pre-exit)
+  installer.rs                 firmware boot menu, target selection and verification
+  disk_layout.rs               streaming GPT/FAT32 writer and save-partition discovery
   shell.rs                      the `>` prompt and its commands
   line_editor.rs                 cursor editing and history for every typed line
   libc_shims.rs                  freestanding `wcslen`
@@ -143,8 +179,11 @@ docs/
 esp/
   EFI/BOOT/BOOTX64.EFI      build output (produced by build.sh)
   APPS/*.wisp                the bundled WISP demo programs
-scripts/                 USB installers (Linux/macOS/Windows), make_release.sh
+scripts/                 USB installers, make_iso.sh, make_release.sh
 tests/
+  installer_test.py         live ISO installation and standalone boot in QEMU
+  iso_test.py               boot-image bytes, names and image-output safeguards
+  console_capture.py        exact framebuffer text decoding without OCR
   acceptance_test.py        end-to-end QEMU run, screenshot-verified
   fault_test.py              deliberate CPU faults -> fault screens
   ahci_test.py                storage bring-up and persistence

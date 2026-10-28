@@ -1,16 +1,16 @@
 # Save Disk Format (v2)
 
-This is the on-disk layout `src/save_format.rs` reads and writes on the
-second, AHCI-attached disk this kernel uses purely for persistent WISP
-program state (Phase 2, Part B -- see `CHANGES.md`). It exists because
-nothing else in this kernel can survive a reboot: `src/fs.rs` only ever
-reads `APPS/*.wisp` from the boot USB stick, once, before Boot Services
-are exited, and that disk is deliberately never written to (see
-`CHANGES.md`'s vvfat-corruption postmortem). `save()`/`load()` -- both
-the shell commands and the WISP builtins -- plus the shell's `keys` and
-`delete` are the only way anything in this project ever reaches this
-format, and this document is the spec `src/save_format.rs`'s own module
-doc comment implements.
+This is the on-disk layout `src/save_format.rs` uses for persistent WISP
+program state on an AHCI disk. It supports both legacy raw save disks
+and the dedicated GPT save partition created by the live installer. An
+installed AHCI disk can therefore hold the boot files and saved state
+without either region overwriting the other.
+
+Apps are still read into memory through firmware before Boot Services
+exit. Native persistence accesses only the selected save region;
+`save()`/`load()`, the shell's `keys` and `delete`, and explicit `format`
+operate on that region. This document specifies the save bytes and the
+ownership checks implemented by `src/save_format.rs`.
 
 If you only need to *use* persistence from a WISP script, you don't
 need this document -- see `save(key, value)`/`load(key)` in
@@ -28,25 +28,47 @@ Version-1 disks keep working -- see "Version 1" below.
 
 ## Why not a real filesystem
 
-Writable FAT32 needs synchronized dual FAT tables, cluster-chain
-allocation, and long-filename directory entries -- real engineering
-effort with no user-visible payoff. Nothing in this project needs a
-hierarchical filesystem: `APPS/*.wisp` is served from a read-only RAM
-snapshot of the boot stick that this format never touches (it lives
-entirely on the second, AHCI-attached disk), and a WISP script's saved
-state is just a handful of named values. A flat, fixed-slot key/value
-store is the simplest thing that can actually hold that across a
-reboot, and it's trivial to reason about: no allocation graph, no
-fragmentation, no partial update that has to be recovered.
+The installer creates a FAT32 boot volume, but normal shell and WISP
+execution serves `APPS/*.wisp` from its read-only RAM snapshot. A WISP
+script's persistent state is a handful of named values. A flat,
+fixed-slot key/value store keeps save updates simple to reason about:
+there is no allocation graph or fragmentation, and an interrupted save
+does not require filesystem recovery.
+
+## Selecting the save region
+
+The kernel's AHCI driver currently exposes its first usable SATA disk.
+A legacy raw store begins at physical LBA 0. On a partitioned disk, the
+save store must be inside a GPT partition with type GUID
+`7c2b7e91-51d0-4a2e-916e-574953505356`. The live installer creates this
+partition at physical LBA **133120**, immediately after its 64 MiB EFI
+System Partition, and initializes an empty version-2 store there.
+
+Before accepting a GPT save partition, discovery validates the primary
+header and partition-table CRCs, metadata geometry, every partition's
+bounds, and the absence of overlapping partitions. Duplicate or
+undersized WISP save partitions are rejected. Discovery supports at
+most 128 entries of 128 bytes each; an unsupported table is refused
+rather than guessed at. It does not repair corrupt GPTs or fall back to
+the backup header.
+
+An MBR disk without a valid WISP GPT partition, or a malformed GPT,
+cannot be formatted as a raw save disk. Disk selection and discovery are
+read-only. A blank or unpartitioned disk can still be explicitly
+provisioned as a legacy raw store. Native persistence requires AHCI;
+installing a bootable system through firmware onto NVMe or USB does not
+add a runtime driver for those devices.
 
 ## Sector and slot layout
 
 All addressing is in 512-byte logical sectors (LBAs), matching
-`src/ahci.rs`'s `SECTOR_SIZE`.
+`src/ahci.rs`'s `SECTOR_SIZE`. All LBAs below are **relative to the save
+region**, unless explicitly described as physical. Add the discovered
+region's starting LBA to obtain a physical disk address.
 
 ```
-LBA 0:              superblock (this one sector only)
-LBA 1 .. 1+64*8-1:   64 fixed-size slots, 8 sectors (4096 bytes) each
+Relative LBA 0:           superblock (this one sector only)
+Relative LBA 1 ..= 512:   64 fixed-size slots, 8 sectors (4096 bytes) each
 ```
 
 64 slots is deliberately small and fixed rather than derived from disk
@@ -55,7 +77,7 @@ size, which keeps every slot's LBA a simple constant calculation: slot
 keys**: one slot is always kept free so that an update can be written
 copy-on-write (see "Saving" below).
 
-### Superblock (LBA 0, 512 bytes)
+### Superblock (relative LBA 0, 512 bytes)
 
 | Offset | Size | Field | Value |
 | --- | --- | --- | --- |
@@ -68,42 +90,48 @@ copy-on-write (see "Saving" below).
 The magic names the store, not its layout -- that is the version
 byte's job -- so it stays `"WISPSAVE1"` in version 2.
 
-At boot the kernel only *reads* LBA 0 (`save_format::probe`). A disk is
-mounted for `save`/`load` only if its superblock matches completely:
-magic, a version this driver reads (1 or 2), slot count and slot size.
-Anything else is left byte-for-byte untouched and persistence stays
-unavailable for that boot:
+At boot `save_format::probe` only reads region-discovery metadata and
+the selected region's superblock. It mounts a store only if its
+superblock matches completely: magic, a supported version (1 or 2),
+slot count and slot size. All other content remains untouched:
 
-- all zeros -- a blank disk, or an interrupted `format` (see below);
-- any other bytes -- a partition table, another filesystem, a damaged
-  superblock: treated as someone else's data;
-- the WISP magic with any other version or geometry -- see
-  "Versioning" below; never silently reinterpreted.
+- an all-zero superblock is a blank store or an interrupted `format`;
+- other bytes in an eligible region are foreign data;
+- a partitioned disk without an eligible save region is foreign;
+- WISP magic with another version or geometry is unsupported, never
+  silently reinterpreted.
 
 ### Provisioning (`format`)
 
-The shell's `format` command is the only thing that ever writes outside
-an existing store. It prints the device (AHCI port, model, serial,
-size) and the exact range it will overwrite -- LBA 0-512, 256.5 KiB,
-including any partition table -- and proceeds only if the user types
-`ERASE`. `save_format::provision` then:
+The shell's `format` command checks region ownership, then prints the
+device's AHCI port, model, serial, capacity and exact physical sector
+range. It proceeds only if the user types `ERASE`. The overwritten
+range is always 513 sectors (256.5 KiB): physical LBA 0–512 on a raw
+store, or 133120–133632 on a disk using the installer's layout. A
+foreign partitioned disk is refused before the confirmation prompt.
 
-1. zeroes LBA 0 (invalidating any previous store) and flushes;
+`save_format::provision` then:
+
+1. zeroes the region's superblock, invalidating any previous store, and
+   flushes;
 2. zeroes every sector of all 64 slots and flushes;
 3. writes a version-2 superblock and flushes.
 
-The superblock is published last, so a power loss or write error at any
-earlier point leaves a disk that `probe` reports as blank or foreign --
-never one it accepts with stale slot contents.
+The superblock is published last, so a power loss or write error at an
+earlier point leaves a store that `probe` reports as blank or foreign,
+never one it accepts with stale slot contents. The installer initializes
+the same version-2 superblock and empty slots while creating a new disk.
 
-Everything outside LBA 0-512 is never read or written; every sector
-access goes through a range check against that region.
+Every save-data access is checked against relative LBA 0–512 before
+translation to a physical address. Reads needed to discover the GPT may
+fall outside that range; save writes and `format` cannot touch the
+partition table, EFI partition or any adjacent partition.
 
 ### Slot (4096 bytes = 8 sectors)
 
 A slot is either free or holds one *copy* of one key's value. The whole
 header fits in the slot's first sector, so scanning the store reads 64
-sectors, not 512.
+sectors, plus the metadata reads needed to discover the save region.
 
 | Offset | Size | Field |
 | --- | --- | --- |
