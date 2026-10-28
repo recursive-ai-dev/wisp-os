@@ -67,6 +67,9 @@ To put this on a real USB stick and boot it on physical x86_64 hardware
 -- including exactly what the machine has to provide, and what is not
 supported -- see `USB_INSTALL.md`.
 
+For everything in one place -- installing, operating, programming in WISP,
+how each layer works, and the roadmap of expansion -- see `docs/MANUAL.md`.
+
 ## What it actually does at boot
 
 1. Starts as a UEFI application: opens GOP, reads `APPS/*.wisp` off the
@@ -132,6 +135,7 @@ src/                  the kernel (no_std, no_main)
   wisp/                           lexer -> parser -> tree-walking interpreter
                                    (one Session per program, or per `wisp` prompt)
 docs/
+  MANUAL.md                the full manual: install, operate, program, internals, roadmap
   WISP_LANGUAGE.md        the complete WISP language reference
   WISP_GRAPHICS.md         the pixel/graphics primitives
   WISP_AI.md                running trained models as WISP forward-pass code
