@@ -2935,3 +2935,47 @@ scripted host; the UEFI build, its warnings and its frame sizes were
 checked, but the new binary has not been booted. Version, `SHA256SUMS`
 and the release archives are untouched: this is work after v1.1.0, for the
 next release to pick up, together with functions as values.
+
+## The manual (`docs/MANUAL.md`)
+
+One document that covers the whole system for four readers -- someone trying
+it, someone putting it on hardware, someone writing WISP, someone changing
+the kernel -- and ends with a roadmap of expansion (Part VI: eight horizons,
+fifty chapters in all, compatibility promises, non-goals, a release train, a
+dependency map and a risk register). It consolidates `README.md`,
+`USB_INSTALL.md` and the four reference documents rather than replacing them;
+where it disagrees with one of them, the specialised document wins.
+
+How it was checked, so its claims are as good as the code's:
+
+- Every WISP program and output in Part IV was run through the real
+  interpreter (`src/wisp`, compiled for the host by `tests/host`, with a
+  scripted `Host`): 13 code-block/output pairs are compared mechanically,
+  every other code block is run and must not fail, and every error message in
+  the error catalog came from running one broken program per row. The
+  transcripts of `hello`, `guess`, `calc`, `words`, `tasks`, `undo`,
+  `adventure`, `tamer` and `xor_brain` are real output. The temporary harness
+  used for this is not committed.
+- `cargo test --release` in `tests/host`: all 229 pass. `./build.sh` on
+  `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`: zero warnings, 308 KB.
+- The hardware limits it states (PCI bus 0 only, first xHCI and first AHCI
+  controller only, no xHCI BIOS ownership hand-off, no `reboot`/`poweroff`,
+  boot-time skips logged to the debug port only) were read from the source,
+  not assumed.
+- All internal links resolve.
+
+Found while writing it, and recorded in the manual's ledger (Chapter 38) and
+roadmap (Horizon 0) rather than changed here:
+
+- A UTF-8 byte-order mark at the start of a `.wisp` file fails to lex
+  (`unexpected character 'ï'`).
+- A condition that is a bare literal (`while 5 { }`) reports `line 0`.
+- Stale sentences in `docs/WISP_LANGUAGE.md` ("There is no `map`/`filter`",
+  a 4055-byte save limit that is 4047 in format version 2, "v2 is landing in
+  pieces"), in `docs/WISP_AI.md`, and in `esp/APPS/canvas.wisp`'s header.
+- There is no CI, and `rust-toolchain.toml` says plain `nightly`.
+
+Not verified: any real hardware; a QEMU boot of the post-v1.1.0 binary (the
+manual says so, and makes it the first roadmap item); the macOS and Windows
+installers; the roadmap's designs, which are proposals.
+
