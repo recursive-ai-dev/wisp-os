@@ -30,10 +30,10 @@ pub enum BinaryOp {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    IntLit(i64),
-    StrLit(Rc<String>),
-    BoolLit(bool),
-    NilLit,
+    IntLit(i64, u32),
+    StrLit(Rc<String>, u32),
+    BoolLit(bool, u32),
+    NilLit(u32),
     Var {
         name: Rc<String>,
         line: u32,
@@ -106,9 +106,8 @@ pub enum Expr {
 
 impl Expr {
     /// The source line this expression starts on, used for runtime error
-    /// reporting. Literals don't carry a line of their own (the parser
-    /// never needs to report an error rooted at a bare literal), so this
-    /// is only meaningful for the variants that do.
+    /// reporting. All expression variants now carry a line number to ensure
+    /// accurate error reporting even for bare literals used in conditions.
     pub fn line(&self) -> Option<u32> {
         match self {
             Expr::Var { line, .. }
@@ -121,7 +120,7 @@ impl Expr {
             | Expr::Index { line, .. }
             | Expr::Slice { line, .. } => Some(*line),
             Expr::Lambda(lambda) => Some(lambda.line),
-            Expr::IntLit(_) | Expr::StrLit(_) | Expr::BoolLit(_) | Expr::NilLit => None,
+            Expr::IntLit(_, line) | Expr::StrLit(_, line) | Expr::BoolLit(_, line) | Expr::NilLit(line) => Some(*line),
         }
     }
 }

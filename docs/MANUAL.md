@@ -55,7 +55,7 @@ It is written for four readers, and each can start in a different place:
   - [27. Memory](#27-memory)
   - [28. Interrupts, ACPI and the clock](#28-interrupts-acpi-and-the-clock)
   - [29. Input: PS/2 and USB](#29-input-ps2-and-usb)
-  - [30. Storage: PCI and AHCI](#30-storage-pci-and-ahci)
+  - [30. Storage: PCI, AHCI, NVMe and USB](#30-storage-pci-ahci-nvme-and-usb)
   - [31. The save format](#31-the-save-format)
   - [32. The console and framebuffer](#32-the-console-and-framebuffer)
   - [33. Failure modes and the fault screen](#33-failure-modes-and-the-fault-screen)
@@ -189,7 +189,7 @@ These principles are not decoration. Each one has already decided real questions
    and requires the word `ERASE`. (This is the lesson of audit finding AUD-01.)
 3. **Degrade, never hang.** Every hardware path has a failure mode that ends in a
    working shell and a sentence on the screen: no MADT means the 8259/PIT fallback;
-   no AHCI disk means `save`/`load` are disabled and say so; no USB keyboard means
+   no supported disk means `save`/`load` are disabled and say so; no USB keyboard means
    PS/2 only. A buggy script cannot crash the machine; Esc always stops it.
 4. **Measure, don't assume.** Stack frame sizes were read from assembly. Boot
    memory ownership was measured by walking live page tables. A hang bug was found
@@ -211,7 +211,7 @@ These principles are not decoration. Each one has already decided real questions
 | Line | Current position | How it could ever change |
 |---|---|---|
 | Networking | Absent by design | A written decision record in `CHANGES.md` plus an update to the README's foundation statement. Not a side effect of a driver. |
-| Writing to the boot stick | Never written | A new filesystem decision, tested against the vvfat-style corruption failure documented in `CHANGES.md`. |
+| Boot filesystem writes | The ESP stays read-only; a dedicated Wisp save partition may share the boot disk | Filesystem writes need a separate design and tests. |
 | Floating point | Absent | Ships together with FPU/SSE fault tests. |
 | LLM-scale inference | Out of scope | Nothing here is a path to it; the realistic ceiling is tiny verified models. |
 | Catchable Esc | Esc cannot be caught or ignored by a script | Never: always-available stop is a safety property. |
@@ -221,7 +221,7 @@ These principles are not decoration. Each one has already decided real questions
 | Term | Meaning |
 |---|---|
 | **ACPI / MADT** | Firmware tables. The kernel parses the MADT (Multiple APIC Description Table) to learn the interrupt topology. There is no AML interpreter. |
-| **AHCI** | The SATA controller interface. The only storage the kernel drives. |
+| **AHCI** | The SATA controller interface. NVMe and USB Bulk-Only storage are also driven natively. |
 | **APPS snapshot** | Every `APPS/*.wisp` file, read into RAM *before* Boot Services exit. `ls` and `run` serve from it. |
 | **Boot Services** | The services UEFI firmware offers while it is still in charge. Gone after `exit_boot_services()`. |
 | **debugcon** | QEMU's debug console port (`0xE9`). Boot and driver log lines go here. It exists only under QEMU; real hardware has no equivalent yet. |
@@ -229,6 +229,7 @@ These principles are not decoration. Each one has already decided real questions
 | **GOP** | UEFI Graphics Output Protocol: gives the kernel a linear framebuffer. |
 | **IST** | Interrupt Stack Table: a dedicated stack the CPU switches to for specific exceptions, such as double fault. |
 | **LAPIC / I/O APIC** | The per-CPU and external interrupt controllers that replace the legacy 8259 on modern machines. |
+| **NVMe / VMD** | PCIe storage; Intel VMD exposes another PCI configuration domain containing NVMe devices. |
 | **OVMF** | The open-source UEFI firmware QEMU uses. |
 | **PMM** | Physical Memory Manager: a bitmap of 4 KiB frames. |
 | **Session** | One WISP interpreter state: one per `run`, or one per `wisp` prompt. |
@@ -239,8 +240,8 @@ These principles are not decoration. Each one has already decided real questions
 
 ## 4. What the machine must provide
 
-Everything here is implemented and exercised by the test suites; anything not
-listed is not supported.
+The interfaces below are supported. Physical Intel VMD operation remains
+unverified; the verification ledger distinguishes hardware from emulator checks.
 
 | Component | Required | Notes |
 |---|---|---|
@@ -249,7 +250,7 @@ listed is not supported.
 | **Secure Boot** | Must be off | The binary is unsigned ([Chapter 9](#9-booting-real-hardware)). |
 | **Display** | A UEFI GOP framebuffer | Effectively universal. Resolution must fit an 8x16 text console. No GPU driver. |
 | **Keyboard** | PS/2 (or firmware emulation of it), **or** a USB HID *boot-protocol* keyboard on an **xHCI** root port | US layout only. No hubs, no hot-plug. |
-| **Storage (optional)** | An **AHCI** SATA controller with a disk | Only needed for `save`/`load`. NVMe and IDE-mode SATA are not supported. |
+| **Storage (optional)** | AHCI SATA, NVMe, or xHCI root-port USB BOT storage | Writable saves require native 512-byte sectors. Native 4 KiB NVMe/USB are read-only; no UAS, hubs or IDE-mode SATA. |
 | **Memory** | 256 MB is comfortable | The kernel heap is a fixed 8 MiB; the rest is frame-allocated for page tables and buffers. |
 | **Network** | None | By design. |
 
@@ -348,6 +349,7 @@ What it does, and the switches that matter:
 | *(none)* | Headless (`-display none`). The shell is still reachable through QEMU's monitor/serial machinery; this is how the test suites drive it. |
 | `UEFI_SHELL_DISPLAY=gui` | Opens a real window. **Use this for interactive play.** |
 | `UEFI_SHELL_USB_KBD=1` | Attaches a USB keyboard to the xHCI controller, so your keystrokes exercise the USB driver instead of PS/2. |
+| `WISP_SAVE_TRANSPORT=ahci\|nvme\|usb` | Chooses the save/install/installed disk image transport; default `ahci`. |
 | extra arguments | Passed through to QEMU (`./run.sh -m 512M`). |
 
 ```bash
@@ -356,7 +358,8 @@ UEFI_SHELL_DISPLAY=gui ./run.sh
 
 The emulated machine has: the `esp/` directory as a **read-only** USB mass-storage
 boot device (via vvfat, read-only on purpose, see below), an empty xHCI controller,
-a 64 MiB raw disk `save.img` on an AHCI controller, **no network** (`-net none`),
+a 64 MiB raw disk `save.img` on AHCI by default (or NVMe/USB with
+`WISP_SAVE_TRANSPORT`), **no network** (`-net none`),
 256 MB RAM, and a debug console written to `debug.log`.
 
 `save.img` is created on first run and never committed. It starts blank, so the first
@@ -365,9 +368,8 @@ Delete `save.img` for a fresh disk.
 
 **Why the stick is mounted read-only.** Mounting vvfat read-write silently corrupted
 the boot executable on the host between runs (47,738 of 90,624 bytes rewritten, found
-by a byte-for-byte comparison). The kernel never writes the boot volume, so read-only
-removes the whole class of failure. The project's rule since: *the boot stick is
-never written.*
+by a byte-for-byte comparison). The boot filesystem remains read-only. An installed USB disk may carry a
+separate Wisp save partition; native writes remain confined to that region.
 
 **OVMF paths.** `run.sh` prefers `/usr/share/OVMF/OVMF_CODE.fd` and falls back to
 `/usr/share/ovmf/OVMF.fd`. Ubuntu 24.04's `ovmf` package ships only split code/vars
@@ -426,8 +428,8 @@ UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.1.0-live.iso ./run.sh
 UEFI_SHELL_DISPLAY=gui WISP_BOOT_DISK=install.img ./run.sh
 ```
 
-Firmware can install and boot from NVMe or USB, but persistence after
-Boot Services still needs a supported AHCI disk. An interrupted install
+Installed save partitions can mount through native AHCI, NVMe or xHCI USB
+BOT drivers. Writable v2 saves require native 512-byte sectors. An interrupted install
 can leave its target unbootable; rerun installation from live media.
 See [USB_INSTALL.md](../USB_INSTALL.md) for the complete procedure.
 
@@ -443,6 +445,11 @@ or `./build.sh`).
 | Linux | `scripts/install_usb_linux.sh` | `parted`, `mkfs.vfat` (package `dosfstools`), root |
 | macOS | `scripts/install_usb_macos.sh` | `diskutil` (ships with macOS) |
 | Windows | `scripts/install_usb_windows.ps1` | PowerShell `Storage` module, Administrator |
+
+These scripts create FAT-only live boot media, without a Wisp save
+partition. Replacing their EFI file does not add persistence. Use the
+live installer on an eligible destination to create the ESP plus save
+partition; the resulting installed USB can persist through xHCI BOT.
 
 All three follow the same two-step pattern:
 
@@ -512,16 +519,16 @@ APPS/hello.wisp          (and any other .wisp files)
 | Setting | Needed value | Why |
 |---|---|---|
 | **Secure Boot** | **Disabled** | The binary is unsigned. A Secure Boot machine will refuse it, often by printing an invalid-image error or by silently falling through to the next boot device. Alternatively enrol your own signature for the binary; this project does not sign or manage enrolment. |
-| **SATA mode** | **AHCI** (not "IDE" / "Compatibility" / "RAID") | Persistence needs AHCI. IDE mode leaves the shell fully usable with `save`/`load` disabled, and it says so on screen. |
+| **SATA mode** | **AHCI** for SATA storage | IDE-mode SATA is unsupported. NVMe and supported Intel client VMD use their own native path. |
 | **CSM / Legacy boot** | Off or irrelevant | There is no BIOS path. |
-| **USB legacy support / xHCI hand-off** | Try both settings if USB input is dead | Not verified on hardware. The kernel does not implement the xHCI ownership hand-off ([Chapter 29](#29-input-ps2-and-usb)), so these firmware settings can change whether USB input works. On machines with no xHCI-visible keyboard, the firmware's PS/2 emulation is how typing works. |
+| **USB legacy support / xHCI hand-off** | Firmware dependent | The kernel requests OS ownership with a bounded timeout before resetting xHCI. Physical firmware variations remain unverified. |
 
 ### Before you boot on a machine with disks you care about
 
 Choosing Try Wisp never provisions a disk. Installation requires the
-separate `ERASE <number>` confirmation. The kernel selects the first
-usable AHCI device for persistence, mounts a valid Wisp save partition
-or legacy raw store, and otherwise leaves the disk alone. `format` shows
+separate `ERASE <number>` confirmation. The kernel probes native disks without writing. It selects a unique mounted
+Wisp store, otherwise a unique eligible format target. Ambiguous choices
+require `disks` and `disk <n>`; selection changes no disk contents. `format` shows
 the device and range and asks for `ERASE`; it refuses foreign partition
 tables rather than overwriting boot files. Read each displayed target
 carefully before confirming.
@@ -535,8 +542,8 @@ carefully before confirming.
 | Boots to OVMF's own "EDK II" shell (QEMU) | `BOOTX64.EFI` missing or corrupt | Re-run `./build.sh`. Never mount `esp/` read-write in QEMU. |
 | Shell appears, **typing does nothing** | Keyboard behind a hub/dock; hot-plugged after boot; USB keyboard on a non-xHCI controller | Plug the keyboard directly into a chassis port and power-cycle; try a PS/2 keyboard or enable firmware USB legacy emulation. |
 | Typing does nothing, and the boot screen says `USB: controller up, but no HID boot keyboard attached.` | The keyboard is not a *boot-protocol* HID device, is on a hub, or is not on a root port | Same as above. |
-| `save` says "no AHCI save disk available this boot" | No AHCI controller, or SATA set to IDE mode, or an NVMe-only machine | Set SATA to AHCI, or accept running without persistence. |
-| Boot says `AHCI disk is blank -- not formatted for WISP` or `AHCI disk holds non-WISP data` | A disk that is not a WISP save store (left untouched on purpose) | Run `format` if (and only if) you intend to dedicate that disk. |
+| `save` says "no save disk selected" | No supported disk or ambiguous candidates | Inspect `disks`, then select with `disk <n>`. |
+| Boot reports a blank/non-WISP disk | No mounted save store | `disks` shows eligibility. A FAT-only boot stick needs a separate Wisp partition from the live installer; `format` refuses foreign partitions. |
 | A fault screen with a red exception name and register dump | A genuine kernel fault | Photograph the screen and report the vector, RIP and CR2 ([Chapter 33](#33-failure-modes-and-the-fault-screen)). |
 | Screen is black after the firmware logo | Resolution too small for the 8x16 console, or no GOP | The kernel prints a fatal message through firmware text output if it cannot initialise the console. |
 | `ls` is empty | `APPS` missing, or all files over budget | Check the file names, sizes and the budgets in [Chapter 24](#24-limits-at-a-glance). |
@@ -566,6 +573,7 @@ AHCI controller found and ABAR mapped.
 AHCI disk identified: 'QEMU HARDDISK' on port 0, 131072 sectors (64 MiB).
 AHCI disk is blank -- not formatted for WISP. Left untouched; run 'format' to use it for save/load.
 USB: controller up, but no HID boot keyboard attached.
+Storage: selected disk 0: AHCI port 0.
 ===========================================================
  WISP OS v1.1.0 -- Minimal Custom Kernel Shell
  hand-built from firmware up; no network stack, by design
@@ -586,9 +594,11 @@ Type 'help' for a list of commands. Esc stops a running program.
 | `AHCI controller found and ABAR mapped.` / `AHCI disk identified: ...` | A SATA controller and disk were found. The model name, port and size printed are what `format` would erase. |
 | `AHCI save disk mounted (save/load available).` | The disk already carries a valid WISP store. |
 | `AHCI disk is blank ...` | Blank disk, left untouched. `format` provisions it. |
-| `AHCI disk holds non-WISP data. Left untouched ...` | A foreign disk (a partition table, another filesystem). Left untouched; **do not `format` it unless you mean to erase it.** |
+| `AHCI disk holds non-WISP data. Left untouched ...` | No mounted Wisp store. `format` refuses foreign partition tables; inspect `disks` before selecting a target. |
 | `AHCI disk has a WISP save store this version does not understand.` | A WISP store with an unknown version or geometry. Left untouched, never reinterpreted. |
-| `AHCI: ... (persistent storage unavailable)` | No usable AHCI controller or disk. `save`/`load` will say so. |
+| `AHCI: ... (checking other storage)` | AHCI is unavailable; NVMe and USB discovery still run. |
+| `NVMe disk identified: ...` / `USB disk identified: ...` | Native storage was discovered; its save probe and selection follow. |
+| `Storage: use ... to select a save disk` | Ambiguous candidates require `disks` and `disk <n>`. |
 | `USB HID keyboard ready.` | A USB boot keyboard was found on an xHCI root port and is being polled. |
 | `USB: controller up, but no HID boot keyboard attached.` | xHCI is fine; nothing keyboard-shaped was found. PS/2 still works. |
 | `USB: ... (PS/2 keyboard only).` | No xHCI controller or it failed to initialise. |
@@ -610,8 +620,9 @@ An unknown command prints `unknown command: <name>` in red.
 | `help` | List the commands. |
 | `clear` | Clear the screen. |
 | `echo <text>` | Print `<text>` back. |
-| `ls [APPS]` | List the in-memory snapshot of `APPS/*.wisp`, with sizes. |
-| `run <name>` | Run `APPS/<name>.wisp`. |
+| `ls [APPS\|PROGRAMS]` | List bundled apps and saved programs, or one origin. |
+| `run <name>` | Run a saved program, falling back to a bundled app. |
+| `ide [name]` / `edit [name]` | Open Wisp Studio to edit, save, check and run a program. |
 | `wisp` | Open the interactive WISP prompt. |
 | `uptime` | Time since boot. |
 | `mem` | Heap and physical-memory use. |
@@ -620,7 +631,9 @@ An unknown command prints `unknown command: <name>` in red.
 | `load <key>` | Print a saved value. |
 | `keys` | List every saved key. |
 | `delete <key>` | Remove a key. |
-| `format` | Provision the save disk. **Erases.** Asks first. |
+| `disks` | List native disks, mount/format state and the selected save disk. |
+| `disk <n>` | Select a disk for this boot without formatting. |
+| `format` | Provision the selected save region. **Erases.** Asks first. |
 
 There is no `reboot`, `halt` or `poweroff` command. To leave, use your machine's
 power button or the emulator's quit. (This is a roadmap item: [Chapter 42](#42-horizon-1-the-machine-gets-a-voice-and-a-door).)
@@ -634,17 +647,20 @@ Available commands:
   help          Show this list of commands
   clear         Clear the screen
   echo <text>   Print <text> back to the screen
-  ls [APPS]     List the in-memory APPS snapshot
-  run <name>    Run APPS/<name>.wisp (a WISP program)
+  ls [APPS|PROGRAMS] List bundled apps and saved programs
+  run <name>    Run a saved program or bundled WISP app
+  ide [name]    Wisp Studio: edit, save, check and run ('edit' also works)
   wisp          Interactive WISP prompt ('exit' to leave)
   uptime        Show elapsed time since boot (timer ticks)
   mem           Show heap and physical memory usage
   version       Show the kernel version and protections
-  save <k> <v>  Save <v> under key <k> on the AHCI save disk
+  save <k> <v>  Save <v> under key <k> on the selected save disk
   load <k>      Print the value saved under key <k>
   keys          List every key on the save disk
   delete <k>    Delete key <k> from the save disk
-  format        Set up the AHCI disk for save/load (ERASES it; asks first)
+  disks         List AHCI, NVMe and USB disks and the selected save disk
+  disk <n>      Select a disk for save/load (does not format it)
+  format        Set up the selected disk for saves (ERASES save region; asks)
 Press Esc to stop a running program. Arrows, Home, End and Delete edit
 a line; Up and Down recall earlier ones.
 ```
@@ -653,39 +669,79 @@ a line; Up and Down recall earlier ones.
 
 Prints everything after the first space, verbatim. `echo` alone prints a blank line.
 
-### `ls [APPS]`
+### `ls [APPS|PROGRAMS]`
 
-Lists the **APPS snapshot**: the files read into RAM at boot. Each line shows the
-file name and its size in bytes. `ls` and `ls APPS` are identical; any other path
-prints an honest error, because there is no live filesystem after boot:
+`ls` lists bundled apps from the **APPS snapshot** and saved programs from the
+save disk, with their origin. `ls APPS` shows only the boot-time snapshot,
+including sizes; `ls PROGRAMS` shows only saved sources. Other paths are unavailable:
 
 ```text
 > ls
-     adventure.wisp  (5338 bytes)
-     bounce.wisp  (2014 bytes)
+     adventure.wisp  (5338 bytes) [bundled]
+     bounce.wisp  (2014 bytes) [bundled]
      ...
+     main.wisp  [saved prog.main]
 > ls /somewhere
-ls: '/somewhere': no live filesystem after boot -- only the in-memory APPS snapshot is available (try 'ls' or 'ls APPS')
+ls: '/somewhere': no live filesystem after boot (try 'ls', 'ls APPS' or 'ls PROGRAMS')
 ```
 
 > **The snapshot is taken once, at boot.** A file you add to the stick afterwards,
-> or edit, does not appear until the next boot. This is the single most common
-> surprise for new users. See [Chapter 25](#25-getting-programs-onto-the-machine).
+> or edit on another computer, does not appear until the next boot. Programs saved
+> in Studio are available immediately. See [Chapter 25](#25-getting-programs-onto-the-machine).
 
 ### `run <name>`
 
-Runs a WISP program from the snapshot. The name may be written with or without the
+Runs a saved WISP program, or a bundled app if no saved program has that name.
+The name may be written with or without the
 `.wisp` extension, and matching ignores case: `run guess`, `run guess.wisp` and
 `run GUESS` are the same program.
 
 - Without a name: `run: expected a program name, e.g. 'run hello'`.
-- Unknown name: `run: '<name>.wisp' not found in the APPS snapshot`.
+- Unknown name: `run: '<name>.wisp' not found in bundled apps or saved programs`.
 - A parse or runtime error ends the program with one line in the form
   `wisp: line N: <message>`, and you are back at `>`.
 - **Esc stops the program** at any moment ([Chapter 14](#14-stopping-a-program)).
 
 Each `run` is a fresh interpreter: global variables do not survive from one run to
 the next. (Use `save`/`load` for that, [Chapter 15](#15-persistence-saving-data).)
+
+### `ide [name]` / `edit [name]`: Wisp Studio
+
+Opens the full-screen editor on `main` by default. `ide hello` opens the saved
+`hello` program, or the bundled `hello.wisp` if no saved copy exists; an unknown
+name starts an empty program. Names are case-insensitive: 1-27 ASCII letters,
+digits, underscores or hyphens, with an optional `.wisp` suffix.
+
+Studio shows line numbers, syntax colors, cursor position and byte count.
+Arrows, Home/End, Page Up/Down, Backspace and Delete move through and edit the
+source. Enter carries indentation to the new line and adds four spaces after
+`{`; Tab inserts spaces to the next four-column stop. The viewport follows the
+cursor vertically and horizontally. Non-ASCII text is preserved but displayed as `?`.
+
+| Key | Action |
+|---|---|
+| F1 | Show help; any key returns. |
+| F2 | Save the whole source as `prog.<name>`. |
+| F3 | List bundled and saved names; type a name to open or create it. Esc cancels. |
+| F5 | Run the current buffer in a fresh interpreter session. Esc stops it; any key returns from output to the editor. |
+| F6 | Check syntax without running. |
+| F10 / Esc | Leave Studio. |
+
+Syntax and runtime errors select the reported source line. Opening another
+program or leaving with unsaved changes offers **S**ave, **D**iscard or **Esc** to
+cancel; a failed save keeps the buffer open. The `*` beside the name marks changes.
+
+Saving needs a formatted selected save disk with native 512-byte sectors. If the disk is blank, leave Studio and
+use the shell's `format` command first ([Chapter 15](#15-persistence-saving-data)).
+Without persistence, editing, checking and running still work in memory. Studio
+holds at most **16 KiB**, while each existing save slot holds **4042 source bytes**.
+A larger buffer is never truncated: saving reports an error and preserves it.
+
+Saved source survives reboot and takes precedence over a bundled app of the same
+name. `APPS` files on the boot volume remain unchanged. Use `ls PROGRAMS` to find
+saved sources, `run <name>` to run one from the shell, or `delete prog.<name>` to
+remove it. Programs share the existing 63-key store with application data. Studio
+currently edits one buffer at a time and has no source export command.
 
 ### `wisp`
 
@@ -760,6 +816,7 @@ Every line of typed input (the `>` prompt, the `wisp>` prompt, and a program's
 | A `...` continuation prompt | Discards the whole unfinished input. |
 | Inside a program's `input()` | Stops the program; the half-typed line is discarded. |
 | Anywhere a program is running | Stops the program ([Chapter 14](#14-stopping-a-program)). |
+| Wisp Studio | Leaves the editor, offering Save / Discard / Cancel for unsaved changes. |
 
 **Limits.** A line is at most 1024 characters; further keystrokes are ignored.
 History keeps the last 32 lines at the shell prompt. The `wisp>` prompt keeps its own
@@ -768,9 +825,9 @@ next until the machine restarts. The editor handles lines longer than the screen
 width and screens that scroll while you type.
 
 **Layout.** The keyboard tables are **US layout only**, scancode set 1 for PS/2 and
-the HID usage table for USB. Shift works. Caps Lock, Num Lock, Scroll Lock, Ctrl,
-Alt and function keys are recognised and discarded rather than mis-decoded, and Tab reaches the
-line editor as a byte it ignores.
+the HID usage table for USB. Shift works. Caps Lock, Num Lock, Scroll Lock, Ctrl
+and Alt are recognised and discarded rather than mis-decoded. F1-F10 and Page
+Up/Down reach Studio on both keyboards; ordinary line prompts ignore them and Tab.
 Characters outside printable ASCII cannot be typed. (Other layouts: Part VI.)
 
 **Display.** The console is an 8x16 bitmap font drawn straight into the
@@ -805,9 +862,12 @@ available. `primes.wisp` and `stopwatch.wisp` exist to be stopped this way.
 
 ### The model
 
-Persistent data lives in a **Wisp save partition** on an installed AHCI
-disk, or in a legacy raw store on a separate AHCI disk when booted live.
-The live boot medium is read once and never written. The save region
+Persistent data lives in a **Wisp save partition** on an installed AHCI,
+NVMe or xHCI USB BOT disk, or in a legacy raw store on an eligible separate
+disk. The boot FAT filesystem stays read-only; a dedicated save partition
+may share an installed boot USB. Writable v2 saves require native 512-byte
+sectors. Native 4 KiB NVMe/USB media are read-only because 512-byte commit
+records would share native blocks. The save region
 holds a **key/value store**:
 
 - keys are strings of 1 to 32 bytes (no NUL bytes);
@@ -824,13 +884,17 @@ right call and exactly how a save survives a power cut.
 
 ### First-time setup: `format`
 
-The live installer initializes its save partition, so installed AHCI
-systems can use `save`/`load` immediately. A separate blank disk used by a
-live session must first be provisioned with `format`:
+The live installer initializes its save partition on supported 512-byte
+AHCI, NVMe or USB disks. `disks` lists candidates; `disk <n>` selects one
+without writing. Boot selects a unique mounted store, otherwise a unique
+format-eligible disk; ambiguous choices require manual selection. A blank
+raw disk needs `format` first. A FAT-only boot stick has no save region,
+and `format` refuses its foreign partition table: use the live installer
+on an eligible destination to create an ESP plus save partition. Example:
 
 ```text
 > format
-format: this ERASES sectors 0-512 (256 KiB, including any partition table) of:
+format: this ERASES sectors 0-512 (256 KiB) of:
   AHCI port 0  model 'QEMU HARDDISK'  serial 'QM00001'  64 MiB
 Type ERASE to continue, anything else to cancel:
 ```
@@ -917,7 +981,8 @@ What it does *not* promise:
 
 | Message (summary) | Meaning |
 |---|---|
-| `no AHCI save disk available this boot` | No AHCI controller/disk was found at boot. |
+| `no save disk selected` | No supported disk or ambiguous candidates; inspect `disks` and choose with `disk <n>`. |
+| Native 4 KiB media refused for saves | Read-only support; writable v2 saves require native 512-byte sectors. |
 | Not mounted / blank / foreign | The disk has no valid WISP store; `format` provisions it. |
 | key empty or longer than 32 bytes | Pick a shorter key. |
 | value too large for one slot | The encoding exceeds 4047 bytes. Split it across keys. |
@@ -1754,9 +1819,9 @@ the loop.
 7. **`int("12a")` is an error**, and there is no `try`. Validate first.
 8. **Integer overflow stops the program.** Factorials past 20! do.
 9. **Named functions don't see caller locals.** Pass arguments, use globals, or write a closure.
-10. **A UTF-8 byte-order mark** at the start of a file breaks the lexer
-    (`unexpected character 'ï'`). Save program files as UTF-8 *without BOM*
-    ([Chapter 25](#25-getting-programs-onto-the-machine)).
+10. **A UTF-8 byte-order mark** at the start of a file was **fixed** to be silently skipped.
+    Both BOM-prefixed and ordinary UTF-8 files now work correctly. See the verification
+    ledger in [Chapter 38](#38-verification-ledger).
 
 ### Syntax traps
 
@@ -2399,6 +2464,9 @@ allocation.
 | Save key | 1-32 bytes | error |
 | Save value encoding | 4047 bytes | error |
 | Save keys | 63 | error |
+| Studio program name | 1-27 ASCII letters, digits, `_` or `-` | error |
+| Studio buffer | 16 KiB | open or insertion rejected without truncation |
+| Saved program source | 4042 bytes | save fails; editor buffer remains intact |
 | Kernel heap | 8 MiB (fixed) | |
 | Mainline stack | 1 MiB (guard-paged) | |
 | Typed line | 1024 characters | extra keystrokes ignored |
@@ -2412,7 +2480,20 @@ The bundled programs total 41,532 bytes, about 4% of the 1 MiB snapshot budget.
 
 ## 25. Getting programs onto the machine
 
-### The workflow today
+### Writing inside Wisp
+
+Run `ide main`, type a WISP program, press F6 to check syntax and F5 to run it.
+F2 saves it on the formatted selected disk as `prog.main`. After leaving Studio or
+rebooting, `run main` runs the saved source. F3 opens a different name or creates
+a new program; `edit` is an alias for `ide`. See the full key list and limits in
+[Chapter 12](#12-the-shell).
+
+The source limit is 4042 bytes for persistence and 16 KiB for an editor buffer.
+Opening a bundled example and saving it creates a saved override; it never writes
+to the boot stick. `delete prog.<name>` removes that override. Exporting source
+from the save store is future work.
+
+### Importing from another computer
 
 1. Write a program in any text editor on any computer.
 2. Save it as `something.wisp` (the extension match ignores case).
@@ -2420,17 +2501,18 @@ The bundled programs total 41,532 bytes, about 4% of the 1 MiB snapshot budget.
    Only files directly in `APPS` are read: subfolders are skipped.
 4. **Reboot** from the stick. The snapshot is taken once, as the last act before Boot
    Services exit.
-5. `ls` to confirm it is there, `run something` to run it.
+5. `ls APPS` to confirm it is there, `run something` to run it.
 
-To iterate faster, develop in QEMU (`./run.sh` re-reads `esp/APPS` on every start) or at
-the `wisp>` prompt, then copy the finished program to the stick.
+To iterate, use Studio or the `wisp>` prompt, or develop in QEMU (`./run.sh`
+re-reads `esp/APPS` on every start). A saved program of the same name takes
+precedence over an imported app; remove its `prog.<name>` key to run the imported version.
 
 ### Format rules
 
 | Rule | Detail |
 |---|---|
 | Encoding | UTF-8. A file that is not valid UTF-8 is skipped. |
-| **No BOM** | A UTF-8 byte-order mark at the start of the file makes the lexer fail with `unexpected character 'ï'`. Save as "UTF-8" without BOM. (Some Windows editors add one by default.) |
+| **BOM tolerated** | A UTF-8 byte-order mark at the start of the file is silently skipped. Both BOM-prefixed and standard UTF-8 files work. (Some Windows editors add one by default.) |
 | Line endings | LF and CRLF both work (verified). Tabs are fine. |
 | Name | At most 64 bytes, ending in `.wisp`. Long (VFAT) names work. |
 | Size | At most 256 KiB each, 1 MiB for all, 64 files. |
@@ -2517,7 +2599,10 @@ layer. For the full reasoning behind any decision, the matching section of
 | `keyboard.rs` | 318 | PS/2 driver, shared key queue, Esc stop-request flag |
 | `xhci.rs` | 1655 | xHCI host controller: rings, slots, enumeration, transfers |
 | `usb_hid.rs` | 219 | HID boot keyboard report decoding, polling loop |
-| `pci.rs` | 235 | Legacy config-space access, bus-0 enumeration |
+| `pci.rs` | current | Cached PCI buses, client VMD domains and 64-bit BAR translation |
+| `nvme.rs` / `nvme_format.rs` | current | Polled NVMe queues, namespaces and LBA validation |
+| `usb_storage.rs` / `usb_bot.rs` | current | USB disk handles and Bulk-Only SCSI wire helpers |
+| `storage.rs` / `storage_policy.rs` | current | Shared sector interface and explicit disk selection |
 | `ahci.rs` | 1043 | AHCI SATA driver, IDENTIFY, command recovery, flush |
 | `save_format.rs` | 972 | The key/value store: probe, provision, save, load, delete |
 | `gfx.rs` / `font.rs` | 584 / 134 | Framebuffer console, 8x16 bitmap font |
@@ -2578,13 +2663,11 @@ The order is not cosmetic: several steps would fault, hang or corrupt if reorder
     interrupts-disabled section mask the 8259, hand EOI ownership to the LAPIC, unmask
     the routes and drain any PS/2 byte that arrived during the switch. Any failure
     before that section leaves the 8259/PIT path live, and says so.
-15. Enumerate **PCI bus 0**.
-16. Bring up the **save disk** (AHCI): find the controller, IDENTIFY the first disk,
-    read LBA 0 only, and *probe* for a store. Never writes.
-17. Bring up **USB**: find an xHCI controller, enumerate a boot keyboard on a root port,
-    install it as a second input source.
-18. Hand the machine to the shell: print the banner, emit the `[shell] ready` marker on
-    the debug port, and loop forever.
+15. Enumerate firmware-assigned **PCI buses and supported Intel client VMD domains**.
+16. Start xHCI input and storage, AHCI, and NVMe. Identify native disks and
+    probe for Wisp saves without writes. Select a unique mounted store or
+    eligible format target; ambiguous choices require manual selection.
+17. Start the shell with the disk inventory and APPS snapshot.
 
 There is no return path to firmware. The only ways out are a panic or CPU exception
 (which draw the fault screen and halt) and the power button.
@@ -2597,7 +2680,7 @@ There is no return path to firmware. The only ways out are a panic or CPU except
 |---|---|---|
 | **Heap** (`allocator.rs`) | Bytes. 8 MiB fixed arena in `.bss`. | Every `Vec`, `String`, `Rc`, the APPS snapshot, the interpreter's whole world. |
 | **PMM** (`pmm.rs`) | 4 KiB frames, a bitmap over every usable page. | Page-table pages and DMA structures (one whole frame each so alignment is free). |
-| **Paging** (`paging.rs`) | Maps virtual to physical. Identity mapping. | MMIO windows (AHCI, xHCI) are mapped as needed. |
+| **Paging** (`paging.rs`) | Maps virtual to physical. Identity mapping. | MMIO windows (AHCI, NVMe, VMD, xHCI) are mapped as needed. |
 
 ### The heap
 
@@ -2727,8 +2810,9 @@ IRQ1, scancode set 1 (what every controller speaks unless reprogrammed). The han
 the 8042 only when the status register says the output buffer is full and the byte is not
 from the auxiliary (mouse) port. It tracks Shift, decodes printable ASCII through two
 tables (unshifted and shifted, US layout), turns the `0xE0`-prefixed arrows, Home, End and
-Delete into the line editor's key codes (`0x80`-`0x86`, above anything ASCII can produce),
-and **discards** everything else (function keys, Ctrl/Alt, lock keys, the "fake shift"
+Delete into the line editor's key codes (`0x80`-`0x86`, above anything ASCII can produce).
+Page Up/Down use `0x87`-`0x88`, and F1-F10 use `0x90`-`0x99`; USB uses the same codes.
+It **discards** other unsupported keys (Ctrl/Alt, lock keys, the "fake shift"
 codes some keyboards wrap arrows in) rather than mis-decode it.
 
 The queue and Esc: Esc sets a **stop-request flag** that the interpreter polls; it is also
@@ -2763,24 +2847,25 @@ Built from scratch against the xHCI 1.2 specification:
 | **No hubs** | A keyboard behind a hub, dock or monitor is invisible. |
 | **No hot-plug** | Ports are scanned once. A keyboard plugged in later is only noted in the log. |
 | **Boot-protocol keyboards only** | No HID report-descriptor parser, so no mice, gamepads or exotic keyboards. |
-| **First xHCI on PCI bus 0 only** | See Chapter 30; a controller on another bus is not found. |
-| **No xHCI BIOS-to-OS ownership handoff** | The driver does not request ownership through the controller's USB Legacy Support extended capability. Many firmwares release the controller at exit; some may not. On a machine where USB input is dead but PS/2 emulation works, this is a candidate cause (unproven). |
+| **First xHCI controller only** | Assigned downstream PCI buses are scanned; additional controllers are not driven. |
+| **Firmware-specific ownership quirks** | OS ownership is requested with a bounded timeout before reset; physical firmware variations need testing. |
 | **EHCI/OHCI/UHCI not driven** | Pre-xHCI machines depend on firmware PS/2 emulation. |
 
-## 30. Storage: PCI and AHCI
+## 30. Storage: PCI, AHCI, NVMe and USB
 
 ### PCI
 
-`pci.rs` uses the legacy configuration mechanism (ports `0xCF8`/`0xCFC`) and enumerates
-**bus 0 only**, with no recursion through PCI-to-PCI bridges and no ECAM/MCFG. Each
-function is classified by class/subclass/programming-interface. AHCI is `01:06:01`.
+`pci.rs` scans firmware-assigned conventional buses through `0xCF8`/`0xCFC`,
+including devices behind bridges. It maps supported Intel client VMD
+configuration domains, including `8086:467f`, with relative bus addressing
+and 32/64-bit BAR translation. The bounded inventory is cached. Discovery
+preserves bridge numbering and BAR assignments. General ACPI MCFG segments
+and assigning unconfigured resources remain future work. Physical VMD
+operation is unverified.
 
-Why this was acceptable: chipset AHCI controllers and, usually, xHCI controllers live on
-bus 0. **The consequence for real hardware is real:** a SATA or USB controller that
-firmware places behind a bridge (some add-in cards, some AMD and server layouts,
-Thunderbolt-attached controllers) is not found, and the kernel reports "no xHCI/AHCI
-controller found on PCI bus 0". Both drivers also use only the **first** matching
-controller. Full enumeration is a roadmap item.
+The first matching AHCI controller supplies its first SATA disk; the first
+NVMe controller supplies a supported active namespace. The first xHCI
+controller supplies a keyboard and up to four root-port BOT disks.
 
 ### AHCI (`ahci.rs`)
 
@@ -2799,8 +2884,36 @@ Built against AHCI 1.3.1:
   *before touching MMIO or DMA memory*, and the frames stay allocated.
 - **`flush_cache`** issues FLUSH CACHE EXT (or FLUSH CACHE), chosen from IDENTIFY. `save`
   reports success only after the write and the flush.
-- Every sector access goes through `save_format::region_lba`, which rejects anything
-  outside LBA 0-512.
+- Save-sector operations are bounded to the detected Wisp region: a dedicated
+  GPT save partition or the legacy raw store.
+
+### NVMe (`nvme.rs`)
+
+The driver resets and enables a controller, identifies an active NVM
+namespace, creates one admin queue pair and one I/O queue pair, and polls
+completions. Read, Write and Flush have bounded waits, completion identity
+checks, phase-tagged queue wraps and pinned DMA frames. Failed controllers
+refuse reuse; frames are freed only after acknowledged disable. Native
+512-byte and 4 KiB namespaces are readable, but the save layer refuses
+writes on 4 KiB-native media because v2 commit records share native blocks.
+
+### USB storage (`xhci.rs`, `usb_storage.rs`, `usb_bot.rs`)
+
+Root-port interface class/subclass/protocol `08/06/50` uses bulk-IN/OUT rings
+and SCSI Bulk-Only Transport. Discovery uses INQUIRY, readiness/sense and
+READ CAPACITY. I/O uses READ/WRITE(10) or (16), with SYNCHRONIZE CACHE for
+durability. LUN0, up to four disks and one command at a time are supported.
+Keyboard completions are retained while storage waits. UAS, hubs and
+hot-plug are not implemented. Native 4 KiB devices are readable but cannot
+hold writable v2 saves.
+
+### Choosing a save disk
+
+`storage.rs` provides the same 512-byte sector API for each transport.
+Boot probes without writes. A unique formatted Wisp store is selected;
+otherwise a unique format-eligible disk is selected. `disks` and `disk <n>`
+resolve ambiguous candidates. Selection never formats. `format` still
+names the target and requires `ERASE`, and refuses foreign partitions.
 
 ## 31. The save format
 
@@ -2910,7 +3023,7 @@ the same style of screen with the panic message. **Photograph it** and report th
 | Native stack exhaustion by deep recursion | Impossible by construction (nesting budget); a stray overflow hits the guard page | host tests; `fault_test` |
 | Breakpoint / page fault / double fault / write to read-only data / jump into data | Fault screen with the right vector and `cr2` | `fault_test.py` (six hooks) |
 | No MADT / bad LAPIC | Falls back to 8259/PIT, says so | `usb_test` `no_xhci`, `apic` |
-| No AHCI controller / no disk | `save`/`load` disabled, says so | `ahci_test` `no_controller`, `controller_no_disk` |
+| No AHCI controller / no disk | Other native transports are still checked; no candidate disables persistence | `ahci_test` `no_controller`, `controller_no_disk` |
 | Foreign or damaged disk | Left byte-for-byte untouched | `ahci_test` `foreign_disk_untouched` (hashes the whole image) |
 | AHCI command timeout | Port recovery; a port that cannot be proven quiet is marked failed and refuses further work | Implemented to the AHCI spec; no injected-timeout test is recorded |
 | Kernel panic | `panic = "abort"`, fault screen, halt | `panic-screen-smoke-test` feature build |
@@ -3066,8 +3179,11 @@ a mounted filesystem. Release source archives now include the complete
 
 | Layer | Where | Count | Runs on |
 |---|---|---|---|
-| Host unit and behaviour tests | `tests/host/tests/*.rs` | 240 | any PC, seconds |
+| Host unit and behaviour tests | `tests/host/tests/*.rs` | language, saves, layout, editor and driver formats | any PC, seconds |
 | Fault injection | `tests/fault_test.py` | 6 hook scenarios | QEMU |
+| NVMe storage | `tests/nvme_test.py` | namespaces, bridged controller, persistence, foreign/4 KiB media protection | QEMU |
+| USB storage | `tests/usb_storage_test.py` | BOT saves/reboot, USB keyboard coexistence, USB-only GPT boot, media/write failures | QEMU |
+| Disk selection | `tests/storage_selection_test.py` | ambiguous candidates, explicit selection, independent stores across reboot | QEMU |
 | Storage | `tests/ahci_test.py` | `no_controller`, `controller_no_disk`, `full_stack`, `foreign_disk_untouched`, `legacy_v1_store` | QEMU |
 | Interrupts and USB | `tests/usb_test.py` | `apic`, `no_xhci`, `xhci_no_device`, `usb_keyboard` | QEMU |
 | End to end | `tests/acceptance_test.py` | 55 numbered checks: steps 1-24 plus second-boot persistence | QEMU |
@@ -3090,6 +3206,12 @@ decode `src/font.rs` directly using `tests/console_capture.py`, so this
 suite needs neither Pillow nor Tesseract. Other QEMU suites retain their
 existing image/OCR dependencies.
 
+Run `python3 tests/nvme_test.py --skip-build`,
+`python3 tests/usb_storage_test.py --skip-build`, and
+`python3 tests/storage_selection_test.py --skip-build` after `./build.sh`
+for native transport and selection checks. These use disposable regular
+images, exact-font screen decoding and no host block-device writes.
+
 ### Host tests
 
 | File | Tests | Covers |
@@ -3103,6 +3225,10 @@ existing image/OCR dependencies.
 | `line_editor.rs` | 8 | Editing against a simulated character grid, keystroke by keystroke |
 | `disk_layout.rs` | 7 | GPT/FAT32 and long names, installation IDs, validation before writes, interrupted writes, readback corruption |
 | `save_partition.rs` | 4 | Save-partition isolation, raw API offsets, foreign MBR and malformed GPT refusal |
+| `editor.rs` / `projects.rs` | current | Text-buffer boundaries and saved program persistence |
+| `pci.rs` | current | Sparse bus discovery, VMD windows, BAR translation and interrupt takeover |
+| `nvme_format.rs` / `usb_bot.rs` | current | Native formats, descriptors, command wrappers and bounds |
+| `storage_policy.rs` | current | Ambiguous stores, format eligibility and failed devices |
 
 The tests use a **counting global allocator** to assert that runs return to the same live-byte
 count (leak detection) and run deep-recursion cases on a deliberately small thread stack, which
@@ -3163,8 +3289,9 @@ What has been exercised, and what has not, as of this manual.
 
 | Claim | Evidence |
 |---|---|
-| 240 host tests pass | Original 229 language/save/editor tests plus seven disk-layout and four save-partition tests. |
+| Earlier 240-test host baseline | Original 229 language/save/editor tests plus seven disk-layout and four save-partition tests; newer driver/editor checks are listed in Chapter 36. |
 | Live ISO installs a standalone system | `tests/installer_test.py`: cancelled and undersized targets unchanged, EFI/apps byte-identical, GPT/FAT validated, installed disk boots and runs `xor_brain`, saves survive reboot, boot disk excluded from install targets. |
+| NVMe, USB and selection checks pass | `nvme_test.py`: direct/bridged namespaces, persistence and protected media; `usb_storage_test.py`: BOT saves, keyboard coexistence, USB-only GPT boot and errors; `storage_selection_test.py`: ambiguity and independent stores across reboot. |
 | Current AHCI storage stack passes QEMU checks | All five `tests/ahci_test.py` scenarios passed, using exact bitmap text decoding for screenshots: missing controller, empty controller, full stack, foreign disk untouched and legacy-v1 upgrade. |
 | The kernel builds with zero warnings | Run for this manual with `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`: `./build.sh` finished, no warnings, `BOOTX64.EFI` 308 KB. |
 | v1.1.0 passes the QEMU suites | Recorded in `CHANGES.md`: fault, ahci and usb suites pass every scenario; acceptance runs to its last step with every OCR check passing (nightly 2026-10-19). |
@@ -3178,13 +3305,13 @@ What has been exercised, and what has not, as of this manual.
 
 | Item | Why it matters |
 |---|---|
-| **Any real hardware** | No physical machine has run this. All hardware claims are QEMU/OVMF. Biggest open risk. |
+| **New native storage drivers on physical hardware** | QEMU checks do not establish operation on the physical Intel VMD machine or real USB devices. VMD remains unverified. |
 | **`tasks` and `undo` in QEMU** | Functions and closures have host coverage; the installed binary boots in QEMU and runs `xor_brain`, but these two apps still lack a QEMU acceptance step. |
 | macOS and Windows installers | Never executed on real systems. |
 | LA57 / 5-level paging path | No OVMF build enables it. |
 | xHCI behaviour with real keyboards of every descriptor shape | QEMU's `usb-kbd` only. |
 | AHCI timeout recovery on real hardware | Designed against the spec, not hardware-injected. |
-| Behaviour with more than one AHCI disk | Only the first is used; foreign-disk safety is tested, selection is not. |
+| Multiple controllers or AHCI ports | The first AHCI disk is exposed. Selection across the discovered AHCI/NVMe/USB candidates is tested, but extra AHCI controllers/ports are not driven. |
 
 ### Known documentation inconsistencies
 
@@ -3202,13 +3329,16 @@ The older documents were written as the project grew; these sentences are now st
 
 ### Known defects found while writing this manual
 
-| Defect | Evidence | Severity |
-|---|---|---|
-| A UTF-8 **BOM** at the start of a `.wisp` file fails to lex | `unexpected character 'ï'` on line 1 | Low, but trips Windows users; fix is one line in the lexer or the snapshot reader. |
-| A bare-literal condition reports **`line 0`** | `while 5 { }` gives `wisp: line 0: expected bool here...` because literals carry no line | Cosmetic; fix by passing the statement's line. |
-| Programs skipped at boot are **silent on real hardware** | Reasons go to the debug port only | Usability; needs an on-screen or serial log. |
+| Defect | Evidence | Severity | Status |
+|---|---|---|---|
+| A UTF-8 **BOM** at the start of a `.wisp` file fails to lex | `unexpected character 'ï'` on line 1 | Low, but trips Windows users; fix is one line in the lexer or the snapshot reader. | **Fixed** (Chapter 38 fix) |
+| A bare-literal condition reports **`line 0`** | `while 5 { }` gives `wisp: line 0: expected bool here...` because literals carry no line | Cosmetic; fix by passing the statement's line. | **Fixed** (Chapter 38 fix) |
+| Programs skipped at boot are **silent on real hardware** | Reasons go to the debug port only | Usability; needs an on-screen or serial log. | Open |
 
-None of these affect safety; all are cheap and are scheduled in [Chapter 41](#41-horizon-0-trust-the-release).
+The first two defects have been addressed: the lexer now skips an initial UTF-8 BOM,
+and all expression literals carry their source line number for accurate error reporting.
+Both fixes are covered by new regression tests and all 291 host tests pass.
+The third defect remains open and is scheduled in [Chapter 41](#41-horizon-0-trust-the-release).
 
 ## 39. Security and threat model
 
@@ -3266,17 +3396,17 @@ machine" into a procedure that produces a *useful* report whether it works or no
 - Prepare the stick with a release archive's prebuilt binary and `sha256sum -c SHA256SUMS`.
 - Put a **PS/2 or USB keyboard directly into the chassis**. Have a phone ready to take photos:
   there is no serial output yet, so the screen is your only log.
-- In firmware setup: **Secure Boot off**, SATA mode **AHCI**.
+- In firmware setup: **Secure Boot off**; SATA mode **AHCI** if using SATA. Supported Intel client VMD has a native discovery path.
 
 ### Known real-hardware risks, in the order they are likely to bite
 
 | Risk | Symptom | First check |
 |---|---|---|
 | Secure Boot on | Firmware refuses or skips the stick | Disable it |
-| Controller not on PCI bus 0 | `no xHCI controller found on PCI bus 0` / no AHCI | Note the vendor/model; this needs the bridge-walking enumeration (roadmap) |
-| xHCI owned by firmware (no handoff) | Shell appears, no USB key works, PS/2 emulation does or doesn't | Try a PS/2 keyboard or firmware "legacy USB" option |
+| Controller/resources not discovered | No supported controller or disk | Assigned conventional buses and supported VMD are scanned; report other segments or unassigned resources |
+| xHCI ownership timeout | USB reports firmware did not release ownership | Try PS/2 and report exact firmware/controller details |
 | Keyboard behind a hub or dock | No input | Plug directly into the chassis |
-| NVMe-only machine | `AHCI: ... (persistent storage unavailable)` | Expected; persistence is unavailable until an NVMe driver exists |
+| NVMe/VMD hardware variation | NVMe initialization fails or disk is absent | Native NVMe and supported VMD exist; physical VMD remains unverified. Record storage lines |
 | Very large reserved or MMIO ranges in the memory map | Slow or failed boot at the "Exiting UEFI Boot Services" step, or `paging` running out of frames | Page tables use 4 KiB pages only: mapping a 12 GiB reserved region took ~6,300 frames under OVMF. Note total RAM and any huge regions |
 | Odd GOP pixel format | Wrong colours | The console handles `Bgr` and `Rgb`; report the machine |
 | MADT quirks | `ACPI: ... (staying on the legacy 8259 PIC)` | Fine on a machine that still has an 8259; report the message |
@@ -3294,7 +3424,7 @@ machine" into a procedure that produces a *useful* report whether it works or no
 | `uptime` twice, ten seconds apart | Confirms the clock ticks at about 100 Hz (about 1000 ticks per 10 s) |
 | Keyboard type and port; did typing work? | Your notes |
 | `run hello`, `run calc`, `run bounce`, `run primes` then Esc | The shell: input, compute, graphics, Esc |
-| If a disk is present: the AHCI lines; do **not** `format` without reading the device line | The boot screen |
+| If a disk is present: the AHCI/NVMe/USB and Storage lines; do **not** `format` without reading the device line | The boot screen |
 | A fault screen, if any | Photograph; include `rip`, `cr2` and the vector |
 
 ### A report template
@@ -3306,7 +3436,7 @@ Machine: (make, model, year, CPU)
 Firmware: (vendor, version; Secure Boot off? SATA mode?)
 Display: (resolution if known, colours correct?)
 Keyboard: (PS/2 or USB, port, worked?)
-Boot screen: (attach photos, or transcribe the ACPI/APIC/AHCI/USB lines)
+Boot screen: (attach photos, or transcribe the ACPI/APIC/AHCI/NVMe/USB/Storage lines)
 Shell: (help, ls, run hello, run bounce, run primes + Esc: each OK/fail)
 Persistence: (disk present? mounted? format tested?)
 Clock: (uptime at T and T+10s)
@@ -3395,7 +3525,7 @@ you are holding, on a machine you can name".
 | **H0-2** | Acceptance steps for `tasks`, `undo`, and a `wisp>` session using functions and closures | `tasks` and `undo` have no acceptance step; the acceptance suite stops at maps (step 24). | S |
 | **H0-3** | First real-hardware reports, recorded in a `HARDWARE.md` matrix | Zero physical machines have run this (Ch. 38). Use the playbook ([Chapter 40](#40-hardware-bring-up-playbook)). | M, ongoing |
 | **H0-4** | Reconcile the stale documentation sentences | Seven stale statements are listed in Ch. 38. | S |
-| **H0-5** | Fix the three small defects: UTF-8 BOM, `line 0` for literal conditions, the stale `canvas.wisp` comment | Found while writing this manual (Ch. 38). | S |
+| **H0-5** | Fix the three small defects: UTF-8 BOM, `line 0` for literal conditions, the stale `canvas.wisp` comment | Found while writing this manual (Ch. 38). **UTF-8 BOM and line 0 defects completed; canvas.wisp comment remains.** | S |
 | **H0-6** | Pin `rust-toolchain.toml` to a dated nightly; keep a CI canary on the latest nightly | The toolchain file says plain `nightly`, which floats; the reproducible-build claim holds only for a fixed toolchain. | S |
 | **H0-7** | Continuous integration: host tests, kernel build, QEMU suites, artifact upload | There is no `.github` directory; everything runs by hand. The QEMU suites need OVMF assembly, `tesseract` and `Pillow`, which a container can fix. | M |
 | **H0-8** | Executable documentation: a checker that runs this manual's code samples and diffs their output | This manual's samples were run by hand against the interpreter; that should be a test so it cannot rot. | S |
@@ -3420,9 +3550,9 @@ sessions the host tests use and OCR-check the key lines (`Sorted by priority...`
 | Machine | Firmware | Result | Keyboard | Disk | Notes | Version |
 |---|---|---|---|---|---|---|
 
-**Why this is first among equals:** every other roadmap item assumes the base works on metal. The
-predicted failures (PCI bus-0-only enumeration, no xHCI handoff, huge reserved regions) are
-*hypotheses*. The hardware reports decide how soon H4-1, H4-2 and H4-5 move up.
+**Why this is first among equals:** every other roadmap item assumes the base works on metal. The remaining hardware risks (VMD variants, xHCI firmware ownership, huge
+reserved regions) need reports even where QEMU passes. Those reports decide
+how soon further H4 hardening moves up.
 **Done when:** the matrix has entries and every failure has a linked issue.
 
 ### H0-5: the small defects
@@ -3543,8 +3673,8 @@ read and say so. **Size:** S for the builtin and command, M with the CMOS fallba
 - **`help <command>`** with usage and examples; `help` stays as the list.
 - **Scrollback** (PageUp/PageDown): retain the last N text rows (for example 200) in a ring beside the
   framebuffer; redraw from it. Graphics drawn by WISP are not scrollback (documented).
-- **`lspci`** (the bus-0 list already gathered at boot, extended after H4-1) and **`disks`** (AHCI port,
-  model, serial, size, mounted?).
+- **`lspci`** over the cached PCI inventory. `disks` already lists native
+  candidates and `disk <n>` selects the save disk without writing.
 - **App descriptions in `ls`** from a first-line comment convention (`# name -- description`).
 - **`sys.autorun`**: a save key naming a program to run at boot (reserved `sys.` namespace).
 
@@ -3553,14 +3683,17 @@ earlier line returns) and `lspci`. **Size M.**
 
 ### H1-5: keymaps and modifiers
 
-**Problem.** Layout is US-only and Ctrl, Alt, Caps Lock and function keys are discarded. Anyone with a
+**Problem.** Layout is US-only and Ctrl, Alt and Caps Lock are discarded. Anyone with a
 non-US keyboard cannot type `;` `{` `}` `[` `]` reliably, and WISP needs them.
+
+**Initial support landed:** F1-F10 and Page Up/Down are decoded on PS/2 and USB
+for Studio. Other keymaps and modifier handling remain future work.
 
 **Design.** A table-driven `keymap` module: each layout is a pair of tables for scancode set 1 and the HID
 usage table, plus an AltGr layer. `keymap <name>` selects and persists in `sys.keymap`; the boot-stick
 configuration file (H4-7) can preselect. Add modifier state (Ctrl, Alt, AltGr), Caps Lock with LED
-update, and **software key repeat** for the USB path (the HID boot report carries no repeat). Decode
-function keys and PageUp/PageDown into new key codes above `0x86`. Keep Esc as the stop key; do **not** map
+update, and **software key repeat** for the USB path (the HID boot report carries no repeat).
+Extend the shared key codes as needed. Keep Esc as the stop key; do **not** map
 Ctrl-C to it (the always-available stop is a safety property).
 **Tests.** Tables are pure data: exhaustive host tests that every layout maps every printable key and
 shifted variant; QEMU keyboard scenarios per layout via `sendkey`. **Risks.** A wrong table silently types
@@ -3702,17 +3835,18 @@ program changes behaviour (run all demos and the host suite from 1.1 unmodified 
 
 ## 44. Horizon 3: The machine stops needing another computer
 
-**Target release: v1.5.0.** Theme: **autonomy**. Today a program is written on another computer and
-copied to a read-only stick, a reboot at a time. This horizon makes the machine self-sufficient: it
-can hold programs and files, edit them, run them, and share them back out.
+**Target release: v1.5.0.** Theme: **autonomy**. Wisp Studio now edits and runs
+programs on the machine, with small sources persisted in the existing v2 store.
+This horizon extends that first version to larger programs, general files and
+sharing source back out.
 
 | ID | Item | Why (evidence) | Size |
 |---|---|---|---|
 | **H3-1** | Save format v3: multi-slot values | A value is capped at 4047 bytes: too small for a program, a model or a document. | L |
-| **H3-2** | A partition-aware store | The store owns a *whole disk's* first 513 sectors; audit "Not addressed". | L |
-| **H3-3** | Disk selection by identity, never "first disk" | Boot uses the first AHCI port; the audit's own multi-disk test is still unwritten. | M |
-| **H3-4** | The program store and shell file commands | No way to create or keep a program on the machine. | M |
-| **H3-5** | `edit`: an on-device text editor | Authoring needs another computer. | L |
+| **H3-2** | Partition-aware store (**initial implementation exists**) | GPT save partitions and guarded writes exist; broader layouts remain. | L |
+| **H3-3** | Persistent disk identity (**partial**) | Ambiguous candidates require selection; persistent UUID-based preference remains. | M |
+| **H3-4** | The program store and shell file commands (**partial**) | Small `prog.<name>` sources, listing and execution exist; larger sources and file commands remain. | M |
+| **H3-5** | Wisp Studio, `ide` / `edit` (**partial**) | Native edit/save/check/run exists; larger buffers, search and richer diagnostics remain. | L |
 | **H3-6** | Sandboxed file builtins | A script cannot read or write anything but `save`/`load`. | M |
 | **H3-7** | Reserved `sys.*` settings | Several roadmap items need persistent settings. | S |
 
@@ -3744,20 +3878,14 @@ scenarios cover v2-to-v3, and `docs/SAVE_FORMAT.md` is rewritten as v3.
 
 ### H3-2 and H3-3: partitions and disk identity
 
-**Today.** `bring_up_save_disk` takes the first AHCI port with a disk; the store owns sectors 0-512 of the
-whole disk and `format` erases any partition table there. That is safe because boot never writes and
-`format` is explicit, but it cannot share a disk with anything.
+**Today.** Native AHCI, NVMe and USB disks share guarded save operations.
+GPT save partitions coexist with the ESP; foreign partition tables are
+refused. `disks` lists candidates; `disk <n>` selects without writing.
+Automatic selection requires a unique mounted store or eligible format
+target. Persistent identity preference remains future work.
 
-**Design.**
-- **Identity:** the superblock records a store UUID; `disks` lists every AHCI port (model, serial, size,
-  *store present?*). Boot mounts the disk that holds a valid store; **never** picks one just because it is
-  first. `format <port>` is explicit. Persist "this serial is my save disk" in the store itself.
-- **Partitions:** a GPT reader (header, entries, CRC32) finds a partition by a WISP type GUID; the store's
-  LBA translation already lives in one function (`save_format::region_lba`), which is the seam: make it
-  relative to the partition start. Creating a partition table from the OS is high-risk; instead `format`
-  *refuses* a disk with a partition table unless asked for the whole disk, and the **installer scripts**
-  learn to create the save partition on the stick (a second partition on the same USB stick, usable once
-  USB mass storage (H4-3) exists).
+**Remaining design.** Record store UUIDs and persist a preferred identity;
+expand supported partition layouts and multiple-controller discovery.
 
 **Tests.** The audit's own proposed regression: a QEMU scenario with a foreign partitioned disk first and a
 valid WISP disk second, then reversed, hashing every sector before and after boot, requiring every
@@ -3765,32 +3893,37 @@ unselected disk to stay byte-identical. GPT parser fuzzing (H0-9). **Size L tota
 
 ### H3-4: the program store and file commands
 
-Programs live in the store under keys `prog.<name>` (using v3). `run <name>` searches the APPS snapshot,
-then the program store; `ls` shows both with their origin; new commands `rm`, `cp`, `mv`, `cat`, and
-`export <name>` (prints the source to the screen and the serial console, base64 on request, so a program
-can leave the machine without writing the boot stick). With H1-1 and a serial cable, `export` is the
-copy-out path; with H4-3 it can write a second USB stick. **Tests.** Round-trip a 100 KiB program; name
-collisions between APPS and the store; power-loss during `cp`. **Size M.**
+**Partially implemented.** Studio saves sources under `prog.<name>` using the
+current v2 store, with a 4042-byte source limit. `run <name>` searches saved
+programs first, then the APPS snapshot; `ls` shows both origins, with `ls APPS`
+and `ls PROGRAMS` filters. `delete prog.<name>` removes a saved program.
 
-### H3-5: `edit`
+**Remaining design.** Use v3 for larger sources and add `rm`, `cp`, `mv`, `cat`,
+and `export <name>` (source to the screen and serial console, optionally base64).
+With H1-1 and a serial cable, `export` becomes the copy-out path; with H4-3 it
+could write a second USB stick. **Future tests.** Round-trip a 100 KiB program;
+power-loss during `cp`. **Size M.**
+
+### H3-5: Wisp Studio (`ide` / `edit`)
 
 **Goal.** Edit a program on the machine, run it, see the error, jump to the failing line, fix it.
 
-**Design.**
-- A **full-screen editor** over the console: needs `Console` cursor addressing (`set_cursor(col,row)`,
-  `rows()`, `cols()`), which also enables TUI programs (H5-2).
-- The core is a text buffer (a vector of lines or a gap buffer) with an operations API and a `Screen`
-  trait, **exactly the structure of `line_editor.rs`**, so it is host-testable against a simulated grid,
-  keystroke by keystroke.
-- Keys: arrows, Home/End, PageUp/PageDown, Backspace/Delete, Enter, Tab (insert spaces), and commands on
-  Esc-prefixed or function keys (these need H1-5's decoding): save, run, quit, search, go to line.
-- **Syntax highlighting** from the real lexer's tokens (keywords, strings, comments, numbers).
-- **Run from the editor** (`F5`): runs the buffer in a fresh session, and on a runtime error reopens the
-  editor at the error's line (needs H2-4's line/column).
-- Bounds: the 256 KiB file cap, 32,768 lines, a line length cap, all with clean errors.
+**Partially implemented.** The console provides cursor addressing, and Studio
+uses a hardware-independent UTF-8 text buffer plus a native full-screen view.
+It has line numbers, scrolling, arrows, Home/End, Page Up/Down, Backspace/Delete,
+autoindented Enter and Tab stops. F1 shows help, F2 saves, F3 opens or creates,
+F5 runs, F6 checks syntax, and F10/Esc leaves. Dirty-buffer replacement requires
+Save, Discard or Cancel. Runs use fresh interpreter sessions; reported errors
+select the source line. Initial syntax colors use a small tolerant highlighter;
+syntax checks use the real lexer and parser. Buffers are capped at 16 KiB and
+save slots at 4042 source bytes.
 
-**Tests.** Host tests for every editing operation and for the screen after each key; an acceptance step
-that types a program with the editor, runs it, and OCR-checks the output. **Size L.**
+**Remaining design.** Search, go-to-line, richer line/column diagnostics (H2-4),
+lexer token spans for coloring, and larger buffers with v3 persistence. The
+longer-term bounds remain the 256 KiB file cap and 32,768 lines, with clean errors.
+
+**Future tests.** Expand operation and rendered-screen coverage as these features
+land; exercise larger source round-trips once v3 exists. **Size L.**
 
 ### H3-6: sandboxed file builtins
 
@@ -3819,10 +3952,10 @@ order inside this horizon is set by H0-3's results; the order below is the order
 
 | ID | Item | Why (evidence) | Size |
 |---|---|---|---|
-| **H4-1** | Full PCI enumeration: bridges, ECAM/MCFG, multiple controllers | Enumeration is **bus 0 only**; a controller behind a bridge is invisible (Ch. 30). | M |
-| **H4-2** | xHCI hardening: BIOS handoff, hubs, hot-plug, multiple devices, MSI | No handoff code exists; no hubs; no hot-plug (Ch. 29). | L |
-| **H4-3** | USB mass storage (Bulk-Only Transport) | Persistence needs AHCI; many machines have only NVMe or a stick. | L |
-| **H4-4** | NVMe driver and a `BlockDevice` trait | NVMe is unsupported; the save store is welded to the AHCI type. | L-XL |
+| **H4-1** | PCI segments and resource assignment (**partial**) | Assigned conventional buses and client VMD exist; generic MCFG and resource assignment remain. | M |
+| **H4-2** | xHCI hardening (**partial**) | Ownership handoff, a keyboard and BOT disks exist; hubs, hot-plug and MSI remain. | L |
+| **H4-3** | USB mass storage (**initial implementation exists**) | Root-port BOT/LUN0 exists; broader recovery and transports remain. | L |
+| **H4-4** | NVMe and shared storage (**initial implementation exists**) | Polled NVMe and a transport-neutral sector interface exist; more namespaces and writable 4 KiB saves remain. | L-XL |
 | **H4-5** | Large-page mappings for non-RAM regions | 4 KiB-only paging used ~6,300 frames for one 12 GiB OVMF region. | M |
 | **H4-6** | HID report-descriptor parser; mouse and non-boot devices | Only boot keyboards are understood. | L |
 | **H4-7** | Boot configuration file and display modes | Nothing can be configured before boot; the stick is read-only but readable. | M |
@@ -3832,7 +3965,9 @@ order inside this horizon is set by H0-3's results; the order below is the order
 
 ### H4-1: full PCI enumeration
 
-**Design.** Keep the 0xCF8/0xCFC mechanism as the fallback; add **ECAM** via the ACPI `MCFG` table
+**Current.** Assigned conventional buses and supported client VMD domains are scanned.
+
+**Remaining design.** Add general **ECAM** via the ACPI `MCFG` table
 (extending `acpi.rs`, which parses only the MADT). Walk **PCI-to-PCI bridges** recursively: read the
 secondary and subordinate bus numbers; if firmware left a bridge unconfigured, assign numbers. Return all
 matching controllers, not the first. Log a bus/device/function tree to the log ring. `lspci` (H1-4) prints
@@ -3845,9 +3980,7 @@ resources; scope: do not reprogram BARs unless a controller has none (record and
 ### H4-2: xHCI hardening
 
 In order of risk reduction:
-1. **BIOS-to-OS ownership handoff** through the USB Legacy Support extended capability (set the OS-owned
-   semaphore, wait, with a bounded timeout): small, and the most likely cause of "USB dead on real
-   hardware".
+1. **Verify the implemented BIOS-to-OS ownership handoff** on physical controllers and firmware.
 2. **Multiple devices and ports**, then **hot-plug** by handling Port Status Change events (enumerate on
    connect; tear down the slot on disconnect), so a keyboard plugged in after boot appears.
 3. **Hubs:** hub-class enumeration (descriptor, port power, reset, per-port status), route strings, and
@@ -3860,26 +3993,21 @@ descriptor-fuzz target (H0-9) because this code trusts a device. **Size L.**
 
 ### H4-3: USB mass storage
 
-Bulk endpoints and the Bulk-Only Transport protocol with SCSI `READ(10)`, `WRITE(10)`,
-`SYNCHRONIZE CACHE`, `TEST UNIT READY`, `READ CAPACITY(10)`. Prerequisite: the xHCI driver drives only an
-interrupt endpoint today; add bulk-IN/OUT rings. With `BlockDevice` (H4-4) the store and, later, a FAT
-reader sit on top. This gives persistence on SATA-less machines and a **write path off the machine**
-without ever writing the *boot* stick (use a second stick). **Size L.**
+**Initial implementation exists.** Root-port BOT/SCSI devices use bulk rings,
+LUN0, readiness/capacity commands, sector reads/writes and cache flushes.
+Installed USB disks can persist in a dedicated Wisp save partition. Future
+work includes broader recovery, hubs, hot-plug, more controllers/LUNs and
+UAS. Writable 4 KiB-native saves need an aligned format.
 
-### H4-4: NVMe and the `BlockDevice` seam
+### H4-4: NVMe and the shared storage seam
 
-**Refactor first.** `save_format` is written against the concrete AHCI type; the host tests work around that
-by substituting an in-memory `ahci` module. Introduce `trait BlockDevice { sector_size, total_sectors,
-read, write, flush }`; implement it for AHCI, for the host test double (replacing the substitution
-trick) and later NVMe and USB. Doing this *before* NVMe is a pure refactor with the existing tests as the
-safety net.
-
-**NVMe driver.** PCI class `01:08:02`; 64-bit BAR0; controller reset and enable; one admin queue pair
-(Identify controller and namespace); one I/O queue pair; polled completions (no MSI initially); PRP1/PRP2 for
-transfers up to a few pages; Read, Write and Flush; the `clock::poll_until` bound on every wait and a failed
-state on timeout mirroring AHCI's recovery rule. QEMU `-device nvme,serial=...,drive=...`. The same
-all-failures-are-visible rule applies. **Why it matters:** most laptops sold in the last several years have
-only NVMe, so without this the machine can never persist data there. **Size L-XL.**
+**Initial implementation exists.** `storage::Disk` dispatches sector/flush
+operations to AHCI, NVMe and USB, keeping `save_format` independent of the
+transport. NVMe provides admin/I/O queues, Identify, Read, Write, Flush,
+bounded polling and failed-state DMA protection. Supported client VMD
+exposes child NVMe controllers; physical operation remains unverified.
+Further work includes more controllers/namespaces, broader PCI domains,
+and a format supporting native 4 KiB commit records.
 
 ### H4-5: large pages for non-RAM regions
 
@@ -4188,15 +4316,15 @@ H0-3 hardware reports ──► orders all of Horizon 4
 
 H1-1 serial/dmesg ──► H0-3 (better reports), H3-4 export, H4-*
 H1-2 reboot ───────► test suites between boots
-H1-5 keymaps/modifiers ──► H3-5 editor, H5-1 key()
-H1-4 console addressing ─► H3-5 editor, H5-2 text
+H1-5 keymaps/modifiers ──► H3-5 richer editing, H5-1 key()
+H1-4 console improvements ─► H3-5 richer editing, H5-2 text
 
 H2-4 diagnostics ──► H2-5 modules ──► H2-6 stdlib
 H2-7 muldiv ───────► H6-1, H6-2
 H2-9 conformance ──► H7-1 bytecode VM ──► H7-4, H5-8
 
 H4-4 BlockDevice ──► H4-3 USB storage, H3-2 partitions, H7-5
-H3-1 save v3 ──► H3-4 program store ──► H3-5 editor, H3-6 files ──► H6-3
+H3-1 save v3 ──► H3-4 larger programs ──► H3-5 larger editing, H3-6 files ──► H6-3
 H4-1 PCI ──► H4-2 xHCI, H4-4 NVMe
 H4-6 HID ──► H5-6 mouse ──► H6-4 digit recogniser (optional)
 H5-1, H5-2, H6-1 ──► H6-4
@@ -4204,8 +4332,10 @@ H5-1, H5-2, H6-1 ──► H6-4
 
 ### The critical path to self-hosting
 
-`H1-1 → H1-5 → H4-1 → H4-4 → H3-1 → H3-4 → H3-5`. Everything else can proceed in parallel; the editor is
-the milestone at which the project can claim *"a computer you can use without another computer"*.
+Studio already supports small programs without another computer. The remaining
+path to larger programs and source exchange is
+`H1-1 → H1-5 → H4-1 → H4-4 → H3-1 → H3-4 → H3-5`; independent items can proceed
+in parallel. Here H3-4 and H3-5 mean extending the existing store and editor.
 
 ### Suggested order of work, first ten
 
@@ -4218,7 +4348,7 @@ enumeration, moved up if H0-3 reports a missing controller.
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| R1 | Real hardware exposes failures QEMU hides (bus-0-only PCI, xHCI handoff, huge reserved regions, odd firmware) | High | High | H0-3 first; H1-1 for visibility; H4-1, H4-2, H4-5 targeted at the predicted failures |
+| R1 | Real hardware exposes failures QEMU hides (VMD variants, xHCI firmware ownership, huge reserved regions, odd firmware) | High | High | H0-3 first; H1-1 for visibility; H4-1, H4-2, H4-5 targeted at the predicted failures |
 | R2 | Data loss from a storage-format change (H3-1) | Medium | Severe | Build the exhaustive crash model before the kernel; v2 stays readable; mutation tests |
 | R3 | Scope creep crosses the charter (networking via a "harmless" USB driver, floats "just for sqrt") | Medium | High | Non-goals table; any crossing needs a written decision first |
 | R4 | Nightly toolchain drift breaks the build | Medium | Medium | H0-6 pin plus a canary job |
@@ -4250,7 +4380,8 @@ Three milestones, each checkable:
 ### Shell
 
 ```text
-help  clear  echo <text>  ls [APPS]  run <name>  wisp
+help  clear  echo <text>  ls [APPS|PROGRAMS]  run <name>  wisp
+ide [name]  edit [name]
 uptime  mem  version
 save <k> <v>  load <k>  keys  delete <k>  format
 ```
@@ -4263,6 +4394,9 @@ save <k> <v>  load <k>  keys  delete <k>  format
 | Up Down | History (at `>` and `wisp>` only) |
 | Enter | Submit |
 | **Esc** | Stop a running program; erase the line at a prompt |
+
+In Studio: **F1** help, **F2** save, **F3** open/new, **F5** run, **F6** check,
+**F10/Esc** leave. Unsaved changes offer **S**ave / **D**iscard / **Esc** Cancel.
 
 ### WISP in a screenful
 
@@ -4285,7 +4419,8 @@ map(f, l)  filter(f, l)  reduce(f, l, 0)  sort_by(l, f)
 ### Limits you will actually hit
 
 `256` nested calls · `128` syntax depth · `32,768` list/map entries · `256 KiB` string · `16 KiB` print/str ·
-`32` byte key · `63` keys · `4047` byte value · `1 MiB`/`256 KiB`/`64` APPS budgets.
+`32` byte key · `63` keys · `4047` byte value · `4042` byte saved source ·
+`16 KiB` Studio buffer · `1 MiB`/`256 KiB`/`64` APPS budgets.
 
 ## Appendix B: A grammar for WISP
 
@@ -4344,10 +4479,11 @@ assignments; a `fn NAME` is legal only at the top level; strings compare in byte
 |---|---|
 | Nothing on screen after boot | Ch. 10: resolution/GOP; Ch. 40 |
 | Prompt, typing dead | Ch. 10 and Ch. 29: hub, hot-plug, boot keyboard, handoff |
-| `unknown command` | Ch. 12: there are 14 commands, case-sensitive |
-| `run: ... not found in the APPS snapshot` | Ch. 12 and 25: the snapshot is taken at boot; names; budgets |
+| `unknown command` | Ch. 12: shell commands are case-sensitive |
+| `run: ... not found in bundled apps or saved programs` | Ch. 12 and 25: `ls APPS`, `ls PROGRAMS`, names and boot-time imports |
+| Studio `Save failed: ...` | Ch. 12 and 15: formatted selected disk, 4042-byte source limit and shared key capacity |
 | `expected ';'` | Ch. 18 gotcha 1 |
-| `unexpected character 'ï'` | Ch. 25: UTF-8 BOM |
+| `unexpected character 'ï'` | Ch. 25: UTF-8 BOM (now handled transparently) |
 | `expected bool here` | Ch. 17 step 3: no truthiness |
 | `save: ...` | Ch. 15: format, size, key rules |
 | Stuck program | Esc (Ch. 14) |
@@ -4382,7 +4518,7 @@ double so the logic can run on a PC. **Ledger**: [Chapter 38](#38-verification-l
 
 **I copied a program to the stick but `ls` does not show it.**
 The `APPS` snapshot is taken once, at boot: reboot. Then check the file sits directly in `APPS` (not a
-subfolder), ends in `.wisp`, has a name of at most 64 bytes, is valid UTF-8 *without* a byte-order mark,
+subfolder), ends in `.wisp`, has a name of at most 64 bytes, is valid UTF-8 (with or without a byte-order mark),
 is under 256 KiB, and that the total stays under 1 MiB and 64 files. A skipped file is only logged to the
 debug port, so `ls` simply lacks it ([Chapter 25](#25-getting-programs-onto-the-machine)).
 
@@ -4393,7 +4529,8 @@ hot-plugging, and try a PS/2 keyboard or the firmware's legacy-USB setting ([Cha
 **Can I run it in VirtualBox, VMware, Hyper-V or UTM?**
 The verified environment is QEMU with OVMF. Anything that boots a 64-bit UEFI image from a FAT volume and
 provides a GOP framebuffer should boot it, but input needs PS/2 emulation or an xHCI controller, and
-persistence needs an AHCI disk. None of those other hypervisors has been tested.
+persistence needs a supported AHCI, NVMe or xHCI USB BOT disk with native
+512-byte sectors. None of those other hypervisors has been tested.
 
 **Does it run on a Raspberry Pi, or an Apple-silicon Mac?**
 No. It is x86_64 UEFI only today. An aarch64 port is on the long horizon (H7-5, [Chapter 48](#48-horizon-7-the-long-horizon)).
@@ -4404,8 +4541,9 @@ It is the founding constraint: there is no network code in the binary at all. Ad
 deliberate project decision made out loud ([Chapter 49](#49-non-goals-and-decisions-to-make-out-loud)), not a patch.
 
 **How do I get a program *off* the machine?**
-There is no way today. Scripts live on a read-only stick, and nothing on the machine can write one out. The
-roadmap adds an on-device program store, `cat`, and `export` over serial ([Chapter 44](#44-horizon-3-the-machine-stops-needing-another-computer)).
+Source export is not available yet. Bundled apps remain on the boot stick, and
+Studio keeps saved sources as `prog.<name>` values on the save disk. The roadmap
+adds `cat` and `export` over serial ([Chapter 44](#44-horizon-3-the-machine-stops-needing-another-computer)).
 
 **Can a program read or write files?**
 No. Only `save`/`load`, into the 63-key store. There is no `import` either.
@@ -4415,8 +4553,10 @@ Its encoding must fit in 4047 bytes, and there are at most 63 keys. Larger value
 format v3 (H3-1).
 
 **What does `format` actually erase?**
-Sectors 0-512 (513 sectors, about 256 KiB) of the first AHCI disk, including any partition table, after
-showing you the model and serial and requiring you to type `ERASE`. Nothing else on the disk is touched.
+The selected disk's Wisp save region: 513 sectors, about 256 KiB. On an
+installed disk this lies inside its save partition, preserving GPT and the
+ESP; on an eligible raw disk it is sectors 0-512. Foreign partition tables
+are refused. The command names the device and range and requires `ERASE`.
 
 **How do I clear one saved value, or all of them?**
 `delete <key>` (or `save(key, nil)` from a program) for one; `format` for all.

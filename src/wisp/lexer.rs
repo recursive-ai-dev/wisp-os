@@ -94,6 +94,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
     let mut line = 1u32;
     let mut tokens = Vec::new();
 
+    // Skip UTF-8 BOM if present (0xEF 0xBB 0xBF)
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        i = 3;
+    }
+
     while i < bytes.len() {
         let c = bytes[i];
 

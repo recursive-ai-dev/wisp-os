@@ -2979,6 +2979,32 @@ Not verified: any real hardware; a QEMU boot of the post-v1.1.0 binary (the
 manual says so, and makes it the first roadmap item); the macOS and Windows
 installers; the roadmap's designs, which are proposals.
 
+## Fixes for Chapter 38 defects: UTF-8 BOM and line-number propagation
+
+**UTF-8 BOM handling (lexer):** Added detection and skipping of the UTF-8
+byte-order mark (`0xEF 0xBB 0xBF`) at the start of source files in
+`src/wisp/lexer.rs`. The lexer now checks for the BOM signature at the
+beginning of input and advances past it before tokenizing, allowing scripts
+saved by Windows-oriented editors (which often add a BOM by default) to
+lex correctly. This is a one-line addition at the start of the `lex`
+function and does not affect the interpretation of valid programs.
+
+**Line-number propagation (AST and interpreter):** Fixed the reporting of
+source locations for bare literals used in conditions. Previously, literal
+expressions (`IntLit`, `StrLit`, `BoolLit`, `NilLit`) did not carry line
+numbers in the AST, causing `expr.line().unwrap_or(0)` to fall back to 0.
+Changed all four literal variants to store their source line (from the
+token), updated `Expr::line()` to return `Some` for literals, and updated
+the parser to pass the token's line number when constructing literals.
+The interpreter's `eval_bool` function now receives accurate line numbers
+for all expressions, including bare literals in conditions like `while 5 { }`.
+
+**Regression tests:** Added ten new tests to `tests/host/tests/regressions.rs`:
+five for UTF-8 BOM handling (basic skipping, code on same line, multiline,
+ordinary UTF-8 without BOM, non-ASCII characters with/without BOM) and
+five for line-number propagation (integer, string, nil literals on lines 1
+and 3, multiline programs). All 291 host tests pass.
+
 ## Live installer, bootable ISO and partition-aware persistence
 
 Added a pre-ExitBootServices Try/Install menu so the live system can copy
@@ -3034,4 +3060,109 @@ their screenshots were checked with the same exact font decoder in place
 of OCR. The decoder uses the embedded font directly, avoiding OCR
 dependencies for installer assertions. Real hardware and macOS/Windows
 host scripts remain unverified. Wisp still has no network stack or online updater.
+
+## Wisp Studio: native WISP authoring
+
+`ide [name]` (also `edit`) opens a full-screen, single-buffer editor inside
+Wisp, defaulting to `main`. It opens saved sources or bundled examples and
+creates empty buffers for new names. Line numbers, syntax colors, a visible
+cursor, horizontal/vertical scrolling, Page Up/Down, automatic indentation
+and Tab stops support editing. The text buffer preserves UTF-8 and uses
+character boundaries for navigation and deletion; the ASCII font displays
+unsupported characters as `?` without changing the source.
+
+F1 shows help, F2 saves, F3 opens or creates, F5 runs and F6 checks syntax.
+F10/Esc leaves. Replacing a dirty buffer requires Save, Discard or Cancel;
+failed saves and failed opens retain its contents. Running uses the shell's
+existing hardware host and a fresh interpreter session. Output stays visible
+until a keypress, Esc still stops computation/input/sleep, and reported
+syntax/runtime errors return the cursor to their source line.
+
+Projects use `prog.<name>` string values in the existing crash-atomic v2
+save store. Names are canonical lowercase, with 1-27 ASCII letters, digits,
+underscores or hyphens and an optional `.wisp` suffix. Saved sources take
+precedence over bundled apps for both Studio and `run`; `ls` shows both
+origins, and `ls APPS`/`ls PROGRAMS` filter them. Boot-volume files are not
+rewritten. Sources share the existing 63-key capacity with application data.
+The editor admits 16 KiB, while a serialized string in one v2 slot admits
+4042 source bytes. Oversize saves fail without truncation. Editing and
+running remain available without a formatted save disk.
+
+PS/2 and USB now deliver matching F1-F10 and Page Up/Down key codes;
+ordinary line prompts ignore them. The view redraws changed character cells
+through the existing console API. Syntax coloring tolerates incomplete
+lines; checking and execution use the real lexer/parser.
+
+Verification: all 258 host tests pass, including 18 new editor/project
+tests for multiline edits, UTF-8 boundaries, preferred columns, indentation,
+atomic size limits, naming, source precedence, persistence and disk errors.
+`./build.sh` passes with zero warnings (361 KiB EFI). Both
+`python3 tests/ide_test.py --skip-build` and its `--usb` variant pass in
+QEMU against that build: edit/check/run, failed-save and dirty-quit retention,
+formatted save, shell execution, reboot/reopen, help/browser, bundled
+examples, paging, syntax/runtime line-3 jumps and stopping an infinite loop.
+Screens are checked against the embedded font without OCR. Real hardware
+remains unverified. README and the manual describe the current limits and
+mark the larger program-store/editor roadmap items as partially implemented.
+
+## Native NVMe, Intel VMD and USB mass storage
+
+Added native storage transports for machines without AHCI SATA. The save
+format now consumes a common disk interface, preserving its partition
+bounds, explicit formatting and copy-on-write protocol across AHCI, NVMe
+and USB. AHCI remains available. Boot probes media without writing; shell
+`disks` lists candidates and `disk <n>` selects one for this boot without
+formatting. A unique mounted store takes precedence over blank/foreign
+disks; otherwise only a unique format-eligible candidate is selected.
+Ambiguous stores require a choice instead of relying on enumeration order.
+
+PCI discovery scans assigned conventional buses, including devices behind
+bridges, and supported Intel client VMD configuration domains (including
+the workspace machine's 8086:467f). It handles relative ECAM bus numbers,
+firmware aperture sizes, 64-bit BARs and VMD shadow translations without
+relocating resources. NVMe/xHCI takeover masks firmware MSI, MSI-X and INTx
+before polled operation. The VMD register handling follows Intel's register
+references and Linux's VMD implementation; source comments link them.
+
+NVMe uses one admin and one I/O queue, bounded polling, active namespace
+discovery, Identify validation, sector reads/writes and explicit Flush.
+Queue completion IDs, phases and status are checked. DMA pages are freed
+only after the controller acknowledges disable; uncertain failures retain
+them and reject subsequent buffer reuse. The first usable namespace on
+the first NVMe controller is exposed, alongside the existing first AHCI disk.
+
+xHCI now enumerates a keyboard and up to four direct-root-port USB
+Bulk-Only/SCSI LUN0 disks. BOT wrappers, status tags, lengths and residue
+are validated; SCSI capacity, READ/WRITE and SYNCHRONIZE CACHE provide the
+disk operations. The controller remains alive without a keyboard and is
+temporarily taken out of the interrupt-disabled lock during synchronous
+I/O waits. Keyboard events are deferred during storage work. Ownership
+handoff precedes reset. Transport stalls/timeouts offline that disk with
+DMA retained; hubs, UAS, hot-plug and BOT reset recovery remain future work.
+
+Drivers can read native 512-byte and 4-KiB NVMe/USB blocks. Writable v2
+saves require 512-byte native blocks: its sector-1 slot layout shares
+4-KiB blocks across slots, so 4Kn writes/formatting are refused rather
+than weakening power-loss guarantees. Native 4Kn GPT headers are detected
+at their actual offset even without a protective MBR. Foreign partition
+tables remain protected. An old FAT-only boot stick does not gain a save
+partition by updating EFI; the live installer creates the ESP plus Wisp
+save partition that enables installed USB persistence.
+
+`run.sh` accepts `WISP_SAVE_TRANSPORT=ahci|nvme|usb` (default AHCI) for the
+ordinary disposable image, installer destination or installed boot disk.
+Both new modes were booted through the script. The EFI binary (397 KiB)
+and live ISO were rebuilt; documentation covers the interfaces and limits.
+
+Verification: all 280 host tests pass, including PCI/VMD addressing and
+interrupt takeover, NVMe Identify, BOT framing, disk selection and 4Kn
+write guards. The release build has zero warnings. QEMU suites pass for
+native NVMe and bridged NSID 7 persistence, USB keyboard/storage coexistence,
+same-disk GPT USB boot/save/reboot, readonly devices, foreign GPT/MBR and
+4Kn media unchanged, ambiguous AHCI/USB selection, the five AHCI regression
+scenarios, and the full live installer/standalone boot workflow. Eight ISO
+tests and two exact-font decoder tests pass. AHCI assertions now use that
+decoder rather than external OCR. No physical PCI or disk writes were
+performed during development; real NVMe/VMD and USB hardware boot tests
+remain outstanding.
 

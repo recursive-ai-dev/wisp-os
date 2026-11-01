@@ -3,6 +3,10 @@
 //! interrupted provisioning, via the volatile-cache disk model), AUD-08
 //! (shared-graph blowup), AUD-09 (cycle reclamation), AUD-10 (stack depth)
 //! and AUD-13 (UTF-8 literals).
+//! 
+//! Also tests for defects discovered during manual verification:
+//! - UTF-8 BOM handling (Chapter 38)
+//! - Line number propagation for literal conditions (Chapter 38)
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -102,7 +106,7 @@ fn run_ok(src: &str) -> String {
 fn run_err(src: &str) -> String {
     match run(src).0 {
         Ok(()) => panic!("script unexpectedly succeeded"),
-        Err(e) => e.message,
+        Err(e) => e.to_display_string(),
     }
 }
 
@@ -526,4 +530,100 @@ fn save_disk_refuses_io_until_formatted() {
     disk.format().unwrap();
     disk.save("k", &Value::Int(1)).unwrap();
     assert_eq!(disk.load("k").unwrap().unwrap().to_display_string(), "1");
+}
+
+// ---- Chapter 38 defects: UTF-8 BOM and line number propagation ---------
+
+/// UTF-8 BOM (0xEF 0xBB 0xBF) at the start of a file should be silently skipped
+#[test]
+fn utf8_bom_is_skipped() {
+    // The UTF-8 BOM as a string (it's valid UTF-8)
+    let bom = "\u{FEFF}";
+    let src = format!("{bom}print(\"hello\");");
+    assert_eq!(run_ok(&src), "hello\n");
+}
+
+/// UTF-8 BOM followed by actual code on the same line
+#[test]
+fn utf8_bom_with_code_on_same_line() {
+    let bom = "\u{FEFF}";
+    let src = format!("{bom}let x = 42; print(x);");
+    assert_eq!(run_ok(&src), "42\n");
+}
+
+/// UTF-8 BOM with multiline code
+#[test]
+fn utf8_bom_multiline() {
+    let bom = "\u{FEFF}";
+    let src = format!("{bom}print(\"line1\");\nprint(\"line2\");");
+    assert_eq!(run_ok(&src), "line1\nline2\n");
+}
+
+/// Ordinary UTF-8 without BOM still works
+#[test]
+fn ordinary_utf8_without_bom() {
+    assert_eq!(run_ok("print(\"hello\");"), "hello\n");
+}
+
+/// Non-ASCII characters work normally (with or without BOM)
+#[test]
+fn non_ascii_characters_with_and_without_bom() {
+    let bom = "\u{FEFF}";
+    let src_without = "print(\"é\");";
+    let src_with = format!("{bom}print(\"é\");");
+    assert_eq!(run_ok(src_without), "é\n");
+    assert_eq!(run_ok(&src_with), "é\n");
+}
+
+/// Literal conditions report their actual line number, not line 0
+#[test]
+fn bare_literal_condition_reports_correct_line() {
+    // Line 1: while with a bare literal should report line 1, not line 0
+    let src = "while 5 { }";
+    let msg = run_err(src);
+    assert!(msg.contains("line 1"), "Expected 'line 1' in error message, got: {msg}");
+    assert!(!msg.contains("line 0"), "Should not contain 'line 0' in error message, got: {msg}");
+}
+
+/// Literal conditions on different lines report their actual line
+#[test]
+fn bare_literal_condition_on_line_3() {
+    let src = "let x = 1;\nlet y = 2;\nwhile 5 { }";
+    let msg = run_err(src);
+    assert!(msg.contains("line 3"), "Expected 'line 3' in error message, got: {msg}");
+    assert!(!msg.contains("line 0"), "Should not contain 'line 0' in error message, got: {msg}");
+}
+
+/// String literal in condition reports correct line
+#[test]
+fn string_literal_condition_reports_correct_line() {
+    let src = "if \"hello\" { }";
+    let msg = run_err(src);
+    assert!(msg.contains("line 1"), "Expected 'line 1' in error message, got: {msg}");
+    assert!(!msg.contains("line 0"), "Should not contain 'line 0' in error message, got: {msg}");
+}
+
+/// Boolean literal in condition still works correctly
+#[test]
+fn boolean_literal_condition_works() {
+    let src = "if true { print(\"yes\"); }";
+    assert_eq!(run_ok(src), "yes\n");
+}
+
+/// Nil literal in condition reports correct line
+#[test]
+fn nil_literal_condition_reports_correct_line() {
+    let src = "while nil { }";
+    let msg = run_err(src);
+    assert!(msg.contains("line 1"), "Expected 'line 1' in error message, got: {msg}");
+    assert!(!msg.contains("line 0"), "Should not contain 'line 0' in error message, got: {msg}");
+}
+
+/// Multiline program with error on later line
+#[test]
+fn multiline_error_reporting() {
+    let src = "let a = 1;\nlet b = 2;\nlet c = 3;\nif 42 { print(\"should not reach\"); }";
+    let msg = run_err(src);
+    assert!(msg.contains("line 4"), "Expected 'line 4' in error message, got: {msg}");
+    assert!(!msg.contains("line 0"), "Should not contain 'line 0' in error message, got: {msg}");
 }

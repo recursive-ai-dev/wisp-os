@@ -709,10 +709,10 @@ impl Interp<'_, '_> {
     // at roughly 2.5x the outlined cost on the UEFI target).
     fn eval_expr_inner(&mut self, expr: &Expr, stack: &ScopeStack) -> Result<Value, WispError> {
         match expr {
-            Expr::IntLit(v) => Ok(Value::Int(*v)),
-            Expr::StrLit(s) => Ok(Value::Str(s.clone())),
-            Expr::BoolLit(b) => Ok(Value::Bool(*b)),
-            Expr::NilLit => Ok(Value::Nil),
+            Expr::IntLit(v, _) => Ok(Value::Int(*v)),
+            Expr::StrLit(s, _) => Ok(Value::Str(s.clone())),
+            Expr::BoolLit(b, _) => Ok(Value::Bool(*b)),
+            Expr::NilLit(_) => Ok(Value::Nil),
             Expr::Var { name, line } => self.eval_var(name, *line, stack),
             Expr::Unary { op, expr, line } => self.eval_unary(*op, expr, *line, stack),
             Expr::Binary { op, lhs, rhs, line } => self.eval_binary(*op, lhs, rhs, *line, stack),

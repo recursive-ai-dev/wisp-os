@@ -477,11 +477,11 @@ impl<'t> Parser<'t> {
         let line = self.peek_line();
         match self.advance().tok {
             Tok::Fn => Ok(Expr::Lambda(self.parse_lambda(line)?)),
-            Tok::Int(v) => Ok(Expr::IntLit(v)),
-            Tok::Str(s) => Ok(Expr::StrLit(s)),
-            Tok::True => Ok(Expr::BoolLit(true)),
-            Tok::False => Ok(Expr::BoolLit(false)),
-            Tok::Nil => Ok(Expr::NilLit),
+            Tok::Int(v) => Ok(Expr::IntLit(v, line)),
+            Tok::Str(s) => Ok(Expr::StrLit(s, line)),
+            Tok::True => Ok(Expr::BoolLit(true, line)),
+            Tok::False => Ok(Expr::BoolLit(false, line)),
+            Tok::Nil => Ok(Expr::NilLit(line)),
             Tok::Ident(name) => {
                 if self.match_tok(&Tok::LParen) {
                     let args = self.parse_call_args()?;
