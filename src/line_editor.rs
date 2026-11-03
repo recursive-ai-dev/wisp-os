@@ -28,6 +28,11 @@ pub const KEY_RIGHT: u8 = 0x83;
 pub const KEY_HOME: u8 = 0x84;
 pub const KEY_END: u8 = 0x85;
 pub const KEY_DELETE: u8 = 0x86;
+pub const KEY_PAGE_UP: u8 = 0x87;
+pub const KEY_PAGE_DOWN: u8 = 0x88;
+/// F1 through F10 occupy ten consecutive codes starting here. Readers
+/// that do not bind function keys simply ignore these non-ASCII bytes.
+pub const KEY_F1: u8 = 0x90;
 
 const ENTER: u8 = 0x0d;
 const BACKSPACE: u8 = 0x08;

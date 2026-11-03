@@ -3,15 +3,19 @@
 //! which QEMU's default `i8042` never is), decoded into the same ASCII
 //! byte space `shell.rs` already expects (`ENTER = 0x0d`, `BACKSPACE =
 //! 0x08`, printable ASCII 0x20-0x7e). The editing keys -- arrows, Home,
-//! End, Delete, all 0xE0-prefixed -- become `line_editor`'s `KEY_*` codes;
-//! keypad Enter is Enter. Every other extended or non-printable key
-//! (function keys, Ctrl/Alt, CapsLock, NumLock, ScrollLock, the "fake
+//! End, Delete and PageUp/PageDown, all 0xE0-prefixed -- and F1 through
+//! F10 become `line_editor`'s `KEY_*` codes; keypad Enter is Enter.
+//! Every other extended or non-printable key
+//! (Ctrl/Alt, CapsLock, NumLock, ScrollLock, the "fake
 //! shift" codes some keyboards wrap arrows in) is recognized and discarded
 //! rather than mis-decoded.
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
-use crate::line_editor::{KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
+use crate::line_editor::{
+    KEY_DELETE, KEY_DOWN, KEY_END, KEY_F1, KEY_HOME, KEY_LEFT, KEY_PAGE_DOWN,
+    KEY_PAGE_UP, KEY_RIGHT, KEY_UP,
+};
 use crate::sync::Locked;
 
 const DATA_PORT: u16 = 0x60;
@@ -34,9 +38,10 @@ fn in8(port: u16) -> u8 {
 }
 
 /// Unshifted scancode-set-1 make-code -> ASCII table, indexed by scancode.
-/// `0` marks a code with no ASCII mapping (function keys, modifiers,
+/// `0` marks a code with no ASCII mapping (modifiers,
 /// unmapped punctuation-adjacent codes, etc.) -- those are dropped, not
-/// substituted with a wrong character.
+/// substituted with a wrong character. F1 through F10 are decoded
+/// separately before this table is consulted.
 #[rustfmt::skip]
 const UNSHIFTED: [u8; 0x59] = [
     0,    ESC,  b'1', b'2', b'3', b'4', b'5', b'6', // 0x00-0x07 (0x01=Esc)
@@ -88,7 +93,8 @@ struct RingBuffer {
     /// scancode byte is known to be part of an extended sequence (see
     /// [`extended_key`]).
     pending_extended: bool,
-    shift_held: bool,
+    left_shift: bool,
+    right_shift: bool,
 }
 
 impl RingBuffer {
@@ -99,7 +105,8 @@ impl RingBuffer {
             tail: 0,
             len: 0,
             pending_extended: false,
-            shift_held: false,
+            left_shift: false,
+            right_shift: false,
         }
     }
 
@@ -188,29 +195,33 @@ pub fn drain_pending() {
 pub fn on_irq() {
     let scancode = in8(DATA_PORT);
 
-    QUEUE.with(|q| {
-        if q.pending_extended {
+    QUEUE.with(|q| q.on_scancode(scancode));
+}
+
+impl RingBuffer {
+    fn on_scancode(&mut self, scancode: u8) {
+        if self.pending_extended {
             // Second byte of an 0xE0-prefixed sequence: an editing key, or
             // something (right Ctrl/Alt, a release, a fake shift) that is
             // not bound to anything.
-            q.pending_extended = false;
+            self.pending_extended = false;
             let key = extended_key(scancode);
             if key != 0 {
-                q.push(key);
+                self.push(key);
             }
             return;
         }
         if scancode == EXTENDED_PREFIX {
-            q.pending_extended = true;
+            self.pending_extended = true;
             return;
         }
         match scancode {
-            LSHIFT_MAKE | RSHIFT_MAKE => {
-                q.shift_held = true;
+            LSHIFT_MAKE | LSHIFT_BREAK => {
+                self.left_shift = scancode == LSHIFT_MAKE;
                 return;
             }
-            LSHIFT_BREAK | RSHIFT_BREAK => {
-                q.shift_held = false;
+            RSHIFT_MAKE | RSHIFT_BREAK => {
+                self.right_shift = scancode == RSHIFT_MAKE;
                 return;
             }
             _ => {}
@@ -221,8 +232,14 @@ pub fn on_irq() {
             // `Input` protocol's own key-repeat-free behavior).
             return;
         }
+        // Set 1 gives F1 through F10 consecutive make codes. Shift does
+        // not change the command code, matching USB's function-key path.
+        if (0x3b..=0x44).contains(&scancode) {
+            self.push(KEY_F1 + scancode - 0x3b);
+            return;
+        }
         let index = scancode as usize;
-        let table = if q.shift_held { &SHIFTED } else { &UNSHIFTED };
+        let table = if self.left_shift || self.right_shift { &SHIFTED } else { &UNSHIFTED };
         let Some(&ascii) = table.get(index) else {
             return;
         };
@@ -230,9 +247,10 @@ pub fn on_irq() {
             request_stop();
         }
         if ascii != 0 {
-            q.push(ascii);
+            self.push(ascii);
         }
-    });
+
+    }
 }
 
 /// The byte an 0xE0-prefixed make code decodes to, or 0 for one this
@@ -248,12 +266,14 @@ fn extended_key(scancode: u8) -> u8 {
         0x47 => KEY_HOME,
         0x4F => KEY_END,
         0x53 => KEY_DELETE,
+        0x49 => KEY_PAGE_UP,
+        0x51 => KEY_PAGE_DOWN,
         0x1C => ENTER, // keypad Enter
         _ => 0,
     }
 }
 
-/// Enqueue an already-decoded ASCII byte from an input source other than
+/// Enqueue an already-decoded ASCII or `KEY_*` byte from a source other than
 /// the PS/2 controller -- today, `usb_hid.rs`'s HID boot-protocol
 /// decoder.
 ///
@@ -314,5 +334,56 @@ pub fn wait_for_key() -> u8 {
         // `hlt` is never missed (see `clock::sleep_ms_unless`'s doc comment for the
         // full race-freedom argument, identical here).
         unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_shift_keys_keep_the_other_modifier_active() {
+        for (first_break, second_break) in [(LSHIFT_BREAK, RSHIFT_BREAK), (RSHIFT_BREAK, LSHIFT_BREAK)] {
+            let mut q = RingBuffer::new();
+            for key in [LSHIFT_MAKE, RSHIFT_MAKE, first_break, 0x1e, second_break, 0x1e] {
+                q.on_scancode(key);
+            }
+            assert_eq!(q.pop(), Some(b'A'));
+            assert_eq!(q.pop(), Some(b'a'));
+            assert_eq!(q.pop(), None);
+        }
+    }
+
+    #[test]
+    fn repeated_shift_makes_and_extended_fake_shifts_are_independent() {
+        let mut q = RingBuffer::new();
+        for key in [LSHIFT_MAKE, LSHIFT_MAKE, EXTENDED_PREFIX, RSHIFT_BREAK, 0x1e, LSHIFT_BREAK, 0x1e] {
+            q.on_scancode(key);
+        }
+        assert_eq!(q.pop(), Some(b'A'));
+        assert_eq!(q.pop(), Some(b'a'));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn function_and_navigation_keys_preserve_modifier_state() {
+        let mut q = RingBuffer::new();
+        for key in [RSHIFT_MAKE, 0x3b, EXTENDED_PREFIX, 0x48, 0x1e, RSHIFT_BREAK] {
+            q.on_scancode(key);
+        }
+        assert_eq!(q.pop(), Some(KEY_F1));
+        assert_eq!(q.pop(), Some(KEY_UP));
+        assert_eq!(q.pop(), Some(b'A'));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn saturated_queue_drops_oldest_and_recovers() {
+        let mut q = RingBuffer::new();
+        for i in 0..(RING_CAPACITY + 20) { q.push(i as u8); }
+        for i in 20..(RING_CAPACITY + 20) { assert_eq!(q.pop(), Some(i as u8)); }
+        assert_eq!(q.pop(), None);
+        q.on_scancode(0x1e);
+        assert_eq!(q.pop(), Some(b'a'));
     }
 }

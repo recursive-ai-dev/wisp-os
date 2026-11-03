@@ -272,14 +272,16 @@ fn deep_value_chains_drop_without_recursing() {
 
 #[test]
 fn deep_parentheses_are_a_parse_error() {
-    let src = format!("let x = {}1{};", "(".repeat(20000), ")".repeat(20000));
+    // Stay below the lexer budget so this still exercises the independent
+    // syntax-depth guard. Oversized token streams have their own tests.
+    let src = format!("let x = {}1{};", "(".repeat(8000), ")".repeat(8000));
     let msg = on_small_stack(move || run_err(&src));
     assert!(msg.contains("nested too deeply"), "{msg}");
 }
 
 #[test]
 fn long_flat_chain_is_a_parse_error() {
-    let src = format!("let x = 1{};", " + 1".repeat(50000));
+    let src = format!("let x = 1{};", " + 1".repeat(15000));
     let msg = on_small_stack(move || run_err(&src));
     assert!(msg.contains("nested too deeply"), "{msg}");
 }
@@ -626,4 +628,49 @@ fn multiline_error_reporting() {
     let msg = run_err(src);
     assert!(msg.contains("line 4"), "Expected 'line 4' in error message, got: {msg}");
     assert!(!msg.contains("line 0"), "Should not contain 'line 0' in error message, got: {msg}");
+}
+
+#[test]
+fn combined_grammar_paths_cannot_hide_ast_depth() {
+    for suffix in ["[0]".repeat(60), "()".repeat(60), " + 1".repeat(60), "[:]".repeat(60)] {
+        let mut source = "0".to_owned();
+        for _ in 0..60 {
+            source = format!("({source}){suffix}");
+        }
+        source.push(';');
+        let problem = on_small_stack(move || {
+            wisp::parser::parse(&wisp::lexer::lex(&source).unwrap()).unwrap_err()
+        });
+        assert!(problem.message.contains("nested too deeply"), "{problem}");
+    }
+}
+
+#[test]
+fn combined_tree_depth_accounts_for_lambda_bodies_and_blocks() {
+    for wrap in [0, 1, 2] {
+        let mut source = "0".to_owned();
+        for _ in 0..40 {
+            source = match wrap {
+                0 => format!("(fn () {{ return {source}; }})()()()"),
+                1 => format!("[({source})][0][0][0]"),
+                _ => format!("{{0: ({source})}}[0][0][0]"),
+            };
+        }
+        source.push(';');
+        let problem = on_small_stack(move || {
+            wisp::parser::parse(&wisp::lexer::lex(&source).unwrap()).unwrap_err()
+        });
+        assert!(problem.message.contains("nested too deeply"), "{problem}");
+    }
+}
+
+#[test]
+fn accepted_combined_trees_drop_on_a_small_stack() {
+    let source = format!("({}){};", "(0)".to_owned() + &"[0]".repeat(50), "()".repeat(50));
+    on_small_stack(move || {
+        let tokens = wisp::lexer::lex(&source).unwrap();
+        let program = wisp::parser::parse(&tokens).unwrap();
+        drop(program);
+        drop(tokens);
+    });
 }

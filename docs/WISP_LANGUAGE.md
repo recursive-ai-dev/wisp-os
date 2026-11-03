@@ -572,6 +572,13 @@ at most 128 levels deep (parentheses, `not`/`-`, indexing, slicing,
 blocks, and each operator in a chain like `1 + 2 + 3` all count) --
 deeper is a parse error.
 
+Source is limited to 256 KiB and 32768 tokens, including the end-of-input
+token. Whitespace and comments do not consume tokens. Dense or oversized
+programs return a resource error before parsing; these bounds also apply
+to syntax checks in Wisp Studio. The parser checks both its own nesting
+and the resulting tree, including combinations of grouping, calls,
+indices and binary operators.
+
 ## Built-in functions
 
 These are always available and cannot be shadowed by `let` or redefined
@@ -846,10 +853,13 @@ wisp> shout(names[0])
 
 - A line that is just an expression shows its value (strings in quotes,
   so `"1"` and `1` look different); `nil` shows nothing.
-- The final `;` may be left off.
+- The final `;` may be left off, including before a trailing `# comment`.
 - A line that opens more `{`, `(` or `[` than it closes continues on the
   next line, at a `...` prompt, until they balance -- so a `fn`, `if`,
   `while` or `for` can be typed over several lines.
+- A whole interactive piece, including inserted newlines, may contain up
+  to 16 KiB. An append beyond that limit discards the unfinished piece
+  and returns to `wisp>`; previously defined session variables remain.
 - Unlike in a program file, `let` may re-declare a global and `fn` may
   redefine a function an earlier line defined -- that is how you fix a
   typo.

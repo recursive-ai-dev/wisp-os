@@ -3166,3 +3166,20 @@ decoder rather than external OCR. No physical PCI or disk writes were
 performed during development; real NVMe/VMD and USB hardware boot tests
 remain outstanding.
 
+
+
+## v1.2.0 engineering sprint (2026-11-03)
+
+Integrated the existing Wisp Studio and native NVMe/USB-storage work, then
+closed 18 evidence-based correctness, data integrity, input safety and release
+engineering tasks. The parser now measures constructed tree height across
+combined grammar paths, save cleanup validates media and records before writes,
+and release tooling snapshots and checksums all runtime artifacts consistently.
+Original-failure regressions, allocation fault injection, guarded framebuffer
+buffers, constrained stacks and QEMU reboot/installation scenarios verify these
+changes. The obsolete repository-root checksum manifest was removed; release
+packages generate their own complete manifests.
+
+See [release notes](docs/RELEASE_NOTES.md), [verification evidence](docs/SPRINT_VERIFICATION.md)
+and [TODO.md](TODO.md) for results, measured allocation reductions, independent
+review findings and remaining platform/tooling limitations.

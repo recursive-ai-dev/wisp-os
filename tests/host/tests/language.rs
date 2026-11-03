@@ -703,3 +703,129 @@ fn calc_bounds_its_own_recursion() {
         ["= 1", "error: the expression nests too deeply", "error: the expression nests too deeply", "= 5"]
     );
 }
+
+// ---- sprint regressions: parser trust boundaries and prompt recovery ----
+
+#[test]
+fn invalid_indexed_assignment_targets_are_errors_never_panics() {
+    for source in [
+        "items[0]() = 1;",
+        "items[0]()(2) = 1;",
+        "items[0] + 1 = 2;",
+        "items[0] == 1 = 2;",
+        "items[:]() = 2;",
+    ] {
+        let problem = wisp::parser::parse(&wisp::lexer::lex(&format!("\n\n{source}")).unwrap())
+            .unwrap_err();
+        assert_eq!(problem.line, 3, "{source}");
+        assert!(problem.message.contains("invalid assignment target"), "{source}: {problem}");
+    }
+    assert_err("let items = [1]; items[:] = [2];", "cannot assign to a slice");
+    assert_eq!(out("let items = [[1]]; items[0][0] = 9; print(items);"), "[[9]]\n");
+}
+
+#[test]
+fn indexed_expression_statements_keep_binary_precedence_and_calls() {
+    let mut session = Session::new();
+    let mut host = TestHost::default();
+    piece(&mut session, &mut host, "let items = [4, 3]").unwrap();
+    for (source, expected) in [
+        ("items[0] + items[1] * 2", "10"),
+        ("items[0] - 3", "1"),
+        ("items[0] / 2 % 2", "0"),
+        ("items[0] == 4 and items[1] < 5", "true"),
+        ("items[0] != 4 or items[1] >= 3", "true"),
+        ("items[:] + [2]", "[4, 3, 2]"),
+    ] {
+        assert_eq!(show(piece(&mut session, &mut host, source).unwrap()), expected, "{source}");
+    }
+    piece(&mut session, &mut host, "let funcs = [fn (x) { return x + 1; }]").unwrap();
+    assert_eq!(show(piece(&mut session, &mut host, "funcs[0](2) + 4").unwrap()), "7");
+    assert_eq!(out("let a = [1]; a[0] + 3; a[0] = 9; print(a);"), "[9]\n");
+}
+
+#[test]
+fn interactive_implicit_terminators_follow_comments_not_source_bytes() {
+    let mut session = Session::new();
+    let mut host = TestHost::default();
+    for (source, expected) in [
+        ("1 + 2 # comment", "3"),
+        ("1 + 2 # comment ending with ;", "3"),
+        ("1 + 2 # comment\n# next comment", "3"),
+        ("1 + 2; # already terminated", "3"),
+        ("\"# ;\" # comment", "# ;"),
+        ("# comment only", "<none>"),
+        ("\n\t # empty", "<none>"),
+    ] {
+        assert_eq!(show(piece(&mut session, &mut host, source).unwrap()), expected, "{source}");
+    }
+    piece(&mut session, &mut host, "print(1) # comment").unwrap();
+    assert_eq!(host.out, "1\n");
+    for source in ["let = 3 # comment", "\n1 + # incomplete", "\"unterminated #"] {
+        let original = wisp::lexer::lex(source).and_then(|tokens| wisp::parser::parse(&tokens)).unwrap_err();
+        let interactive = wisp::parse_interactive(source).unwrap_err();
+        assert_eq!(interactive.line, original.line);
+        assert_eq!(interactive.message, original.message);
+    }
+}
+
+#[test]
+fn interactive_source_append_is_bounded_atomic_and_reusable() {
+    use wisp::{append_interactive_line, MAX_INTERACTIVE_SOURCE_BYTES};
+    let mut source = String::new();
+    append_interactive_line(&mut source, &"a".repeat(MAX_INTERACTIVE_SOURCE_BYTES - 2)).unwrap();
+    append_interactive_line(&mut source, "b").unwrap();
+    assert_eq!(source.len(), MAX_INTERACTIVE_SOURCE_BYTES);
+    let previous = source.clone();
+    for line in ["", "x", "é"] {
+        assert!(append_interactive_line(&mut source, line).is_err());
+        assert_eq!(source, previous);
+    }
+    source.clear();
+    append_interactive_line(&mut source, "1 + 2").unwrap();
+    let mut session = Session::new();
+    let mut host = TestHost::default();
+    assert_eq!(show(piece(&mut session, &mut host, &source).unwrap()), "3");
+    source.clear();
+    assert!(append_interactive_line(&mut source, &"é".repeat(MAX_INTERACTIVE_SOURCE_BYTES)).is_err());
+    assert!(source.is_empty());
+}
+
+#[test]
+fn lexer_limits_dense_input_and_accepts_exact_token_and_source_boundaries() {
+    use wisp::lexer::{lex, MAX_SOURCE_BYTES, MAX_TOKENS};
+    let dense = ";".repeat(MAX_TOKENS - 1);
+    let tokens = lex(&(dense.clone() + " # trailing whitespace and comment\n")).unwrap();
+    assert_eq!(tokens.len(), MAX_TOKENS);
+    assert!(tokens.capacity() <= MAX_TOKENS);
+    assert!(lex(&(dense + ";")).unwrap_err().message.contains("too many tokens"));
+    let source = format!("#{}", "x".repeat(MAX_SOURCE_BYTES - 1));
+    assert_eq!(lex(&source).unwrap().len(), 1);
+    assert!(lex(&(source + "x")).unwrap_err().message.contains("source limit"));
+    let dense = ";".repeat(MAX_SOURCE_BYTES);
+    for _ in 0..10 {
+        assert!(lex(&dense).unwrap_err().message.contains("too many tokens"));
+        assert_eq!(out("print(1 + 2);"), "3\n");
+    }
+}
+
+#[test]
+fn deterministic_malformed_token_sequences_do_not_panic() {
+    // Regression seed: 0x574953505f504152. Lexed token streams always have
+    // EOF; source syntax itself is fully adversarial here.
+    let atoms = ["x", "0", "[", "]", "(", ")", "{", "}", "=", ";", "+", ":", "fn", ",", "return"];
+    let mut seed = 0x574953505f504152u64;
+    for case in 0..4000 {
+        let mut source = String::new();
+        for _ in 0..(case % 40 + 1) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            source.push_str(atoms[seed as usize % atoms.len()]);
+            source.push(' ');
+        }
+        let tokens = wisp::lexer::lex(&source).unwrap();
+        let _ = wisp::parser::parse(&tokens);
+        let _ = wisp::parse_interactive(&source);
+    }
+}

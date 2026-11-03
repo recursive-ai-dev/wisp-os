@@ -157,6 +157,18 @@ If the winner fails its checksum, `load` reports corruption. It never
 falls back to an older copy: that would silently hand back a value the
 program had already replaced.
 
+Reclamation validates the winning copy's length and checksum before
+freeing any duplicates. If that validation fails, an unrelated mutation
+leaves every copy untouched. Explicitly saving over the damaged key can
+repair it when a free slot exists: its old copies remain until the new
+value commits, then are retired. If there is no free slot, recovery fails
+without sacrificing the remaining intact copy. Device read errors are
+propagated even during explicit recovery.
+
+Every mounted operation also revalidates the superblock before scanning
+slots or reclaiming copies. Media that changed to a foreign or unsupported
+format after mounting is refused before any save or delete writes.
+
 ### Checksum
 
 `fnv1a32`, the standard 32-bit FNV-1a algorithm (offset basis
@@ -179,9 +191,9 @@ is a hard error, never a silent "not found" or a silently wrong value.
 
 `save(key, value)` never overwrites a key's winner. It:
 
-1. scans every slot's header; frees every stale copy of *any* key and
-   flushes (so a later step can never let an older generation
-   resurface);
+1. scans every slot's header; validates winners before freeing their
+   stale copies and flushes (so a later step can never let an older
+   generation resurface);
 2. refuses if the key is new and 63 keys are already stored (one slot
    must stay free for the next update);
 3. if the store is still version 1, upgrades it (see "Version 1");
@@ -190,7 +202,7 @@ is a hard error, never a silent "not found" or a silently wrong value.
    slot's first sector, then a flush; then the first sector (header,
    generation, checksum), then a flush. **That flush is the commit
    point**: from here the new copy is the winner;
-5. frees the old winner and flushes.
+5. frees the key's previous copies and flushes.
 
 A device's write cache may persist any of the writes not yet flushed,
 in any order, when power is lost. Walking through the steps under that
@@ -256,6 +268,11 @@ decode as `Int`s or `Str`s in strictly ascending order (all ints, by
 value, before all strings, by byte) -- the only order the encoder writes
 -- so a repeated or out-of-order key is reported as corrupt data rather
 than silently merged.
+
+List storage grows fallibly as elements are successfully decoded; the
+decoder never reserves capacity directly from an untrusted element count.
+This keeps nested malformed counts from multiplying allocations before
+the truncated payload is rejected.
 
 Adding the `Map` tag did not change the format version: the slot layout
 is the same, so a disk written with maps is still a version-2 disk, and

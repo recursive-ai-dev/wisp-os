@@ -17,14 +17,14 @@ This needs Python 3 and `xorriso`, plus the usual Rust build tools. Use
 `--skip-build` to package an existing `esp/EFI/BOOT/BOOTX64.EFI`, or
 `--output /path/wisp-live.iso` to choose the output file. No root access,
 mount operation or additional Python packages are needed. The default
-output is `dist/wisp-os-v1.1.0-live.iso` and its `.sha256` file. The ISO has
+output is `dist/wisp-os-v1.2.0-live.iso` and its `.sha256` file. The ISO has
 both an EFI El Torito entry for optical/VM boot and a GPT EFI partition
 for USB image-writing tools. Secure Boot requirements still apply.
 
 For a VM trial with a separate, disposable image destination:
 
 ```bash
-UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.1.0-live.iso ./run.sh
+UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.2.0-live.iso ./run.sh
 ```
 
 The runner creates `install.img` at 128 MiB if missing. Select another
@@ -59,11 +59,18 @@ target; boot the live medium and install again. It installs the standard
 boot entries. Some firmware requires choosing that file using its
 “boot from EFI file” facility on an internal disk.
 
-The installed save store mounts automatically on supported AHCI disks.
-`format` resets only that save region, preserving the boot partition.
-Firmware may install and boot Wisp on NVMe or USB even though the kernel
-still needs AHCI for persistence after Boot Services ends. The installer
+The installed save store can mount through native AHCI SATA, NVMe, or
+xHCI USB Bulk-Only drivers after Boot Services ends. Native 512-byte
+sectors are required for writable v2 saves; 4 KiB-native NVMe/USB media
+are read-only. `format` resets only the save region, preserving GPT and
+the boot partition. Intel client VMD domains, including `8086:467f`, are
+discovered, but physical VMD hardware has not been verified. The installer
 does not add networking or online updates.
+
+Use `disks` to inspect the disks and `disk <n>` to select one without
+changing its contents. Boot selects a unique formatted store, otherwise
+a unique eligible format target; ambiguous choices need manual selection.
+Selection is for this boot and does not format the disk.
 
 ## Prepare a USB stick from another OS
 
@@ -78,8 +85,15 @@ containing `EFI/BOOT/BOOTX64.EFI` and the `APPS/*.wisp` programs.
 | macOS | `scripts/install_usb_macos.sh` | `diskutil` |
 | Windows | `scripts/install_usb_windows.ps1` | PowerShell `Storage` module |
 
-All three prepare live media with the boot menu above. They follow the
-same two-step pattern and the same safety philosophy:
+All three prepare live media with the boot menu above. These host scripts
+create a boot FAT volume, not a Wisp save partition. A plain boot stick
+therefore cannot save merely by running `format`: the kernel refuses
+foreign partition tables. Use the live installer on a separate eligible
+destination to create both the ESP and Wisp save partition. An installed
+USB disk can then hold persistent saves when connected to a supported
+xHCI root port.
+
+The scripts follow the same two-step pattern and the same safety philosophy:
 
 ```
 <script> list                     # read-only: shows candidate disks
@@ -88,7 +102,7 @@ same two-step pattern and the same safety philosophy:
 
 `esp/EFI/BOOT/BOOTX64.EFI` must exist -- that's what gets copied onto the
 stick, along with everything in `esp/APPS/`. A release archive
-(`wisp-os-v1.1.0.tar.gz` / `.zip`) ships it prebuilt (check it with
+(`wisp-os-v1.2.0.tar.gz` / `.zip`) ships it prebuilt (check it with
 `sha256sum -c SHA256SUMS` in the extracted folder); from a source checkout,
 run `./build.sh` first (see the main `README`/`CHANGES.md`).
 
@@ -256,13 +270,20 @@ up but does not respond to typing, move the keyboard to a port directly
 on the machine rather than through a hub, dock or monitor, and power-
 cycle rather than hot-plugging it.
 
-**Storage.** Saved data (`save`/`load` in WISP) needs an **AHCI** SATA
-controller with a disk attached. NVMe is not supported, and neither is
-IDE-mode SATA -- a firmware setting of "IDE"/"Compatibility" instead of
-"AHCI" will leave the shell fully usable with persistence disabled, and
-it says so on screen when that happens rather than failing silently. The
-boot stick itself is read through UEFI's own protocols before exit from
-Boot Services, so it does not depend on any of this.
+**Storage.** Native drivers support **AHCI SATA**, **NVMe**, and **xHCI
+USB Bulk-Only SCSI** disks. PCI discovery covers firmware-assigned buses
+and supported Intel client VMD domains. Each of the first AHCI and NVMe
+controllers supplies one disk/namespace; the first xHCI controller accepts
+up to four root-port BOT disks, LUN0 only. UAS, hubs, hot-plug and
+IDE-mode SATA are not implemented.
+
+Writable saves require native **512-byte sectors** and an existing Wisp
+save partition or eligible raw disk. 4 KiB-native NVMe/USB media are read
+only: v2's 512-byte commit records cannot safely share a native block.
+Booting files through firmware still works independently of these native
+drivers. `disks` shows candidates; `disk <n>` changes selection without
+formatting. The live installer creates the save partition needed for
+persistence on the installed USB or NVMe disk.
 
 **Display.** A UEFI Graphics Output Protocol framebuffer, which is
 effectively universal on UEFI machines. The console is drawn by this

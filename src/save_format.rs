@@ -1,9 +1,9 @@
-//! A hand-designed, fixed-slot key/value store on top of `ahci.rs`'s raw
+//! A hand-designed, fixed-slot key/value store on top of `storage.rs`'s raw
 //! sector read/write -- Build Order Step 8 of the Phase 2 plan, and the
 //! only way a WISP program's `save`/`load` data survives a reboot.
 //!
 //! Apps are served from the boot volume's read-only in-memory snapshot.
-//! Saves use a small copy-on-write store, either on a legacy raw AHCI disk
+//! Saves use a small copy-on-write store, either on a legacy raw disk
 //! or inside the dedicated WISP GPT save partition created by the installer.
 //! Partition discovery validates the GPT before constructing a bounded view;
 //! the boot partition and unrelated partitions are never save-write targets.
@@ -109,7 +109,7 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::ahci::Hba;
+use crate::storage::Disk as Hba;
 use crate::wisp::value::{ListCell, MapCell, MapKey, Value, MAX_VALUE_DEPTH};
 
 /// On-disk magic identifying a disk formatted for this store. It names the
@@ -136,8 +136,8 @@ pub const MAX_KEYS: usize = SLOT_COUNT as usize - 1;
 /// every slot read/write is a small loop over [`Hba::read_sector`]/
 /// [`Hba::write_sector`], never a partial-sector operation.
 const SECTORS_PER_SLOT: u32 = 8;
-const SECTOR: usize = crate::ahci::SECTOR_SIZE as usize;
-const SLOT_SIZE: u32 = SECTORS_PER_SLOT * crate::ahci::SECTOR_SIZE;
+const SECTOR: usize = crate::storage::SECTOR_SIZE as usize;
+const SLOT_SIZE: u32 = SECTORS_PER_SLOT * crate::storage::SECTOR_SIZE;
 /// Maximum key length, chosen to comfortably fit any identifier-shaped
 /// name (WISP identifiers are short ASCII words) while keeping the slot
 /// header itself small and fixed-size.
@@ -181,6 +181,9 @@ const TAG_LIST: u8 = 4;
 /// one as unreadable (an unrecognized tag) rather than misreading it.
 const TAG_MAP: u8 = 5;
 
+const CORRUPT_LENGTH: &str = "save_format: corrupt slot -- stored value length exceeds the slot's capacity";
+const CORRUPT_CHECKSUM: &str = "save_format: corrupt slot -- checksum mismatch";
+
 fn slot_lba(slot_index: u16) -> u64 {
     SLOTS_START_LBA + (slot_index as u64) * (SECTORS_PER_SLOT as u64)
 }
@@ -223,6 +226,16 @@ impl<'a> Region<'a> {
         }
         let mut sector1 = [0u8; SECTOR];
         unsafe { hba.read_sector(1, &mut sector1)? };
+        // The current GPT reader uses 512-byte LBAs. A native 4Kn GPT
+        // puts its header at byte 4096, even if its protective MBR is
+        // missing. Refuse that geometry before any format can touch it.
+        if hba.native_sector_size() > 512 {
+            let mut native_header = [0u8; SECTOR];
+            unsafe { hba.read_sector(u64::from(hba.native_sector_size() / 512), &mut native_header)? };
+            if &native_header[..8] == b"EFI PART" {
+                return Err("save_format: native 4Kn GPT partitions are not supported; disk left untouched");
+            }
+        }
         if sector0[510..512] != [0x55, 0xaa] && &sector1[..8] != b"EFI PART" {
             // An unpartitioned disk may be provisioned only after consent.
             return Ok(Some(Self { hba, start: 0 }));
@@ -244,8 +257,15 @@ impl<'a> Region<'a> {
 
     unsafe fn identified(hba: &'a Hba) -> Result<Self, &'static str> {
         let sectors = hba.info().ok_or("save_format: disk has not been identified")?.total_sectors;
-        unsafe { Self::discover(hba, sectors)? }
-            .ok_or("save_format: partitioned disk has no WISP save partition")
+        let region = unsafe { Self::discover(hba, sectors)? }
+            .ok_or("save_format: partitioned disk has no WISP save partition")?;
+        // Mount state is only a boot-time observation. Revalidate before
+        // scanning slots, especially before any stale-copy reclamation.
+        let mut sb = [0u8; SECTOR];
+        unsafe { region.read_sector(SUPERBLOCK_LBA, &mut sb)? };
+        superblock_version(&sb)
+            .map_err(|_| "save_format: the superblock is no longer valid -- the disk changed since it was mounted")?;
+        Ok(region)
     }
 
     fn physical_lba(&self, lba: u64) -> Result<u64, &'static str> {
@@ -258,6 +278,9 @@ impl<'a> Region<'a> {
     }
 
     unsafe fn write_sector(&self, lba: u64, data: &[u8; SECTOR]) -> Result<(), &'static str> {
+        if self.hba.native_sector_size() != 512 {
+            return Err("save_format: writes need 512-byte native blocks; 4Kn stores require an aligned future format");
+        }
         unsafe { self.hba.write_sector(self.physical_lba(lba)?, data) }
     }
 
@@ -429,13 +452,18 @@ fn deserialize_value(bytes: &[u8], depth: u32) -> Result<(Value, usize), &'stati
             // than there are bytes left to hold them (every element is at
             // least 1 byte) -- reject an implausible count up front rather
             // than looping `count` times against corrupt data.
-            if count as usize > LEGACY_VALUE_MAX_LEN {
+            if count as usize > rest.len() - 4 {
                 return Err("save_format: stored list length is implausibly large -- corrupt data");
             }
             let mut consumed = 1 + 4;
-            let mut items = Vec::with_capacity(count as usize);
+            let mut items = Vec::new();
             for _ in 0..count {
                 let (item, item_len) = deserialize_value(&bytes[consumed..], depth + 1)?;
+                // Reserve only for values that were actually decoded. Even
+                // individually plausible nested counts can collectively
+                // describe far more items than the slot contains.
+                items.try_reserve(1)
+                    .map_err(|_| "save_format: out of memory decoding a stored list")?;
                 items.push(item);
                 consumed += item_len;
             }
@@ -446,9 +474,9 @@ fn deserialize_value(bytes: &[u8], depth: u32) -> Result<(Value, usize), &'stati
                 .get(0..4)
                 .ok_or("save_format: truncated value data (missing map length)")?;
             let count = u32::from_le_bytes(count_slice.try_into().expect("slice is exactly 4 bytes long"));
-            // Every entry is at least two bytes (a key and a value), so the
-            // same up-front plausibility check as a list's applies.
-            if count as usize > LEGACY_VALUE_MAX_LEN / 2 {
+            // The shortest valid key is an empty string (five bytes), and
+            // every value uses at least one byte.
+            if count as usize > (rest.len() - 4) / 6 {
                 return Err("save_format: stored map length is implausibly large -- corrupt data");
             }
             let mut consumed = 1 + 4;
@@ -539,6 +567,9 @@ pub unsafe fn probe(hba: &Hba, total_sectors: u64) -> Result<Probe, &'static str
 /// # Safety
 /// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
 pub unsafe fn provision(hba: &Hba, total_sectors: u64) -> Result<(), &'static str> {
+    if hba.native_sector_size() != 512 {
+        return Err("save_format: formatting needs 512-byte native blocks; 4Kn disks are read-only");
+    }
     let region = unsafe { Region::discover(hba, total_sectors)? }
         .ok_or("save_format: partitioned disk has no WISP save partition; format refused")?;
     let hba = &region;
@@ -592,7 +623,7 @@ impl Header {
     fn used_len(&self) -> Result<usize, &'static str> {
         let (start, max) = self.value_start_and_max();
         if self.len > max {
-            return Err("save_format: corrupt slot -- stored value length exceeds the slot's capacity");
+            return Err(CORRUPT_LENGTH);
         }
         Ok(start + self.len)
     }
@@ -666,8 +697,8 @@ impl Scan {
         best
     }
 
-    /// Every copy that is not its key's winner: invisible to readers, and
-    /// safe to free.
+    /// Every copy that is not its key's header-selected winner: invisible
+    /// to readers, but reclaimable only after that winner is validated.
     fn stale(&self) -> Vec<u16> {
         let mut out = Vec::new();
         for (index, slot) in self.slots.iter().enumerate() {
@@ -698,17 +729,52 @@ unsafe fn free_slot(hba: &Region<'_>, slot_index: u16) -> Result<(), &'static st
     unsafe { write_region_sector(hba, slot_lba(slot_index), &[0u8; SECTOR]) }
 }
 
-/// Free every stale copy, then flush, so none of them can outlive a later
-/// write. Run first by every operation that writes slots.
+/// Validate winners before freeing their stale copies. A forged generation
+/// must never authorize deletion of the only intact copy. An explicit
+/// replacement can repair a corrupt winner, but retains that key's copies
+/// until the new value commits. Transport errors always propagate.
 ///
 /// # Safety
 /// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
-unsafe fn reclaim_stale(hba: &Region<'_>, scan: &mut Scan) -> Result<(), &'static str> {
+unsafe fn reclaim_stale(
+    hba: &Region<'_>,
+    scan: &mut Scan,
+    replacing: Option<&[u8; KEY_MAX_LEN]>,
+) -> Result<(), &'static str> {
     let stale = scan.stale();
     if stale.is_empty() {
         return Ok(());
     }
+    let mut verified = [None; SLOT_COUNT as usize];
+    let mut reclaim = Vec::new();
     for &slot_index in &stale {
+        let Slot::Copy(header) = scan.slots[slot_index as usize] else {
+            continue;
+        };
+        let (winner, header) = scan.winner(&header.key)
+            .ok_or("save_format: internal error -- stale copy has no winner")?;
+        let safe = match verified[winner as usize] {
+            Some(safe) => safe,
+            None => {
+                let safe = match unsafe { read_copy(hba, winner, &header) } {
+                    Ok(_) => true,
+                    Err(CORRUPT_CHECKSUM | CORRUPT_LENGTH) if replacing == Some(&header.key) => false,
+                    Err(error) => return Err(error),
+                };
+                verified[winner as usize] = Some(safe);
+                safe
+            }
+        };
+        if safe {
+            reclaim.push(slot_index);
+        }
+    }
+    // Finish every validation before the first write so a corrupt winner
+    // discovered later cannot leave a partially reclaimed store.
+    if reclaim.is_empty() {
+        return Ok(());
+    }
+    for slot_index in reclaim {
         unsafe { free_slot(hba, slot_index)? };
         scan.slots[slot_index as usize] = Slot::Free;
     }
@@ -746,7 +812,7 @@ unsafe fn read_copy(hba: &Region<'_>, slot_index: u16, h: &Header) -> Result<Vec
         fnv1a32(&[&raw[..OFF_CHECKSUM], &raw[OFF_GENERATION..used]])
     };
     if checksum != h.checksum {
-        return Err("save_format: corrupt slot -- checksum mismatch");
+        return Err(CORRUPT_CHECKSUM);
     }
     raw.truncate(used);
     raw.drain(..start);
@@ -840,15 +906,16 @@ unsafe fn save_in(hba: &Region<'_>, key: &str, value: &Value) -> Result<(), &'st
         return unsafe { delete_in(hba, key) }.map(|_| ());
     }
     let encoded = encode(value)?;
+    let field = key_field(key);
 
     // Freeing stale copies is valid in either version (a free slot is the
     // same in both), so it may run before the upgrade; the upgrade itself
     // waits until the save is known to be possible, so a save that fails
     // for lack of room leaves a version-1 store a version-1 store.
     let mut scan = unsafe { Scan::read(hba)? };
-    unsafe { reclaim_stale(hba, &mut scan)? };
+    unsafe { reclaim_stale(hba, &mut scan, Some(&field))? };
 
-    let old = scan.winner(&key_field(key));
+    let old = scan.winner(&field);
     if old.is_none() && scan.occupied() >= MAX_KEYS {
         return Err("save_format: the save disk is full (63 keys is the limit) -- delete a key first");
     }
@@ -874,9 +941,17 @@ unsafe fn save_in(hba: &Region<'_>, key: &str, value: &Value) -> Result<(), &'st
     // never reaches the media, the old copy is merely stale -- invisible
     // to readers, and reclaimed by the next save or delete. Reporting an
     // error here would claim a save failed that in fact took effect.
-    if let Some((old_slot, _)) = old {
-        // SAFETY: the caller's contract, as above.
-        let _ = unsafe { free_slot(hba, old_slot).and_then(|()| hba.flush_cache()) };
+    if old.is_some() {
+        // Include any copies preserved while explicitly replacing a corrupt
+        // winner. The new target was free in this scan and cannot be retired.
+        let _ = (|| -> Result<(), &'static str> {
+            for (slot, copy) in scan.slots.iter().enumerate() {
+                if matches!(copy, Slot::Copy(header) if header.key == field) {
+                    unsafe { free_slot(hba, slot as u16)? };
+                }
+            }
+            unsafe { hba.flush_cache() }
+        })();
     }
     Ok(())
 }
@@ -891,7 +966,7 @@ unsafe fn save_in(hba: &Region<'_>, key: &str, value: &Value) -> Result<(), &'st
 unsafe fn delete_in(hba: &Region<'_>, key: &str) -> Result<bool, &'static str> {
     validate_key(key)?;
     let mut scan = unsafe { Scan::read(hba)? };
-    unsafe { reclaim_stale(hba, &mut scan)? };
+    unsafe { reclaim_stale(hba, &mut scan, None)? };
     match scan.winner(&key_field(key)) {
         None => Ok(false),
         Some((slot_index, _)) => {
@@ -983,7 +1058,7 @@ pub unsafe fn keys(hba: &Hba) -> Result<Vec<(String, usize)>, &'static str> {
     unsafe { keys_in(&Region::identified(hba)?) }
 }
 
-/// The save disk as the shell sees it: the AHCI device, its size, and
+/// The save disk as the shell sees it: the native device, its size, and
 /// whether it currently carries a valid store. Owning all three together
 /// is what lets `save`/`load` refuse an unformatted disk, and lets the
 /// `format` command mount the disk the moment provisioning succeeds.
@@ -1011,6 +1086,9 @@ impl SaveDisk {
     /// Inclusive physical sector range that an explicit format may overwrite.
     /// Foreign or malformed partition tables are rejected before confirmation.
     pub fn format_range(&self) -> Result<(u64, u64), &'static str> {
+        if self.hba.native_sector_size() != 512 {
+            return Err("save_format: formatting needs 512-byte native blocks; 4Kn disks are read-only");
+        }
         let region = unsafe { Region::discover(&self.hba, self.total_sectors)? }
             .ok_or("save_format: partitioned disk has no WISP save partition; format refused")?;
         Ok((region.start, region.physical_lba(REGION_SECTORS - 1)?))
@@ -1033,7 +1111,7 @@ impl SaveDisk {
     /// [`save`] against this disk, if it is mounted.
     pub fn save(&self, key: &str, value: &Value) -> Result<(), &'static str> {
         self.usable()?;
-        // SAFETY: `hba` came from `ahci::init` and was identified, and
+        // SAFETY: the native driver was initialized and identified, and
         // `mounted` proves a valid superblock -- `save`'s contract.
         unsafe { save(&self.hba, key, value) }
     }
@@ -1066,7 +1144,7 @@ impl SaveDisk {
             return Err("the save disk was taken offline after an unrecoverable error (reboot to retry)");
         }
         self.mounted = false;
-        // SAFETY: `hba` came from `ahci::init` and was identified.
+        // SAFETY: the native driver was initialized and identified.
         unsafe { provision(&self.hba, self.total_sectors)? };
         self.mounted = true;
         Ok(())

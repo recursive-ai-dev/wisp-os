@@ -18,10 +18,13 @@ pub struct DiskInfo {
 }
 
 pub struct Hba {
+    pub native_block_size: Cell<u32>,
     media: RefCell<Vec<Sector>>,
     cache: RefCell<BTreeMap<u64, Sector>>,
     /// Fail the write with this 0-based index (counting every write).
     pub fail_write_at: Cell<Option<usize>>,
+    /// Fail the read with this 0-based index (counting every read).
+    pub fail_read_at: Cell<Option<usize>>,
     /// Fail every flush while set.
     pub fail_flush: Cell<bool>,
     /// Fail every write and flush once this many of them (counted together
@@ -43,9 +46,11 @@ impl Hba {
     /// A disk whose media already holds `media` (and whose cache is empty).
     pub fn from_media(media: Vec<Sector>) -> Self {
         Self {
+            native_block_size: Cell::new(512),
             media: RefCell::new(media),
             cache: RefCell::new(BTreeMap::new()),
             fail_write_at: Cell::new(None),
+            fail_read_at: Cell::new(None),
             fail_flush: Cell::new(false),
             fail_after_ops: Cell::new(None),
             writes: Cell::new(0),
@@ -62,6 +67,8 @@ impl Hba {
     pub fn total_sectors(&self) -> u64 {
         self.media.borrow().len() as u64
     }
+
+    pub fn native_sector_size(&self) -> u32 { self.native_block_size.get() }
 
     /// Write straight to media, bypassing the cache and counters -- for
     /// setting up a disk's initial contents.
@@ -100,7 +107,11 @@ impl Hba {
     }
 
     pub unsafe fn read_sector(&self, lba: u64, out: &mut Sector) -> Result<(), &'static str> {
-        self.reads.set(self.reads.get() + 1);
+        let n = self.reads.get();
+        self.reads.set(n + 1);
+        if self.fail_read_at.get() == Some(n) {
+            return Err("mock: injected read failure");
+        }
         let media = self.media.borrow();
         let sector = self
             .cache

@@ -36,13 +36,13 @@
 //! a held key does repeat there; the USB boot protocol has no such thing,
 //! and a host-side repeat timer is not worth its complexity here.)
 
-use crate::sync::Locked;
-use crate::xhci::Xhci;
 use crate::keyboard::ESC;
 use crate::line_editor::{
-    KEY_DELETE as DEL, KEY_DOWN as DOWN, KEY_END as END, KEY_HOME as HOME, KEY_LEFT as LEFT,
-    KEY_RIGHT as RIGHT, KEY_UP as UP,
+    KEY_DELETE as DEL, KEY_DOWN as DOWN, KEY_END as END, KEY_F1, KEY_HOME as HOME,
+    KEY_LEFT as LEFT, KEY_PAGE_DOWN as PGDN, KEY_PAGE_UP as PGUP, KEY_RIGHT as RIGHT, KEY_UP as UP,
 };
+use crate::sync::Locked;
+use crate::xhci::Xhci;
 use crate::{debugcon, keyboard};
 
 /// ASCII carriage return, matching `shell.rs`'s and `keyboard.rs`'s
@@ -53,14 +53,13 @@ const ENTER: u8 = 0x0d;
 const BACKSPACE: u8 = 0x08;
 
 /// HID Keyboard/Keypad usage codes (HID Usage Tables 1.12, section 10)
-/// mapped to the same ASCII byte space `keyboard.rs` already produces --
+/// mapped to the same ASCII and `KEY_*` byte space `keyboard.rs` produces --
 /// so `shell.rs` and WISP's `input()` cannot tell which physical
 /// keyboard a byte came from, which is the point.
 ///
-/// `0` marks a usage with no ASCII meaning here (modifiers, function
-/// keys, arrows, lock keys); those are dropped rather than
+/// `0` marks an unused usage (modifiers, lock keys); those are dropped rather than
 /// substituted with a wrong character, exactly as `keyboard.rs` drops
-/// unmapped scancodes.
+/// unmapped scancodes. F1 through F10 are decoded separately.
 #[rustfmt::skip]
 const UNSHIFTED: [u8; 0x68] = [
     0,    0,    0,    0,    b'a', b'b', b'c', b'd', // 0x00-0x07
@@ -72,7 +71,7 @@ const UNSHIFTED: [u8; 0x68] = [
     b']', b'\\', 0,   b';', b'\'', b'`', b',', b'.', // 0x30-0x37 (0x32=non-US #)
     b'/', 0,    0,    0,    0,    0,    0,    0,    // 0x38-0x3F (0x39=CapsLock, 0x3A..=F1..)
     0,    0,    0,    0,    0,    0,    0,    0,    // 0x40-0x47
-    0,    0,    HOME, 0,    DEL,  END,  0,    RIGHT, // 0x48-0x4F (0x4A=Home, 0x4C=Delete, 0x4D=End, 0x4F=Right)
+    0,    0,    HOME, PGUP, DEL,  END,  PGDN, RIGHT, // 0x48-0x4F (Home, PageUp, Delete, End, PageDown, Right)
     LEFT, DOWN, UP,   0,    b'/', b'*', b'-', b'+', // 0x50-0x57 (Left, Down, Up, NumLock, keypad / * - +)
     ENTER, b'1', b'2', b'3', b'4', b'5', b'6', b'7', // 0x58-0x5F (keypad Enter, 1-7)
     b'8', b'9', b'0', b'.', 0,    0,    0,    0,    // 0x60-0x67 (keypad 8, 9, 0, .)
@@ -89,7 +88,7 @@ const SHIFTED: [u8; 0x68] = [
     b'}', b'|', 0,    b':', b'"', b'~', b'<', b'>',
     b'?', 0,    0,    0,    0,    0,    0,    0,
     0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    HOME, 0,    DEL,  END,  0,    RIGHT,
+    0,    0,    HOME, PGUP, DEL,  END,  PGDN, RIGHT,
     LEFT, DOWN, UP,   0,    b'/', b'*', b'-', b'+',
     ENTER, b'1', b'2', b'3', b'4', b'5', b'6', b'7',
     b'8', b'9', b'0', b'.', 0,    0,    0,    0,
@@ -139,12 +138,29 @@ static USB: Locked<UsbInput> = Locked::new(UsbInput {
 /// Adopt a brought-up controller with a live keyboard. Called once, from
 /// `main.rs`'s boot sequence, if `xhci::init` found one.
 pub fn install(controller: Xhci) {
+    let has_keyboard = controller.has_keyboard();
     USB.with(|usb| {
         usb.controller = Some(controller);
         usb.previous = [0; 6];
         usb.first_key_logged = false;
     });
-    debugcon::write_str("[usb_hid] USB keyboard installed as an input source\n");
+    if has_keyboard {
+        debugcon::write_str("[usb_hid] USB keyboard installed as an input source\n");
+    }
+}
+
+/// Temporarily borrow the controller on the mainline with interrupts enabled.
+/// No IRQ handler accesses USB. Taking ownership out under the short lock
+/// prevents nested polls from borrowing the controller while an I/O wait runs.
+pub(crate) fn with_controller<R>(
+    operation: impl FnOnce(&mut Xhci) -> R,
+) -> Result<R, &'static str> {
+    let mut controller = USB
+        .with(|usb| usb.controller.take())
+        .ok_or("usb-storage: USB controller unavailable")?;
+    let result = operation(&mut controller);
+    USB.with(|usb| usb.controller = Some(controller));
+    Ok(result)
 }
 
 /// Drain the controller's event ring and enqueue a byte for every key
@@ -175,7 +191,9 @@ pub fn poll() {
             controller.poll(|report| {
                 let modifiers = report[0];
                 let shift = modifiers & (MOD_LEFT_SHIFT | MOD_RIGHT_SHIFT) != 0;
-                let keys: [u8; 6] = [report[2], report[3], report[4], report[5], report[6], report[7]];
+                let keys: [u8; 6] = [
+                    report[2], report[3], report[4], report[5], report[6], report[7],
+                ];
 
                 for &usage in &keys {
                     if usage == 0 {
@@ -193,6 +211,13 @@ pub fn poll() {
                     // previous report is not a new keystroke. See the
                     // module doc comment.
                     if previous.contains(&usage) {
+                        continue;
+                    }
+                    // HID usages for F1 through F10 are consecutive;
+                    // emit the same codes as the PS/2 driver, shifted or not.
+                    if (0x3a..=0x43).contains(&usage) {
+                        keyboard::push_decoded(KEY_F1 + usage - 0x3a);
+                        saw_key = true;
                         continue;
                     }
                     let table = if shift { &SHIFTED } else { &UNSHIFTED };

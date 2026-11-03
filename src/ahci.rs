@@ -466,7 +466,7 @@ unsafe fn bring_up_first_available_port(abar: *mut u8, pi: u32) -> Result<PortHa
 /// twice would map it twice, wasting page-table entries harmlessly rather
 /// than corrupting anything, but there's no reason to).
 pub unsafe fn init() -> Result<Hba, &'static str> {
-    let devices = pci::enumerate_bus0();
+    let devices = pci::enumerate_devices();
     let Some(controller) = pci::find_ahci_controller(&devices) else {
         debugcon::write_str(
             "[ahci] no AHCI controller found on PCI bus 0 -- persistent storage unavailable\n",
@@ -900,10 +900,7 @@ impl Hba {
             return Err("ahci: attached disk reports a logical sector size other than 512 bytes -- unsupported by this driver");
         }
 
-        let total_sectors = u64::from(words[100])
-            | (u64::from(words[101]) << 16)
-            | (u64::from(words[102]) << 32)
-            | (u64::from(words[103]) << 48);
+        let total_sectors = crate::ahci_format::capacity(&words)?;
 
         // Word 83 bit 13: FLUSH CACHE EXT supported; bit 12: FLUSH CACHE
         // supported. Words 82/85 bit 5: volatile write cache supported /
@@ -948,11 +945,11 @@ impl Hba {
     /// into `out` via READ DMA EXT (ATA8-ACS, 7.24).
     ///
     /// # Safety
-    /// Same contract as [`Hba::identify`]. `lba` must be within the disk's
-    /// addressable range -- an out-of-range LBA is a device-reported error
-    /// (caught via `PxTFD.STS.ERR`, not undefined behavior), but is still
-    /// the caller's responsibility to avoid.
+    /// Same contract as [`Hba::identify`]. The disk must be identified;
+    /// out-of-range LBAs are rejected before command encoding or DMA.
     pub unsafe fn read_sector(&self, lba: u64, out: &mut [u8; SECTOR_SIZE as usize]) -> Result<(), &'static str> {
+        let sectors = self.info.as_ref().ok_or("ahci: disk has not been identified")?.total_sectors;
+        crate::ahci_format::validate_sector(sectors, lba)?;
         // SAFETY: `self` was constructed by `init`.
         unsafe { self.issue(ATA_CMD_READ_DMA_EXT, lba, 1, SECTOR_SIZE, false, COMMAND_TIMEOUT_TICKS)? };
         // SAFETY: `issue` returned `Ok`, meaning the HBA DMA'd exactly
@@ -979,6 +976,8 @@ impl Hba {
     /// # Safety
     /// Same contract as [`Hba::read_sector`].
     pub unsafe fn write_sector(&self, lba: u64, data: &[u8; SECTOR_SIZE as usize]) -> Result<(), &'static str> {
+        let sectors = self.info.as_ref().ok_or("ahci: disk has not been identified")?.total_sectors;
+        crate::ahci_format::validate_sector(sectors, lba)?;
         if self.state.get() == PortState::Failed {
             // Checked here as well as in `issue`: the scratch buffer may
             // still belong to the HBA, so it must not even be filled.

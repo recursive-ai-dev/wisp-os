@@ -23,7 +23,7 @@ use super::WispError;
 pub const MAX_SYNTAX_DEPTH: usize = 128;
 
 pub fn parse(tokens: &[Token]) -> Result<Program, WispError> {
-    let mut p = Parser { tokens, pos: 0, depth: 0 };
+    let mut p = Parser { tokens, pos: 0, depth: 0, height: 0 };
     let mut items = Vec::new();
     while !p.is_eof() {
         // `fn name` declares; `fn (` starts an expression statement.
@@ -42,9 +42,26 @@ struct Parser<'t> {
     /// Syntax-tree depth of the node currently being parsed; see
     /// [`MAX_SYNTAX_DEPTH`].
     depth: usize,
+    /// Height of the most recently returned expression, statement or block.
+    /// Unlike `depth` (active parser recursion), this survives a grouped
+    /// expression followed by more operators. Every parent combines its
+    /// children's heights before returning, so building and dropping the
+    /// resulting AST has the same bound even across grammar productions.
+    height: usize,
 }
 
 impl<'t> Parser<'t> {
+    fn finish<T>(&mut self, node: T, height: usize) -> Result<T, WispError> {
+        if height > MAX_SYNTAX_DEPTH {
+            return Err(WispError::new(
+                self.peek_line(),
+                format!("program is nested too deeply (over {MAX_SYNTAX_DEPTH} levels of blocks/expressions)"),
+            ));
+        }
+        self.height = height;
+        Ok(node)
+    }
+
     /// Go one level deeper into the syntax tree, failing cleanly past
     /// [`MAX_SYNTAX_DEPTH`]. Callers restore `self.depth` on the way out;
     /// on an error the whole parse is abandoned, so no restore is needed.
@@ -130,12 +147,12 @@ impl<'t> Parser<'t> {
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         let (params, body) = self.parse_params_and_body()?;
-        Ok(FuncDecl {
+        self.finish(FuncDecl {
             name,
             params,
             body,
             line,
-        })
+        }, self.height + 1)
     }
 
     /// `(a, b) { ... }`: what a named declaration and an anonymous function
@@ -172,13 +189,14 @@ impl<'t> Parser<'t> {
             ));
         }
         let (params, body) = self.parse_params_and_body()?;
-        Ok(alloc::rc::Rc::new(Lambda { params, body, line }))
+        self.finish(alloc::rc::Rc::new(Lambda { params, body, line }), self.height + 1)
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, WispError> {
         self.descend()?;
         self.expect(Tok::LBrace)?;
         let mut stmts = Vec::new();
+        let mut height = 0;
         while !self.check(&Tok::RBrace) {
             if self.is_eof() {
                 return Err(WispError::new(
@@ -187,10 +205,11 @@ impl<'t> Parser<'t> {
                 ));
             }
             stmts.push(self.parse_stmt()?);
+            height = height.max(self.height);
         }
         self.expect(Tok::RBrace)?;
         self.depth -= 1;
-        Ok(stmts)
+        self.finish(stmts, height + 1)
     }
 
     // ---- statements ----
@@ -205,13 +224,13 @@ impl<'t> Parser<'t> {
                 let line = self.peek_line();
                 self.advance();
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Break { line })
+                self.finish(Stmt::Break { line }, 1)
             }
             Tok::Continue => {
                 let line = self.peek_line();
                 self.advance();
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Continue { line })
+                self.finish(Stmt::Continue { line }, 1)
             }
             Tok::Return => self.parse_return(),
             Tok::Ident(_) if matches!(self.peek_at(1), Tok::Eq) => self.parse_assign(),
@@ -221,7 +240,7 @@ impl<'t> Parser<'t> {
             _ => {
                 let expr = self.parse_expr()?;
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::ExprStmt(expr))
+                self.finish(Stmt::ExprStmt(expr), self.height + 1)
             }
         }
     }
@@ -234,7 +253,7 @@ impl<'t> Parser<'t> {
         self.expect(Tok::Eq)?;
         let expr = self.parse_expr()?;
         self.expect(Tok::Semi)?;
-        Ok(Stmt::Let { name, expr, line })
+        self.finish(Stmt::Let { name, expr, line }, self.height + 1)
     }
 
     #[inline(never)]
@@ -244,7 +263,7 @@ impl<'t> Parser<'t> {
         self.expect(Tok::Eq)?;
         let expr = self.parse_expr()?;
         self.expect(Tok::Semi)?;
-        Ok(Stmt::Assign { name, expr, line })
+        self.finish(Stmt::Assign { name, expr, line }, self.height + 1)
     }
 
     /// Handles a statement that starts `ident [` -- either a list write
@@ -255,33 +274,35 @@ impl<'t> Parser<'t> {
     /// Both start identically -- an identifier followed by one or more
     /// `[...]` -- and only diverge at the token right after that chain,
     /// so this parses the postfix target once and branches on what comes
-    /// next, rather than needing unbounded lookahead or backtracking.
+    /// next. Parse the whole expression so an indexed read can also be
+    /// followed by binary operators, without backtracking.
     #[inline(never)]
     fn parse_index_assign_or_expr_stmt(&mut self) -> Result<Stmt, WispError> {
         let line = self.peek_line();
-        let target = self.parse_postfix()?;
+        let target = self.parse_expr()?;
+        let target_height = self.height;
         if self.match_tok(&Tok::Eq) {
+            if !matches!(target, Expr::Index { .. } | Expr::Slice { .. }) {
+                return Err(WispError::new(line, "invalid assignment target (expected an indexed element)"));
+            }
             let value = self.parse_expr()?;
             self.expect(Tok::Semi)?;
             return match target {
-                Expr::Index { object, index, .. } => Ok(Stmt::IndexAssign {
+                Expr::Index { object, index, .. } => self.finish(Stmt::IndexAssign {
                     object: *object,
                     index: *index,
                     value,
                     line,
-                }),
+                }, target_height.max(self.height) + 1),
                 Expr::Slice { .. } => Err(WispError::new(
                     line,
                     "cannot assign to a slice (assign one element at a time, or use insert()/remove())",
                 )),
-                // This function is only ever entered when the statement
-                // starts with `ident [`, so `parse_postfix` always
-                // produces an `Expr::Index` or `Expr::Slice` here.
-                _ => unreachable!("parse_index_assign_or_expr_stmt always parses an Expr::Index or Expr::Slice"),
+                _ => Err(WispError::new(line, "invalid assignment target (expected an indexed element)")),
             };
         }
         self.expect(Tok::Semi)?;
-        Ok(Stmt::ExprStmt(target))
+        self.finish(Stmt::ExprStmt(target), target_height + 1)
     }
 
     #[inline(never)]
@@ -289,31 +310,38 @@ impl<'t> Parser<'t> {
         self.expect(Tok::If)?;
         let mut branches = Vec::new();
         let cond = self.parse_expr()?;
+        let mut height = self.height;
         let body = self.parse_block()?;
+        height = height.max(self.height);
         branches.push((cond, body));
 
         let else_body = loop {
             if self.match_tok(&Tok::Elif) {
                 let cond = self.parse_expr()?;
+                height = height.max(self.height);
                 let body = self.parse_block()?;
+                height = height.max(self.height);
                 branches.push((cond, body));
                 continue;
             }
             if self.match_tok(&Tok::Else) {
-                break Some(self.parse_block()?);
+                let body = self.parse_block()?;
+                height = height.max(self.height);
+                break Some(body);
             }
             break None;
         };
 
-        Ok(Stmt::If { branches, else_body })
+        self.finish(Stmt::If { branches, else_body }, height + 1)
     }
 
     #[inline(never)]
     fn parse_while(&mut self) -> Result<Stmt, WispError> {
         let line = self.expect(Tok::While)?.line;
         let cond = self.parse_expr()?;
+        let condition_height = self.height;
         let body = self.parse_block()?;
-        Ok(Stmt::While { cond, body, line })
+        self.finish(Stmt::While { cond, body, line }, condition_height.max(self.height) + 1)
     }
 
     #[inline(never)]
@@ -322,20 +350,22 @@ impl<'t> Parser<'t> {
         let var = self.expect_ident()?;
         self.expect(Tok::In)?;
         let iter = self.parse_expr()?;
+        let iter_height = self.height;
         let body = self.parse_block()?;
-        Ok(Stmt::For { var, iter, body, line })
+        self.finish(Stmt::For { var, iter, body, line }, iter_height.max(self.height) + 1)
     }
 
     #[inline(never)]
     fn parse_return(&mut self) -> Result<Stmt, WispError> {
         self.expect(Tok::Return)?;
+        self.height = 0;
         let expr = if self.check(&Tok::Semi) {
             None
         } else {
             Some(self.parse_expr()?)
         };
         self.expect(Tok::Semi)?;
-        Ok(Stmt::Return { expr })
+        self.finish(Stmt::Return { expr }, self.height + 1)
     }
 
     // ---- expressions, lowest to highest precedence ----
@@ -357,6 +387,7 @@ impl<'t> Parser<'t> {
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, WispError> {
         let base = self.depth;
         let mut lhs = self.parse_unary()?;
+        let mut height = self.height;
         while let Some((op, prec)) = binary_op(self.peek()) {
             if prec < min_prec {
                 break;
@@ -365,12 +396,13 @@ impl<'t> Parser<'t> {
             self.advance();
             self.descend()?;
             let rhs = self.parse_binary(prec + 1)?;
-            lhs = Expr::Binary {
+            height = height.max(self.height) + 1;
+            lhs = self.finish(Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 line,
-            };
+            }, height)?;
         }
         self.depth = base;
         Ok(lhs)
@@ -382,21 +414,21 @@ impl<'t> Parser<'t> {
             self.descend()?;
             let expr = self.parse_unary()?;
             self.depth -= 1;
-            return Ok(Expr::Unary {
+            return self.finish(Expr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(expr),
                 line,
-            });
+            }, self.height + 1);
         }
         if self.match_tok(&Tok::Minus) {
             self.descend()?;
             let expr = self.parse_unary()?;
             self.depth -= 1;
-            return Ok(Expr::Unary {
+            return self.finish(Expr::Unary {
                 op: UnaryOp::Neg,
                 expr: Box::new(expr),
                 line,
-            });
+            }, self.height + 1);
         }
         self.parse_postfix()
     }
@@ -426,20 +458,27 @@ impl<'t> Parser<'t> {
     /// expression nesting.
     #[inline(never)]
     fn parse_index_suffix(&mut self, object: Expr, line: u32) -> Result<Expr, WispError> {
+        let mut height = self.height;
         self.advance();
         self.descend()?;
         let first = if self.check(&Tok::Colon) { None } else { Some(Box::new(self.parse_expr()?)) };
+        if first.is_some() {
+            height = height.max(self.height);
+        }
         if self.match_tok(&Tok::Colon) {
             let end = if self.check(&Tok::RBracket) { None } else { Some(Box::new(self.parse_expr()?)) };
+            if end.is_some() {
+                height = height.max(self.height);
+            }
             self.expect(Tok::RBracket)?;
-            Ok(Expr::Slice { object: Box::new(object), start: first, end, line })
+            self.finish(Expr::Slice { object: Box::new(object), start: first, end, line }, height + 1)
         } else {
             self.expect(Tok::RBracket)?;
-            Ok(Expr::Index {
+            self.finish(Expr::Index {
                 object: Box::new(object),
                 index: first.expect("an index expression was parsed: the token after '[' was not ':'"),
                 line,
-            })
+            }, height + 1)
         }
     }
 
@@ -449,9 +488,10 @@ impl<'t> Parser<'t> {
     /// not paid at every level of expression nesting.
     #[inline(never)]
     fn parse_call_suffix(&mut self, callee: Expr, line: u32) -> Result<Expr, WispError> {
+        let callee_height = self.height;
         self.descend()?;
         let args = self.parse_call_args()?;
-        Ok(Expr::CallValue { callee: Box::new(callee), args, line })
+        self.finish(Expr::CallValue { callee: Box::new(callee), args, line }, callee_height.max(self.height) + 1)
     }
 
     /// A call's arguments, after its `(`, through its `)`. Outlined from
@@ -460,9 +500,11 @@ impl<'t> Parser<'t> {
     #[inline(never)]
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, WispError> {
         let mut args = Vec::new();
+        let mut height = 0;
         if !self.check(&Tok::RParen) {
             loop {
                 args.push(self.parse_expr()?);
+                height = height.max(self.height);
                 if self.match_tok(&Tok::Comma) {
                     continue;
                 }
@@ -470,24 +512,24 @@ impl<'t> Parser<'t> {
             }
         }
         self.expect(Tok::RParen)?;
-        Ok(args)
+        self.finish(args, height)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, WispError> {
         let line = self.peek_line();
         match self.advance().tok {
             Tok::Fn => Ok(Expr::Lambda(self.parse_lambda(line)?)),
-            Tok::Int(v) => Ok(Expr::IntLit(v, line)),
-            Tok::Str(s) => Ok(Expr::StrLit(s, line)),
-            Tok::True => Ok(Expr::BoolLit(true, line)),
-            Tok::False => Ok(Expr::BoolLit(false, line)),
-            Tok::Nil => Ok(Expr::NilLit(line)),
+            Tok::Int(v) => self.finish(Expr::IntLit(v, line), 0),
+            Tok::Str(s) => self.finish(Expr::StrLit(s, line), 0),
+            Tok::True => self.finish(Expr::BoolLit(true, line), 0),
+            Tok::False => self.finish(Expr::BoolLit(false, line), 0),
+            Tok::Nil => self.finish(Expr::NilLit(line), 0),
             Tok::Ident(name) => {
                 if self.match_tok(&Tok::LParen) {
                     let args = self.parse_call_args()?;
-                    Ok(Expr::Call { name, args, line })
+                    self.finish(Expr::Call { name, args, line }, self.height + 1)
                 } else {
-                    Ok(Expr::Var { name, line })
+                    self.finish(Expr::Var { name, line }, 0)
                 }
             }
             Tok::LParen => {
@@ -497,9 +539,11 @@ impl<'t> Parser<'t> {
             }
             Tok::LBracket => {
                 let mut items = Vec::new();
+                let mut height = 0;
                 if !self.check(&Tok::RBracket) {
                     loop {
                         items.push(self.parse_expr()?);
+                        height = height.max(self.height);
                         if self.match_tok(&Tok::Comma) {
                             continue;
                         }
@@ -507,14 +551,14 @@ impl<'t> Parser<'t> {
                     }
                 }
                 self.expect(Tok::RBracket)?;
-                Ok(Expr::ListLit { items, line })
+                self.finish(Expr::ListLit { items, line }, height + 1)
             }
             // Only reached where an operand is expected, so a `{` here is
             // never a block: a block's `{` comes after a complete condition
             // or a `)`, where the expression parser has already stopped.
             Tok::LBrace => {
                 let entries = self.parse_map_entries()?;
-                Ok(Expr::MapLit { entries, line })
+                self.finish(Expr::MapLit { entries, line }, self.height + 1)
             }
             other => Err(WispError::new(line, format!("unexpected {}", describe(&other)))),
         }
@@ -526,9 +570,11 @@ impl<'t> Parser<'t> {
     #[inline(never)]
     fn parse_map_entries(&mut self) -> Result<Vec<(Expr, Expr)>, WispError> {
         let mut entries = Vec::new();
+        let mut height = 0;
         if !self.check(&Tok::RBrace) {
             loop {
                 let key = self.parse_expr()?;
+                height = height.max(self.height);
                 if !self.match_tok(&Tok::Colon) {
                     return Err(WispError::new(
                         self.peek_line(),
@@ -536,6 +582,7 @@ impl<'t> Parser<'t> {
                     ));
                 }
                 let value = self.parse_expr()?;
+                height = height.max(self.height);
                 entries.push((key, value));
                 if self.match_tok(&Tok::Comma) {
                     continue;
@@ -544,7 +591,7 @@ impl<'t> Parser<'t> {
             }
         }
         self.expect(Tok::RBrace)?;
-        Ok(entries)
+        self.finish(entries, height)
     }
 }
 

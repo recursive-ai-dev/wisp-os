@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Drives ./run.sh's QEMU instance over the HMP monitor to exercise the
-acceptance test end-to-end, saving a PNG screenshot after each step so the
+acceptance test end-to-end, saving a PPM screenshot after each step so the
 result can be visually verified.
 
 Usage: tests/acceptance_test.py [output_dir]
 """
 import os
 import re
-import shutil
 import socket
 import subprocess
 import sys
 import time
+
+import console_capture
+from test_support import new_run_directory, package_version
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "tests", "out")
@@ -60,9 +62,9 @@ def key_name_for(ch: str) -> str:
 class Monitor:
     def __init__(self, sock_path: str):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        deadline = time.time() + 15
+        deadline = time.monotonic() + 15
         last_err = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
                 self.sock.connect(sock_path)
                 break
@@ -112,14 +114,7 @@ class Monitor:
         time.sleep(0.02)
 
     def screendump(self, name: str) -> str:
-        ppm_path = os.path.join(OUT_DIR, name + ".ppm")
-        png_path = os.path.join(OUT_DIR, name + ".png")
-        self.cmd(f"screendump {ppm_path}")
-        time.sleep(0.1)
-        from PIL import Image
-
-        Image.open(ppm_path).save(png_path)
-        return png_path
+        return str(console_capture.capture(self, os.path.join(OUT_DIR, name + ".ppm")))
 
     def quit(self):
         try:
@@ -128,78 +123,22 @@ class Monitor:
             pass
 
 
-def ocr_text(png_path: str) -> str:
-    """OCR a screenshot via the `tesseract` CLI (already installed in this
-    sandbox) and return the recognized text. Shells out rather than using
-    pytesseract so this test has no extra Python dependency beyond
-    Pillow. `tesseract <img> stdout` prints recognized text to stdout."""
-    result = subprocess.run(
-        ["tesseract", png_path, "stdout"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    return result.stdout
+def ocr_text(ppm_path: str) -> str:
+    """Decode Wisp's exact bitmap font; retain the legacy helper name for callers."""
+    return console_capture.text(ppm_path)
 
 
 def wait_for_boot(mon: "Monitor", timeout: float) -> str:
-    """Poll screendumps until *our* shell's banner is confirmed on screen,
-    then return the path to that shot.
-
-    A pixel-presence check alone is not enough to prove this is our
-    shell: on a boot gone wrong, OVMF's own built-in EDK II UEFI
-    Interactive Shell draws its own banner starting at the same (0, 0)
-    position ours does, so "some non-black pixels appeared up here"
-    would happily pass while looking at entirely the wrong shell -- which
-    is exactly what happened during development (see run.sh's comment
-    for the full account of the vvfat read-write corruption that caused
-    it). So: first wait for *something* to be drawn (cheap, avoids OCR
-    on pure-black frames while the TianoCore splash is still up), then
-    OCR that frame and require our banner's actual text -- "Custom
-    Kernel" is a substring of shell.rs's BANNER constant ("Minimal
-    Custom Kernel Shell -- own GDT/IDT/PIC/PIT") and appears nowhere in
-    OVMF's own shell banner ("UEFI Interactive Shell"), so it's an
-    unambiguous discriminator between the two, not a coincidental proxy
-    like pixel color. Seeing OVMF's banner text instead is treated as an
-    immediate hard failure rather than something to keep polling past.
-    (Updated from the original "Boot Services" check when this project
-    left Boot Services behind for its own GDT/IDT/PIC/PIT/keyboard
-    drivers -- see CHANGES.md.)
-    """
-    from PIL import Image
-
-    deadline = time.time() + timeout
+    """Require Wisp's rendered banner, never just firmware pixels or a log marker."""
+    deadline = time.monotonic() + timeout
     last_path = None
     attempt = 0
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         attempt += 1
         last_path = mon.screendump(f"_boot_poll_{attempt}")
-        img = Image.open(last_path)
-        # Our banner occupies roughly the top-left 480x112 px (4-5 text
-        # rows of an 8x16 font); the TianoCore splash's logo box is
-        # centered on screen and doesn't reach this corner at the
-        # resolutions OVMF/QEMU's stdvga negotiate here.
-        region = img.crop((0, 0, 480, 112))
-        colors = region.getcolors(maxcolors=64)
-        non_black = colors is None or any(c != (0, 0, 0) for _count, c in colors)
-        if non_black:
-            text = ocr_text(last_path)
-            if "Custom Kernel" in text:
-                return last_path
-            if "Interactive Shell" in text:
-                raise RuntimeError(
-                    "QEMU/OVMF booted into its own built-in EDK II UEFI "
-                    "Interactive Shell instead of BOOTX64.EFI -- our banner "
-                    "never appeared on screen. This is the exact failure "
-                    "mode documented in run.sh (historically caused by "
-                    "vvfat read-write corruption of BOOTX64.EFI on disk; "
-                    "see CHANGES.md). OCR read:\n"
-                    f"{text!r}\nScreenshot: {last_path}"
-                )
-            # Some other non-black frame (partially drawn mid-scan, or
-            # OCR misread a transient frame) -- keep polling rather than
-            # failing on a single ambiguous read.
-        time.sleep(1.0)
+        if "Custom Kernel" in ocr_text(last_path):
+            return last_path
+        time.sleep(0.3)
     raise RuntimeError(
         f"timed out after {timeout}s waiting for our shell's banner to "
         f"appear (last screendump: {last_path})"
@@ -219,9 +158,9 @@ def wait_for_debug_marker(debug_log: str, markers, timeout: float) -> str:
     VMs at once."""
     if isinstance(markers, str):
         markers = [markers]
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     text = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if os.path.isfile(debug_log):
             with open(debug_log, "r", errors="replace") as f:
                 text = f.read()
@@ -235,71 +174,28 @@ def wait_for_debug_marker(debug_log: str, markers, timeout: float) -> str:
 
 
 def read_uptime_ticks(mon: "Monitor", base_name: str, step_name: str, attempts: int = 4) -> tuple:
-    """Screendump and OCR-extract the `(N ticks)` reading from the shell's
-    `uptime` output, retrying against *fresh screendumps of the same,
-    already-rendered, unchanged screen* if OCR fails to parse it cleanly --
-    never by re-typing `uptime` again, which would actually change what's
-    on screen and defeat the point of a retry.
-
-    This project has independently confirmed real tesseract misreads on
-    other screens by direct visual inspection of the actual PNG (see
-    CHANGES.md's xor_brain truth-table postmortem), and hit three variants
-    of the same thing here during Phase 2 verification: the
-    `\\((\\d+)\\s*ticks\\)` regex matching nothing despite `ticks` being
-    present in the OCR text, two successive readings OCR'ing to the exact
-    same tick count, and (once both of those were dumped to a raw
-    `tesseract` invocation for direct inspection) the actual, confirmed
-    cause of both: tesseract deterministically misreading this bitmap
-    font's `(` as `{` in this specific position -- `up 20.200s {2020
-    ticks)` -- on a screenshot that, opened directly, shows a perfectly
-    correct, cleanly rendered `up 20.200s (2020 ticks)` line. Conclusive
-    proof the kernel and PIT are both working correctly and only the OCR
-    pass is unreliable, and specifically unreliable about `(` vs `{` (not
-    the digits, not `ticks` itself) -- so the regex below accepts either
-    bracket character in both the open and close position, exactly
-    mirroring this project's existing "ls" vs "1s" and lowercase-`c`-vs-`E`
-    OCR-ambiguity precedents rather than inventing a new kind of fix.
-    Retrying the *capture+recognize* step against content that has not
-    changed is kept as defense in depth against any other, still-unknown
-    transient misread class, but the bracket fix is what actually resolved
-    the two confirmed failures above -- a same-run misread this
-    deterministic does not go away by re-screenshotting identical pixels.
-
-    Raises with every attempt's OCR text attached if all attempts fail,
-    which would then mean a real problem (the kernel genuinely didn't
-    render a parseable reading), not a transient misread.
-    """
+    """Read exact `(N ticks)` text, retrying only to allow an in-flight redraw."""
     last_text = None
     last_path = None
     for attempt in range(1, attempts + 1):
         name = base_name if attempt == 1 else f"{base_name}_retry{attempt}"
-        shot = mon.screendump(name)
-        text = ocr_text(shot)
-        last_text, last_path = text, shot
-        if "ticks" in text:
-            # `[({]`/`[)}]`: tesseract has been confirmed (see doc comment
-            # above) to sometimes misread this font's `(`/`)` as `{`/`}` in
-            # this exact spot -- both are accepted as the same unambiguous
-            # on-screen glyph, not a real alternative meaning.
-            matches = re.findall(r"[({](\d+)\s*ticks[)}]", text)
-            if matches:
-                return shot, int(matches[-1])
+        last_path = mon.screendump(name)
+        last_text = ocr_text(last_path)
+        matches = re.findall(r"\((\d+)\s*ticks\)", last_text)
+        if matches:
+            return last_path, int(matches[-1])
         time.sleep(0.2)
     raise RuntimeError(
-        f"{step_name}: could not OCR-extract a '(N ticks)' reading after "
-        f"{attempts} attempts against the same, unchanged on-screen "
-        f"content -- either the kernel genuinely didn't render it (a real "
-        f"bug) or tesseract misread it every single time (see this "
-        f"function's doc comment for the confirmed-by-direct-inspection "
-        f"precedent for the latter).\nLast OCR text:\n{last_text}\n"
+        f"{step_name}: could not decode a '(N ticks)' reading after "
+        f"{attempts} attempts.\nLast framebuffer text:\n{last_text}\n"
         f"Last screenshot: {last_path}"
     )
 
 
 def assert_ocr(png_path: str, must_contain, step_name: str, must_not_contain=None) -> str:
-    """OCR `png_path` and assert every string in `must_contain` appears in
+    """Decode `png_path` and assert every string in `must_contain` appears in
     the recognized text (and, if given, that nothing in `must_not_contain`
-    does). Raises with the full OCR text on failure so a broken run fails
+    does). Raises with the full framebuffer text on failure so a broken run fails
     loudly with the evidence attached, rather than a screenshot silently
     being saved and never actually inspected -- passing screendumps do not
     prove correct behavior; only checking their content does. `must_contain`
@@ -316,8 +212,8 @@ def assert_ocr(png_path: str, must_contain, step_name: str, must_not_contain=Non
         if unexpected:
             problems.append(f"contains unexpected text {unexpected!r}")
         raise RuntimeError(
-            f"{step_name}: OCR verification failed ({'; '.join(problems)}) "
-            f"in {png_path}.\nFull OCR text:\n{text}"
+            f"{step_name}: framebuffer verification failed ({'; '.join(problems)}) "
+            f"in {png_path}.\nFull framebuffer text:\n{text}"
         )
     return text
 
@@ -363,10 +259,7 @@ def assert_colors_present(png_path: str, expected_colors, step_name: str, tolera
     order from `Console::encode`'s BGR/RGB handling, wrong color
     entirely) can't hide inside it.
     """
-    from PIL import Image
-
-    img = Image.open(png_path).convert("RGB")
-    present = [c for _count, c in (img.getcolors(maxcolors=65536) or [])]
+    present = console_capture.palette(png_path)
     missing = [
         expected
         for expected in expected_colors
@@ -387,10 +280,7 @@ def assert_pixel_near(png_path: str, x: int, y: int, expected: tuple, step_name:
     (`plot`/`rect`/`line`) whose target position this test script chose
     itself and therefore knows exactly. Returns the actual pixel so a
     caller can log it."""
-    from PIL import Image
-
-    img = Image.open(png_path).convert("RGB")
-    actual = img.getpixel((x, y))
+    actual = console_capture.pixel(png_path, x, y)
     if any(abs(a - e) > tolerance for a, e in zip(actual, expected)):
         raise RuntimeError(
             f"{step_name}: pixel at ({x},{y}) in {png_path} is {actual}, "
@@ -407,10 +297,10 @@ def wait_for_text(mon: "Monitor", name: str, must_contain: str, timeout: float =
     bounce.wisp's total run time is `frames` iterations of a
     `sleep_ms()` call the interpreter (not this test script) actually
     waits out."""
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_text = None
     last_shot = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         last_shot = mon.screendump(name)
         last_text = ocr_text(last_shot)
         if must_contain in last_text:
@@ -424,9 +314,10 @@ def wait_for_text(mon: "Monitor", name: str, must_contain: str, timeout: float =
 
 
 def main():
-    global OUT_DIR
-    shutil.rmtree(OUT_DIR, ignore_errors=True)
-    os.makedirs(OUT_DIR, exist_ok=True)
+    global OUT_DIR, MONITOR_SOCK, DEBUG_LOG
+    OUT_DIR = new_run_directory(OUT_DIR)
+    MONITOR_SOCK = os.path.join(OUT_DIR, "monitor.sock")
+    DEBUG_LOG = os.path.join(OUT_DIR, "debug.log")
 
     # The ESP is mounted read-only (`fat:esp`, not `fat:rw:esp` -- see
     # run.sh's comment for the full account). QEMU's vvfat driver in
@@ -437,23 +328,17 @@ def main():
     # BOOTX64.EFI's 90624 bytes on the *host filesystem* -- same size,
     # wrong bytes from partway through the file onward -- which is why
     # OVMF gave up loading it and fell back to its own built-in shell.
-    # Deleting `esp/NvVars` before each run (an earlier fix, kept below
-    # only as a defensive no-op for old/foreign esp directories) treated
+    # Deleting `esp/NvVars` before each run (an earlier fix) treated
     # a symptom and missed the actual disease. Nothing this project boots
     # ever writes to the ESP (`src/fs.rs` only ever opens files
     # `FileMode::Read`), so read-only costs us nothing: OVMF's NVRAM
     # write simply fails and it falls back to a volatile in-memory store
     # for that boot, which matches this project's "no cached boot manager
     # entry" boot philosophy better than persisting one ever did.
-    nvvars = os.path.join(ROOT, "esp", "NvVars")
-    if os.path.exists(nvvars):
-        os.remove(nvvars)
-
     # Phase 2, Part B: a second, separate virtual disk attached via AHCI,
     # purely for WISP-program save data -- fully additive, the boot-USB
     # `-drive`/`-device usb-storage` pair below stays byte-for-byte
-    # unchanged. Lives under `OUT_DIR` (already fresh: `shutil.rmtree`
-    # above), not the project root's `save.img` that `run.sh` uses for
+    # unchanged. Lives under a fresh per-run `OUT_DIR`, not the project root's `save.img` that `run.sh` uses for
     # interactive sessions -- every ordinary acceptance-suite run then gets
     # a clean, empty save disk, never state left over from a previous run
     # or from a manual `./run.sh` session.
@@ -588,14 +473,14 @@ def main():
             ["Available commands", "clear", "echo", "APPS", "run", "uptime", "version", "Esc"],
             "step 2 (help)",
         )
-        print("step 2 (help):", shot, "-- OCR verified")
+        print("step 2 (help):", shot, "-- framebuffer verified")
 
         mon.type_text("echo hello world")
         mon.enter()
         time.sleep(0.3)
         shot = mon.screendump("03_echo_output")
         assert_ocr(shot, "hello world", "step 3 (echo hello world)")
-        print("step 3 (echo hello world):", shot, "-- OCR verified")
+        print("step 3 (echo hello world):", shot, "-- framebuffer verified")
 
         mon.type_text("ls")
         mon.enter()
@@ -606,7 +491,7 @@ def main():
             ["hello.wisp", "oracle.wisp", "tamer.wisp", "adventure.wisp", "xor_brain.wisp"],
             "step 4 (ls)",
         )
-        print("step 4 (ls):", shot, "-- OCR verified")
+        print("step 4 (ls):", shot, "-- framebuffer verified")
 
         # Backspace test: type "abcXX" then backspace twice, then submit so
         # the resulting "unknown command: abc" line proves the trailing
@@ -630,7 +515,7 @@ def main():
         text = assert_ocr(shot, [], "step 5a (before backspace)")
         if "xx" not in text.lower():
             raise RuntimeError(f"step 5a (before backspace): typed 'XX' not on screen.\nOCR text:\n{text}")
-        print("step 5a (before backspace):", shot, "-- OCR verified")
+        print("step 5a (before backspace):", shot, "-- framebuffer verified")
         mon.backspace()
         mon.backspace()
         time.sleep(0.1)
@@ -648,7 +533,7 @@ def main():
             "step 5c (submitted line reflects deletion)",
             must_not_contain=["XX", "X:"],
         )
-        print("step 5c (submitted line reflects deletion):", shot, "-- OCR verified")
+        print("step 5c (submitted line reflects deletion):", shot, "-- framebuffer verified")
 
         mon.type_text("clear")
         mon.enter()
@@ -657,7 +542,7 @@ def main():
         # A real clear wipes the earlier "unknown command: abc" line off
         # screen; if it's still readable, `clear` silently did nothing.
         assert_ocr(shot, [], "step 6 (clear)", must_not_contain=["unknown command"])
-        print("step 6 (clear):", shot, "-- OCR verified")
+        print("step 6 (clear):", shot, "-- framebuffer verified")
 
         # uptime: a positive, specific proof the PIT timer interrupt is
         # actually firing, not just "the prompt appeared so it must be
@@ -701,21 +586,21 @@ def main():
             ["hello.wisp", "oracle.wisp", "tamer.wisp", "adventure.wisp", "xor_brain.wisp"],
             "step 7 (ls APPS)",
         )
-        print("step 7 (ls APPS):", shot, "-- OCR verified")
+        print("step 7 (ls APPS):", shot, "-- framebuffer verified")
 
         mon.type_text("run hello")
         mon.enter()
         time.sleep(0.3)
         shot = mon.screendump("08a_run_hello_prompt")
         assert_ocr(shot, "What's your name?", "step 8a (run hello -- waiting on input())")
-        print("step 8a (run hello -- waiting on input()):", shot, "-- OCR verified")
+        print("step 8a (run hello -- waiting on input()):", shot, "-- framebuffer verified")
 
         mon.type_text("James")
         mon.enter()
         time.sleep(0.3)
         shot = mon.screendump("08b_run_hello_output")
         assert_ocr(shot, "Hello, James", "step 8b (run hello -- greeted James)")
-        print("step 8b (run hello -- greeted James):", shot, "-- OCR verified")
+        print("step 8b (run hello -- greeted James):", shot, "-- framebuffer verified")
 
         # WISP lists: run the shuffle-bag oracle demo and draw a fortune,
         # proving list literals, indexing, push/pop, and rand() all work
@@ -726,7 +611,7 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("09a_run_oracle_prompt")
         assert_ocr(shot, "The oracle is listening", "step 9a (run oracle -- waiting at its own '>' prompt)")
-        print("step 9a (run oracle -- waiting at its own '>' prompt):", shot, "-- OCR verified")
+        print("step 9a (run oracle -- waiting at its own '>' prompt):", shot, "-- framebuffer verified")
 
         mon.type_text("ask")
         mon.enter()
@@ -744,14 +629,14 @@ def main():
             "step 9b (run oracle -- drew a fortune from the list)",
             must_not_contain=["only understands"],
         )
-        print("step 9b (run oracle -- drew a fortune from the list):", shot, "-- OCR verified")
+        print("step 9b (run oracle -- drew a fortune from the list):", shot, "-- framebuffer verified")
 
         mon.type_text("quit")
         mon.enter()
         time.sleep(0.3)
         shot = mon.screendump("09c_run_oracle_quit")
         assert_ocr(shot, "The oracle falls silent", "step 9c (run oracle -- quit back to the shell prompt)")
-        print("step 9c (run oracle -- quit back to the shell prompt):", shot, "-- OCR verified")
+        print("step 9c (run oracle -- quit back to the shell prompt):", shot, "-- framebuffer verified")
 
         # A real (if tiny) trained neural network, doing fixed-point
         # forward-pass inference against a live keyboard prompt, running
@@ -769,7 +654,7 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("10a_run_tamer_erratic")
         assert_ocr(shot, "Erratic", "step 10a (run tamer -- mismatched stats classified 'Erratic')")
-        print("step 10a (run tamer -- mismatched stats classified 'Erratic'):", shot, "-- OCR verified")
+        print("step 10a (run tamer -- mismatched stats classified 'Erratic'):", shot, "-- framebuffer verified")
 
         mon.type_text("8")
         mon.enter()
@@ -779,14 +664,14 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("10b_run_tamer_predictable")
         assert_ocr(shot, "Predictable", "step 10b (run tamer -- matched stats classified 'Predictable')")
-        print("step 10b (run tamer -- matched stats classified 'Predictable'):", shot, "-- OCR verified")
+        print("step 10b (run tamer -- matched stats classified 'Predictable'):", shot, "-- framebuffer verified")
 
         mon.type_text("quit")
         mon.enter()
         time.sleep(0.3)
         shot = mon.screendump("10c_run_tamer_quit")
         assert_ocr(shot, "tamer done", "step 10c (run tamer -- quit back to the shell prompt)")
-        print("step 10c (run tamer -- quit back to the shell prompt):", shot, "-- OCR verified")
+        print("step 10c (run tamer -- quit back to the shell prompt):", shot, "-- framebuffer verified")
 
         # adventure.wisp: walk the full five-room map, deliberately hitting
         # every gating branch (an invalid direction, the dark storage
@@ -799,14 +684,14 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("11a_run_adventure_start")
         assert_ocr(shot, ["THE SEALED ARCHIVE", "ENTRANCE HALL"], "step 11a (run adventure -- entrance hall)")
-        print("step 11a (run adventure -- entrance hall):", shot, "-- OCR verified")
+        print("step 11a (run adventure -- entrance hall):", shot, "-- framebuffer verified")
 
         mon.type_text("east")
         mon.enter()
         time.sleep(0.2)
         shot = mon.screendump("11b_run_adventure_bad_direction")
         assert_ocr(shot, "can't go that way", "step 11b (run adventure -- invalid direction rejected)")
-        print("step 11b (run adventure -- invalid direction rejected):", shot, "-- OCR verified")
+        print("step 11b (run adventure -- invalid direction rejected):", shot, "-- framebuffer verified")
 
         mon.type_text("north")
         mon.enter()
@@ -823,7 +708,7 @@ def main():
             "too dark to find anything",
             "step 11c (run adventure -- too dark to find the key without the lantern)",
         )
-        print("step 11c (run adventure -- too dark to find the key without the lantern):", shot, "-- OCR verified")
+        print("step 11c (run adventure -- too dark to find the key without the lantern):", shot, "-- framebuffer verified")
 
         mon.type_text("west")
         mon.enter()
@@ -840,7 +725,7 @@ def main():
             "vault door is locked tight",
             "step 11d (run adventure -- vault door locked without the key)",
         )
-        print("step 11d (run adventure -- vault door locked without the key):", shot, "-- OCR verified")
+        print("step 11d (run adventure -- vault door locked without the key):", shot, "-- framebuffer verified")
 
         mon.type_text("south")
         mon.enter()
@@ -860,7 +745,7 @@ def main():
             "pry the small iron key loose",
             "step 11e (run adventure -- lantern lets you see and take the key)",
         )
-        print("step 11e (run adventure -- lantern lets you see and take the key):", shot, "-- OCR verified")
+        print("step 11e (run adventure -- lantern lets you see and take the key):", shot, "-- framebuffer verified")
 
         mon.type_text("west")
         mon.enter()
@@ -873,7 +758,7 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("11f_run_adventure_win")
         assert_ocr(shot, ["THE VAULT", "YOU WIN"], "step 11f (run adventure -- vault opens with the key, game won)")
-        print("step 11f (run adventure -- vault opens with the key, game won):", shot, "-- OCR verified")
+        print("step 11f (run adventure -- vault opens with the key, game won):", shot, "-- framebuffer verified")
 
         # xor_brain.wisp: the full 4-row truth table against the live
         # interpreter, then quit.
@@ -888,33 +773,19 @@ def main():
             mon.enter()
             time.sleep(0.1)
         shot = mon.screendump("12a_run_xor_brain_truth_table")
-        # Ideally this asserts the exact 4 result lines ("0 XOR 0 = 0", "0
-        # XOR 1 = 1", "1 XOR 0 = 1", "1 XOR 1 = 0"). In practice tesseract's
-        # plain-stdout mode was found (during manual verification of this
-        # exact screen) to intermittently drop/garble the trailing "= N"
-        # of these specific short numeric lines even though the rendered
-        # pixels are correct -- confirmed by opening the PNG directly and
-        # reading all 4 rows correctly by eye. Rather than assert against
-        # a text-extraction failure mode unrelated to the kernel, this
-        # checks the weaker-but-still-meaningful "XOR" appears once per
-        # row (proving all 4 prompts were answered and produced output)
-        # and leaves the exact-arithmetic claim to that manual check.
-        text = assert_ocr(shot, [], "step 12a (run xor_brain -- full 4-row truth table)")
-        xor_count = text.upper().count("XOR")
-        if xor_count < 4:
-            raise RuntimeError(
-                f"step 12a (run xor_brain -- full 4-row truth table): only "
-                f"found {xor_count} 'XOR' occurrences in OCR text (expected "
-                f"4, one per truth-table row); full text:\n{text}"
-            )
-        print(f"step 12a (run xor_brain -- full 4-row truth table): {shot} -- {xor_count} XOR rows OCR verified")
+        assert_ocr(
+            shot,
+            ["0 XOR 0 = 0", "0 XOR 1 = 1", "1 XOR 0 = 1", "1 XOR 1 = 0"],
+            "step 12a (run xor_brain -- full 4-row truth table)",
+        )
+        print(f"step 12a (run xor_brain -- full 4-row truth table): {shot} -- exact results verified")
 
         mon.type_text("quit")
         mon.enter()
         time.sleep(0.3)
         shot = mon.screendump("12b_run_xor_brain_quit")
         assert_ocr(shot, "xor_brain done", "step 12b (run xor_brain -- quit back to the shell prompt)")
-        print("step 12b (run xor_brain -- quit back to the shell prompt):", shot, "-- OCR verified")
+        print("step 12b (run xor_brain -- quit back to the shell prompt):", shot, "-- framebuffer verified")
 
         # The fresh save.img is blank, and boot never formats a disk on
         # its own (CODEBASE_AUDIT.md AUD-01): it must have been probed
@@ -938,7 +809,7 @@ def main():
             "[save_format] disk provisioned by explicit 'format' command",
             "step 13 (format provisions the save disk)",
         )
-        print("step 13 (explicit format of the blank save disk):", shot, "-- OCR verified")
+        print("step 13 (explicit format of the blank save disk):", shot, "-- framebuffer verified")
 
         # counter.wisp, first half of the cross-boot persistence proof
         # (Phase 2, Part B, Build Order Step 11): against the save.img this
@@ -962,7 +833,7 @@ def main():
             ["This is the first time", "You have run this 1 time"],
             "step 13a (run counter -- first ever boot, count saved as 1)",
         )
-        print("step 13a (run counter -- first ever boot, count saved as 1):", shot, "-- OCR verified")
+        print("step 13a (run counter -- first ever boot, count saved as 1):", shot, "-- framebuffer verified")
 
         # WISP v2 graphics primitives (fill_screen/rect/plot/line/rgb/
         # screen_width/screen_height): bounce.wisp is a short, fully
@@ -997,7 +868,7 @@ def main():
         print("step 14a (run bounce -- mid-flight background+ball colors):", shot, "-- pixel verified")
 
         shot = wait_for_text(mon, "14b_run_bounce_finished", "bounce.wisp finished", timeout=10.0)
-        print("step 14b (run bounce -- finished cleanly):", shot, "-- OCR verified")
+        print("step 14b (run bounce -- finished cleanly):", shot, "-- framebuffer verified")
 
         # canvas.wisp: an interactive drawing tool. Walks plot/rect/line
         # each with a real, sampled-pixel color check, exercises
@@ -1027,7 +898,7 @@ def main():
             ["screen is", "pixels", "plot, rect, line, fillscreen"],
             "step 15a (run canvas -- startup banner)",
         )
-        print("step 15a (run canvas -- startup banner):", shot, "-- OCR verified")
+        print("step 15a (run canvas -- startup banner):", shot, "-- framebuffer verified")
 
         # plot with an unrecognized color name -- exercises
         # color_by_name()'s fallback branch (white) as well as plot()
@@ -1047,7 +918,7 @@ def main():
         shot = mon.screendump("15b_canvas_plot_unrecognized_color")
         assert_ocr(shot, "unrecognized color", "step 15b (canvas plot -- unrecognized color name)")
         assert_pixel_near(shot, 100, 100, (255, 255, 255), "step 15b (canvas plot -- pixel is white)")
-        print("step 15b (canvas plot -- unrecognized color falls back to white):", shot, "-- OCR + pixel verified")
+        print("step 15b (canvas plot -- unrecognized color falls back to white):", shot, "-- framebuffer + pixel verified")
 
         # rect: a 60x40 green rectangle at (150,150) -- sample its rough
         # center.
@@ -1122,7 +993,7 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("15e_canvas_rect_negative_error")
         assert_ocr(shot, "must not be negative", "step 15e (canvas rect -- negative size is a clean runtime error)")
-        print("step 15e (canvas rect -- negative size is a clean runtime error):", shot, "-- OCR verified")
+        print("step 15e (canvas rect -- negative size is a clean runtime error):", shot, "-- framebuffer verified")
 
         # The error ended the script (no explicit 'quit' needed) --
         # confirm we're genuinely back at the shell's own prompt, not
@@ -1132,7 +1003,7 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("15f_canvas_back_at_shell")
         assert_ocr(shot, "canvas_test_done", "step 15f (canvas -- shell prompt responsive again after the error)")
-        print("step 15f (canvas -- shell prompt responsive again after the error):", shot, "-- OCR verified")
+        print("step 15f (canvas -- shell prompt responsive again after the error):", shot, "-- framebuffer verified")
 
         # --- v1.0 additions ------------------------------------------------
         mon.type_text("clear")
@@ -1144,15 +1015,15 @@ def main():
         shot = mon.screendump("16a_version")
         # "OS" alone is routinely OCR-misread as "0S"; the version string and
         # the networking line are the unambiguous parts.
-        assert_ocr(shot, ["v1.1.0", "networking: none", "NX on"], "step 16a (version)")
-        print("step 16a (version):", shot, "-- OCR verified")
+        assert_ocr(shot, ["v" + package_version(), "networking: none", "NX on"], "step 16a (version)")
+        print("step 16a (version):", shot, "-- framebuffer verified")
 
         mon.type_text("mem")
         mon.enter()
         time.sleep(0.3)
         shot = mon.screendump("16b_mem")
         assert_ocr(shot, ["heap:", "KiB total", "frames:"], "step 16b (mem)")
-        print("step 16b (mem):", shot, "-- OCR verified")
+        print("step 16b (mem):", shot, "-- framebuffer verified")
 
         # Esc stops a pure compute loop (no input(), no sleep_ms()): the
         # interpreter's per-iteration stop check, fed by the PS/2 ISR.
@@ -1166,7 +1037,7 @@ def main():
         # Tesseract reads the dense column of "prime #N: P" lines poorly (it
         # drops the "#N" parts), so only the word itself is asserted.
         assert_ocr(shot, "prime", "step 17a (run primes -- computing)")
-        print("step 17a (run primes -- computing):", shot, "-- OCR verified")
+        print("step 17a (run primes -- computing):", shot, "-- framebuffer verified")
         mon.cmd("sendkey esc")
         time.sleep(0.5)
         # The stop is proven from the kernel's own log line (OCR cannot
@@ -1181,7 +1052,7 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("17b_primes_stopped")
         assert_ocr(shot, "primes_done", "step 17b (primes -- prompt responsive after Esc)")
-        print("step 17b (primes -- Esc stopped the compute loop, prompt responsive):", shot, "-- debug log + OCR verified")
+        print("step 17b (primes -- Esc stopped the compute loop, prompt responsive):", shot, "-- debug log + framebuffer verified")
 
         # Esc wakes a long sleep_ms() immediately, and the elapsed-time
         # reading proves time_ms() advances. The program never ends on its
@@ -1194,7 +1065,7 @@ def main():
         time.sleep(2.6)
         shot = mon.screendump("18a_stopwatch_running")
         assert_ocr(shot, ["lap 1", "lap 2", "s elapsed"], "step 18a (run stopwatch -- laps from time_ms())")
-        print("step 18a (run stopwatch -- laps from time_ms()):", shot, "-- OCR verified")
+        print("step 18a (run stopwatch -- laps from time_ms()):", shot, "-- framebuffer verified")
         mon.cmd("sendkey esc")
         time.sleep(0.4)
         mon.type_text("echo stopwatch_done")
@@ -1211,7 +1082,7 @@ def main():
             ["stopped", "stopwatch_done"],
             "step 18b (stopwatch -- Esc interrupted sleep_ms(), prompt responsive, no stray keys)",
         )
-        print("step 18b (stopwatch -- Esc interrupted sleep_ms(), prompt responsive):", shot, "-- OCR verified")
+        print("step 18b (stopwatch -- Esc interrupted sleep_ms(), prompt responsive):", shot, "-- framebuffer verified")
 
         # At the prompt, Esc discards the half-typed line.
         mon.type_text("clear")
@@ -1230,7 +1101,7 @@ def main():
             "step 19 (Esc at the prompt discards the typed line)",
             must_not_contain=["leftover"],
         )
-        print("step 19 (Esc at the prompt discards the typed line):", shot, "-- OCR verified")
+        print("step 19 (Esc at the prompt discards the typed line):", shot, "-- framebuffer verified")
 
         # calc.wisp: an expression parser written in WISP, exercising the
         # v2 language (for over a string, indexing, contains(), trim())
@@ -1252,7 +1123,7 @@ def main():
         time.sleep(0.5)
         shot = wait_for_text(mon, "20a_calc", "division by zero")
         assert_ocr(shot, ["calc", "32", "division by zero"], "step 20a (run calc -- precedence and a caught error)")
-        print("step 20a (run calc -- 2 + 3 * (4 + 6) = 32, division by zero reported):", shot, "-- OCR verified")
+        print("step 20a (run calc -- 2 + 3 * (4 + 6) = 32, division by zero reported):", shot, "-- framebuffer verified")
         mon.type_text("quit")
         mon.enter()
         time.sleep(0.3)
@@ -1261,7 +1132,7 @@ def main():
         time.sleep(0.3)
         shot = mon.screendump("20b_calc_quit")
         assert_ocr(shot, "calc_done", "step 20b (calc -- quit back to the shell prompt)")
-        print("step 20b (calc -- quit back to the shell prompt):", shot, "-- OCR verified")
+        print("step 20b (calc -- quit back to the shell prompt):", shot, "-- framebuffer verified")
 
         # The interactive prompt: state carried between lines, a function
         # typed over three lines, an error that leaves the session intact,
@@ -1289,7 +1160,7 @@ def main():
         text = assert_ocr(shot, ["HI!", "undefined variable"], "step 21a (wisp prompt -- definitions, multi-line fn, error)")
         if not re.search(r"ada\W{0,8}alan\W{0,8}grace", text):
             raise RuntimeError(f"step 21a: the sorted list was not echoed as ada, alan, grace.\nOCR text:\n{text}")
-        print("step 21a (wisp prompt -- sorted list echoed, 3-line fn defined and called, error reported):", shot, "-- OCR verified")
+        print("step 21a (wisp prompt -- sorted list echoed, 3-line fn defined and called, error reported):", shot, "-- framebuffer verified")
 
         mon.type_text("clear()")
         mon.enter()
@@ -1315,7 +1186,7 @@ def main():
             ["stopped", "globals: names", "functions: shout", "30"],
             "step 21b (wisp prompt -- Esc, vars, session intact)",
         )
-        print("step 21b (wisp prompt -- Esc stopped a runaway line, vars, session intact):", shot, "-- debug log + OCR verified")
+        print("step 21b (wisp prompt -- Esc stopped a runaway line, vars, session intact):", shot, "-- debug log + framebuffer verified")
 
         mon.type_text("exit")
         mon.enter()
@@ -1326,7 +1197,7 @@ def main():
         shot = mon.screendump("21c_wisp_exit")
         assert_ocr(shot, ["left the WISP prompt", "prompt_done"], "step 21c (wisp prompt -- exit back to the shell)")
         assert_debug_log("[wisp] interactive prompt ended", "step 21c (wisp prompt -- exit back to the shell)")
-        print("step 21c (wisp prompt -- exit back to the shell):", shot, "-- debug log + OCR verified")
+        print("step 21c (wisp prompt -- exit back to the shell):", shot, "-- debug log + framebuffer verified")
 
         # The line editor: Up recalls the last command, which is edited
         # mid-line before it runs; then Home/Right/Delete/End/Backspace
@@ -1364,7 +1235,7 @@ def main():
             "step 22a (line editor -- history recall and mid-line edits)",
             must_not_contain=["Kfirst", "twoX"],
         )
-        print("step 22a (line editor -- Up recalled and edited a command; Home/Right/Delete/End/Backspace):", shot, "-- OCR verified")
+        print("step 22a (line editor -- Up recalled and edited a command; Home/Right/Delete/End/Backspace):", shot, "-- framebuffer verified")
 
         mon.type_text("wisp")
         mon.enter()
@@ -1386,7 +1257,7 @@ def main():
         mon.type_text("exit")
         mon.enter()
         time.sleep(0.2)
-        print("step 22b (wisp prompt -- Up recalled 'let n = 41', edited to 46):", shot, "-- OCR verified")
+        print("step 22b (wisp prompt -- Up recalled 'let n = 41', edited to 46):", shot, "-- framebuffer verified")
 
         # words.wisp: a word counter whose whole state is one map, so its
         # answers exercise map writes, get(), key-order iteration and the
@@ -1407,7 +1278,7 @@ def main():
             ["8 words, 5 different", "the: 3 times", "dog: twice", "cat: once"],
             "step 23a (run words -- tallies kept in a map, ranked)",
         )
-        print("step 23a (run words -- tallies kept in a map, ranked):", shot, "-- OCR verified")
+        print("step 23a (run words -- tallies kept in a map, ranked):", shot, "-- framebuffer verified")
         for line in ["forget the", "list", "quit"]:
             mon.type_text(line)
             mon.enter()
@@ -1424,7 +1295,7 @@ def main():
             raise RuntimeError(f"step 23b: 'the' was still listed after 'forget the'.\nOCR text:\n{text}")
         if not re.search(r"cat: once.*dog: twice.*ran: once.*saw: once", after_forget, re.S):
             raise RuntimeError(f"step 23b: the list was not in alphabetical order.\nOCR text:\n{text}")
-        print("step 23b (words -- forget removed a key, list walked the rest in order):", shot, "-- OCR verified")
+        print("step 23b (words -- forget removed a key, list walked the rest in order):", shot, "-- framebuffer verified")
 
         # Maps at the wisp> prompt, then saved to the AHCI disk; the second
         # boot below loads it back (step 13d).
@@ -1456,7 +1327,7 @@ def main():
         mon.type_text("exit")
         mon.enter()
         time.sleep(0.2)
-        print("step 24a (wisp prompt -- a map built, changed and saved):", shot, "-- OCR verified")
+        print("step 24a (wisp prompt -- a map built, changed and saved):", shot, "-- framebuffer verified")
 
         mon.quit()
     finally:
@@ -1525,7 +1396,7 @@ def main():
             ["Welcome back", "You have run this 2 times"],
             "step 13c (run counter -- second, separate boot -- count persisted as 2)",
         )
-        print("step 13c (run counter -- second, separate boot -- count persisted as 2):", shot, "-- OCR verified")
+        print("step 13c (run counter -- second, separate boot -- count persisted as 2):", shot, "-- framebuffer verified")
 
         # The map step 24a saved, read back by this separate boot: the
         # map encoding (save format tag 5) on a real AHCI disk.
@@ -1547,7 +1418,7 @@ def main():
             "step 13d (wisp prompt -- second boot loads the map step 24a saved)",
             must_not_contain=["wisp: line"],
         )
-        print("step 13d (wisp prompt -- second boot loads the map step 24a saved):", shot, "-- OCR verified")
+        print("step 13d (wisp prompt -- second boot loads the map step 24a saved):", shot, "-- framebuffer verified")
 
         mon2.quit()
     finally:

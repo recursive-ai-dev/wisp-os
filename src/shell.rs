@@ -1,5 +1,5 @@
 //! The interactive command shell: prompt, line editing, and command
-//! dispatch for `help`, `clear`, `echo`, `ls`, `run`, `wisp`, `uptime`,
+//! dispatch for `help`, `clear`, `echo`, `ls`, `run`, `ide`, `wisp`, `uptime`,
 //! `mem`, `version`, `save`, `load`, `keys`, `delete`, and `format`.
 //!
 //! Runs entirely on our own drivers (`keyboard.rs` for input, `clock.rs` for
@@ -10,9 +10,10 @@
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::ahci;
+use crate::storage;
 use crate::allocator;
 use crate::lapic;
 use crate::paging;
@@ -186,15 +187,15 @@ pub struct Shell {
     /// `Shell::new`); never re-seeded, so successive `run` invocations of
     /// different scripts don't repeat the same sequence.
     rng_state: u64,
-    /// The AHCI save disk -- `None` if `main.rs`'s `bring_up_save_disk`
-    /// found no usable disk this boot (see its own doc comment for the
-    /// first-class failure modes that lead here). A present disk may still
+    /// The selected save disk. A present disk may still
     /// be unmounted (blank or foreign) until `format` provisions it.
     /// Owned here, not dropped after boot, specifically so `save`/`load`
     /// (this module's own commands below, and the WISP builtins that will
     /// route through them in a later Build Order step) can issue commands
     /// at any later point in the shell's lifetime.
     save_disk: Option<save_format::SaveDisk>,
+    save_disk_index: Option<usize>,
+    other_disks: Vec<(usize, save_format::SaveDisk)>,
     /// Lines typed at the `>` prompt, for Up/Down.
     history: History,
     /// Lines typed at the `wisp>` prompt, kept separately (they are WISP,
@@ -203,11 +204,19 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(apps: alloc::vec::Vec<(String, String)>, save_disk: Option<save_format::SaveDisk>) -> Self {
+    pub fn new(apps: alloc::vec::Vec<(String, String)>, disks: Vec<save_format::SaveDisk>, selected: Option<usize>) -> Self {
+        let mut save_disk = None;
+        let mut other_disks = Vec::new();
+        for (index, disk) in disks.into_iter().enumerate() {
+            if Some(index) == selected { save_disk = Some(disk); }
+            else { other_disks.push((index, disk)); }
+        }
         Self {
             apps,
             rng_state: seed_rng(),
             save_disk,
+            save_disk_index: selected,
+            other_disks,
             history: History::new(),
             wisp_history: History::new(),
         }
@@ -259,6 +268,13 @@ impl Shell {
             "echo" => self.cmd_echo(rest, console),
             "ls" => self.cmd_ls(rest, console),
             "run" => self.cmd_run(console, rest),
+            "ide" | "edit" => {
+                if let Err(message) = crate::ide::run(console, &self.apps, &mut self.rng_state, self.save_disk.as_ref(), rest) {
+                    console.set_fg(gfx::ERROR);
+                    let _ = writeln!(console, "ide: {message}");
+                    console.set_fg(gfx::FOREGROUND);
+                }
+            }
             "wisp" => self.cmd_wisp(console),
             "uptime" => self.cmd_uptime(console),
             "version" => self.cmd_version(console),
@@ -268,6 +284,8 @@ impl Shell {
             "keys" => self.cmd_keys(console),
             "delete" => self.cmd_delete(rest, console),
             "format" => self.cmd_format(console),
+            "disks" => self.cmd_disks(console),
+            "disk" => self.cmd_disk(rest, console),
             // Hidden, feature-gated, never listed in `cmd_help`: exists
             // purely so `tests/fault_test.py` can prove the GDT/IDT/
             // fault-screen path built in this phase actually catches and
@@ -395,17 +413,20 @@ impl Shell {
              \x20\x20help          Show this list of commands\n\
              \x20\x20clear         Clear the screen\n\
              \x20\x20echo <text>   Print <text> back to the screen\n\
-             \x20\x20ls [APPS]     List the in-memory APPS snapshot\n\
-             \x20\x20run <name>    Run APPS/<name>.wisp (a WISP program)\n\
+             \x20\x20ls [APPS|PROGRAMS] List bundled apps and saved programs\n\
+             \x20\x20run <name>    Run a saved program or bundled WISP app\n\
+             \x20\x20ide [name]    Wisp Studio: edit, save, check and run ('edit' also works)\n\
              \x20\x20wisp          Interactive WISP prompt ('exit' to leave)\n\
              \x20\x20uptime        Show elapsed time since boot (timer ticks)\n\
              \x20\x20mem           Show heap and physical memory usage\n\
              \x20\x20version       Show the kernel version and protections\n\
-             \x20\x20save <k> <v>  Save <v> under key <k> on the AHCI save disk\n\
+             \x20\x20save <k> <v>  Save <v> under key <k> on the selected save disk\n\
              \x20\x20load <k>      Print the value saved under key <k>\n\
              \x20\x20keys          List every key on the save disk\n\
              \x20\x20delete <k>    Delete key <k> from the save disk\n\
-             \x20\x20format        Set up the AHCI disk for save/load (ERASES it; asks first)\n\
+             \x20\x20disks         List AHCI, NVMe and USB disks and the selected save disk\n\
+             \x20\x20disk <n>      Select a disk for save/load (does not format it)\n\
+             \x20\x20format        Set up the selected disk for saves (ERASES save region; asks)\n\
              Press Esc to stop a running program. Arrows, Home, End and Delete edit\n\
              a line; Up and Down recall earlier ones.\n",
         );
@@ -435,7 +456,7 @@ impl Shell {
         }
         let Some(disk) = self.save_disk.as_ref() else {
             console.set_fg(gfx::ERROR);
-            console.write_str("save: no AHCI save disk available this boot\n");
+            console.write_str("save: no save disk selected (use 'disks' and 'disk <n>')\n");
             console.set_fg(gfx::FOREGROUND);
             return;
         };
@@ -464,7 +485,7 @@ impl Shell {
         }
         let Some(disk) = self.save_disk.as_ref() else {
             console.set_fg(gfx::ERROR);
-            console.write_str("load: no AHCI save disk available this boot\n");
+            console.write_str("load: no save disk selected (use 'disks' and 'disk <n>')\n");
             console.set_fg(gfx::FOREGROUND);
             return;
         };
@@ -488,7 +509,7 @@ impl Shell {
     fn cmd_keys(&mut self, console: &mut Console) {
         let Some(disk) = self.save_disk.as_ref() else {
             console.set_fg(gfx::ERROR);
-            console.write_str("keys: no AHCI save disk available this boot\n");
+            console.write_str("keys: no save disk selected (use 'disks' and 'disk <n>')\n");
             console.set_fg(gfx::FOREGROUND);
             return;
         };
@@ -518,7 +539,7 @@ impl Shell {
         }
         let Some(disk) = self.save_disk.as_ref() else {
             console.set_fg(gfx::ERROR);
-            console.write_str("delete: no AHCI save disk available this boot\n");
+            console.write_str("delete: no save disk selected (use 'disks' and 'disk <n>')\n");
             console.set_fg(gfx::FOREGROUND);
             return;
         };
@@ -537,14 +558,14 @@ impl Shell {
         }
     }
 
-    /// `format`: provision the AHCI disk as a WISP save store. This is the
+    /// `format`: provision the selected disk as a WISP save store. This is the
     /// only path that ever writes outside an existing store, so it names
     /// the exact device and the exact destructive range, and proceeds
     /// only if the user types the confirmation word in full.
     fn cmd_format(&mut self, console: &mut Console) {
         let Some(disk) = self.save_disk.as_mut() else {
             console.set_fg(gfx::ERROR);
-            console.write_str("format: no AHCI save disk available this boot\n");
+            console.write_str("format: no save disk selected (use 'disks' and 'disk <n>')\n");
             console.set_fg(gfx::FOREGROUND);
             return;
         };
@@ -566,12 +587,12 @@ impl Shell {
         let _ = write!(
             console,
             "format: this ERASES sectors {first_sector}-{last_sector} ({} KiB) of:\n\
-             \x20 AHCI port {}  model '{model}'  serial '{serial}'  {} MiB\n\
+             \x20 {}  model '{model}'  serial '{serial}'  {} MiB\n\
              {}\
              Type ERASE to continue, anything else to cancel: ",
-            save_format::REGION_SECTORS * u64::from(ahci::SECTOR_SIZE) / 1024,
-            disk.hba().port(),
-            total * u64::from(ahci::SECTOR_SIZE) / (1024 * 1024),
+            save_format::REGION_SECTORS * u64::from(storage::SECTOR_SIZE) / 1024,
+            disk.hba().location(),
+            total * u64::from(storage::SECTOR_SIZE) / (1024 * 1024),
             if disk.is_mounted() {
                 "It currently holds a WISP save store; every saved value will be lost.\n"
             } else {
@@ -599,31 +620,82 @@ impl Shell {
         }
     }
 
-    /// `ls`/`ls APPS` both list the in-memory snapshot; there is no other
-    /// directory to list once Boot Services (and with it, live filesystem
-    /// access) is gone. Any other argument is reported as not available
-    /// rather than silently showing the same snapshot under a misleading
-    /// path, so a script or user typing `ls SOMETHINGELSE` gets an honest
-    /// answer instead of a confusing one.
+    fn cmd_disks(&self, console: &mut Console) {
+        let mut disks: Vec<(usize, &save_format::SaveDisk)> = self.other_disks.iter().map(|(i, d)| (*i, d)).collect();
+        if let (Some(index), Some(disk)) = (self.save_disk_index, self.save_disk.as_ref()) { disks.push((index, disk)); }
+        disks.sort_by_key(|(index, _)| *index);
+        if disks.is_empty() { console.write_str("No supported AHCI, NVMe or USB disks found.\n"); }
+        for (index, disk) in disks {
+            let info = disk.hba().info().unwrap();
+            let state = if disk.hba().is_failed() { "offline" }
+                else if disk.hba().native_sector_size() != 512 { "4Kn read-only; saves need an aligned future format" }
+                else if disk.is_mounted() { "WISP saves mounted" }
+                else if disk.format_range().is_ok() { "not formatted for WISP" }
+                else { "foreign/unsupported partitions; format refused" };
+            let _ = writeln!(console, "{} {index}: {} '{}' {} MiB -- {state}",
+                if Some(index) == self.save_disk_index { "*" } else { " " },
+                disk.hba().location(), info.model(), disk.total_sectors() / 2048);
+        }
+        console.write_str("Use 'disk <n>' to select a save disk; selection never formats it.\n");
+    }
+
+    fn cmd_disk(&mut self, rest: &str, console: &mut Console) {
+        let Ok(index) = rest.trim().parse::<usize>() else {
+            self.cmd_disks(console);
+            return;
+        };
+        if Some(index) != self.save_disk_index {
+            let Some(position) = self.other_disks.iter().position(|(i, _)| *i == index) else {
+                console.write_str("disk: unknown disk number (use 'disks')\n");
+                return;
+            };
+            let (_, next) = self.other_disks.remove(position);
+            if let (Some(previous), Some(disk)) = (self.save_disk_index.take(), self.save_disk.take()) {
+                self.other_disks.push((previous, disk));
+            }
+            self.save_disk = Some(next);
+            self.save_disk_index = Some(index);
+        }
+        let _ = writeln!(console, "Selected disk {index} for saves (no disk contents changed).");
+    }
+
+    /// List boot-time apps, saved source projects, or both with their origin.
     fn cmd_ls(&self, path: &str, console: &mut Console) {
         let normalized = path.trim().trim_matches('/').to_ascii_uppercase();
-        if !normalized.is_empty() && normalized != "APPS" {
+        if !normalized.is_empty() && normalized != "APPS" && normalized != "PROGRAMS" {
             console.set_fg(gfx::ERROR);
             let _ = write!(
                 console,
-                "ls: '{path}': no live filesystem after boot -- only the in-memory APPS snapshot is available (try 'ls' or 'ls APPS')\n"
+                "ls: '{path}': no live filesystem after boot (try 'ls', 'ls APPS' or 'ls PROGRAMS')\n"
             );
             console.set_fg(gfx::FOREGROUND);
             return;
         }
 
-        if self.apps.is_empty() {
-            console.write_str("(empty)\n");
-            return;
+        let mut count = 0;
+        if normalized != "PROGRAMS" {
+            for (name, source) in &self.apps {
+                let _ = writeln!(console, "     {name}  ({} bytes) [bundled]", source.len());
+                count += 1;
+            }
         }
-        for (name, source) in &self.apps {
-            let _ = write!(console, "     {name}  ({} bytes)\n", source.len());
+        if normalized != "APPS" {
+            match crate::projects::list(self.save_disk.as_ref()) {
+                Ok(names) => {
+                    for name in names {
+                        let _ = writeln!(console, "     {name}.wisp  [saved prog.{name}]");
+                        count += 1;
+                    }
+                }
+                Err(message) => {
+                    console.set_fg(gfx::ERROR);
+                    let _ = writeln!(console, "ls: {message}");
+                    console.set_fg(gfx::FOREGROUND);
+                    return;
+                }
+            }
         }
+        if count == 0 { console.write_str("(empty)\n"); }
     }
 
     fn cmd_run(&mut self, console: &mut Console, name: &str) {
@@ -636,31 +708,31 @@ impl Shell {
         }
 
         let filename = resolve_program_filename(name);
+        let saved = match crate::projects::normalize_name(name) {
+            Ok(name) => match crate::projects::load_source(&name, &[], self.save_disk.as_ref()) {
+                Ok(source) => source,
+                Err(message) => {
+                    console.set_fg(gfx::ERROR);
+                    let _ = writeln!(console, "run: {message}");
+                    console.set_fg(gfx::FOREGROUND);
+                    return;
+                }
+            },
+            Err(_) => None,
+        };
         // Borrowed, not cloned: a second full copy of the source would
         // double its heap residency for the whole run.
-        let source = match self.apps.iter().find(|(n, _)| n.eq_ignore_ascii_case(&filename)) {
-            Some((_, s)) => s.as_str(),
+        let source = match saved.as_deref().or_else(|| self.apps.iter().find(|(n, _)| n.eq_ignore_ascii_case(&filename)).map(|(_, s)| s.as_str())) {
+            Some(source) => source,
             None => {
                 console.set_fg(gfx::ERROR);
-                let _ = write!(console, "run: '{filename}' not found in the APPS snapshot\n");
+                let _ = write!(console, "run: '{filename}' not found in bundled apps or saved programs\n");
                 console.set_fg(gfx::FOREGROUND);
                 return;
             }
         };
 
-        // A fresh start: an Esc pressed before this program began (at the
-        // prompt, or to stop the previous program) must not stop this one.
-        keyboard::clear_stop_request();
-        let mut host = ShellHost {
-            console,
-            rng: &mut self.rng_state,
-            save_disk: self.save_disk.as_ref(),
-            last_usb_poll_tick: u64::MAX,
-        };
-        let result = wisp::run_source(source, &mut host);
-        // And a clean exit: keys typed into the program (including the Esc
-        // that stopped it) never spill into the shell prompt.
-        keyboard::clear_stop_request();
+        let result = run_program_source(source, console, &mut self.rng_state, self.save_disk.as_ref());
         if let Err(e) = result {
             // A stop is logged (just the fact and the line -- never message
             // text, which can quote what the user typed) so the test
@@ -717,10 +789,14 @@ impl Shell {
                     }
                     _ => {}
                 }
-            } else {
-                pending.push('\n');
             }
-            pending.push_str(&line);
+            if let Err(message) = wisp::append_interactive_line(&mut pending, &line) {
+                pending.clear();
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "wisp: {message} (unfinished input discarded)");
+                console.set_fg(gfx::FOREGROUND);
+                continue;
+            }
             if wisp::open_brackets(&pending) > 0 {
                 continue;
             }
@@ -845,9 +921,7 @@ fn list_definitions(session: &wisp::interp::Session, console: &mut Console) {
     }
 }
 
-/// `run <name>` always resolves against the `APPS` snapshot, auto-appending
-/// `.wisp` when `name` has no extension of its own, per
-/// `docs/WISP_LANGUAGE.md`.
+/// Auto-append `.wisp` for snapshot lookup when the user omitted an extension.
 fn resolve_program_filename(name: &str) -> String {
     if name.contains('.') {
         name.to_string()
@@ -914,11 +988,17 @@ fn next_rand_u64(state: &mut u64) -> u64 {
     x
 }
 
-/// Bridges the WISP interpreter's `Host` trait to this shell's actual
-/// screen, keyboard, timer, and (Phase 2, Part B) AHCI save disk, for the
-/// duration of one `run` command. `save_disk` borrows `Shell::save_disk`
-/// rather than owning it, since the `Hba` itself must keep living in the
-/// `Shell` across every `run` invocation, not just this one.
+/// Shared execution path for the shell and Studio, with a fresh session.
+pub(crate) fn run_program_source(source: &str, console: &mut Console, rng: &mut u64, save_disk: Option<&save_format::SaveDisk>) -> Result<(), wisp::WispError> {
+    // Esc and queued program input must not leak between runs or into the editor.
+    keyboard::clear_stop_request();
+    let mut host = ShellHost { console, rng, save_disk, last_usb_poll_tick: u64::MAX };
+    let result = wisp::run_source(source, &mut host);
+    keyboard::clear_stop_request();
+    result
+}
+
+/// Bridges interpreter I/O to the shell's drivers for the duration of a run.
 struct ShellHost<'a> {
     console: &'a mut Console,
     rng: &'a mut u64,
@@ -981,11 +1061,11 @@ impl wisp::interp::Host for ShellHost<'_> {
     }
 
     fn save(&mut self, key: &str, value: &Value) -> Result<(), &'static str> {
-        self.save_disk.ok_or("no AHCI save disk available this boot")?.save(key, value)
+        self.save_disk.ok_or("no save disk selected (use 'disks' and 'disk <n>')")?.save(key, value)
     }
 
     fn load(&mut self, key: &str) -> Result<Option<Value>, &'static str> {
-        self.save_disk.ok_or("no AHCI save disk available this boot")?.load(key)
+        self.save_disk.ok_or("no save disk selected (use 'disks' and 'disk <n>')")?.load(key)
     }
 
     // ---- WISP v2: pixel/graphics primitives ----------------------------

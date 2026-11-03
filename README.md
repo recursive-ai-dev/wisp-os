@@ -1,4 +1,4 @@
-# WISP OS v1.1.0
+# WISP OS v1.2.0
 
 A freestanding x86_64 kernel that boots directly on UEFI firmware (or in
 QEMU/OVMF) and *becomes* the machine's whole environment: no underlying
@@ -24,7 +24,7 @@ was designed around: see `USB_INSTALL.md`'s "No networking, by design".
 
 ## Quick start
 
-A release archive (`wisp-os-v1.1.0.tar.gz` / `.zip`) already contains a
+A release archive (`wisp-os-v1.2.0.tar.gz` / `.zip`) already contains a
 prebuilt `esp/EFI/BOOT/BOOTX64.EFI`: to boot real hardware without
 installing Rust at all, copy the `esp/` directory onto a FAT32 USB stick
 (or use the installer scripts -- see `USB_INSTALL.md`). Verify the files
@@ -33,7 +33,7 @@ first with `sha256sum -c SHA256SUMS` inside the extracted folder.
 To build and run from source:
 
 ```bash
-./build.sh           # cargo +nightly build --release --target x86_64-unknown-uefi,
+./build.sh           # cargo build --locked --release --target x86_64-unknown-uefi,
                      # then assembles esp/EFI/BOOT/BOOTX64.EFI
 ./run.sh             # boots ./esp in QEMU under OVMF (headless by default;
                      # UEFI_SHELL_DISPLAY=gui ./run.sh for a real window,
@@ -44,7 +44,7 @@ To build the live installer ISO (Python 3 and `xorriso` required):
 
 ```bash
 ./scripts/make_iso.sh
-UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.1.0-live.iso ./run.sh
+UEFI_SHELL_DISPLAY=gui WISP_ISO=dist/wisp-os-v1.2.0-live.iso ./run.sh
 ```
 
 This creates a separate 128 MiB `install.img` destination for the VM. At
@@ -77,8 +77,36 @@ WISP prompt that runs each line as you type it -- the way to try the
 language, or write a quick program, on the machine itself. Every line of
 input can be edited with the arrow keys, Home, End and Delete, and Up/Down
 recall earlier lines at the `>` and `wisp>` prompts.
+
+`ide` opens **Wisp Studio**, the built-in editor, on `main`; `ide hello`
+(or `edit hello`) opens a saved program or bundled example. New names
+start empty. Studio has line numbers, syntax colors, automatic indentation,
+and scrolling with arrows and Page Up/Down. **F2 saves, F3 opens or creates,
+F5 runs, F6 checks syntax, F1 shows help, and F10 or Esc leaves.** Leaving
+or opening another program with unsaved edits offers Save, Discard or Cancel.
+Run output stays visible until a keypress; errors select their source line.
+
+Saved programs use `prog.<name>` keys on the selected save disk and survive
+reboots. A blank disk needs the shell's `format` command first. Names are
+1-27 ASCII letters, digits, underscores or hyphens; `.wisp` is optional.
+Studio edits up to 16 KiB, while current save slots hold **4042 source bytes**;
+larger buffers can run but cannot be saved. Without persistence, editing
+and running work in memory. `ls` shows bundled and saved origins,
+`ls PROGRAMS` lists saved sources, and `run <name>` prefers a saved program
+over a bundled app of the same name. Boot-volume `APPS` files stay unchanged.
+Remove a saved program with `delete prog.<name>`; source export is not yet available.
+
+`disks` lists discovered disks and marks the selected save disk; `disk <n>`
+selects one without formatting it. Ambiguous choices require this explicit
+selection. A boot USB containing only FAT files has no save region: use the
+live installer to create an ESP plus Wisp save partition on an eligible
+destination. `format` refuses foreign partition tables.
+
+For native transport trials in QEMU, set `WISP_SAVE_TRANSPORT=nvme` or
+`WISP_SAVE_TRANSPORT=usb` when running `./run.sh`; the default is `ahci`.
+
 **Esc stops any running program.**
-`save`/`load` persist key/value pairs to the AHCI disk (after a one-time
+`save`/`load` persist key/value pairs to the selected disk (after a one-time
 `format`, which names the disk and asks before erasing anything) -- each
 save is crash-atomic, and `keys`/`delete` list and remove them -- `uptime` reports
 elapsed time from the timer interrupt, `mem` shows heap and physical
@@ -131,13 +159,14 @@ how each layer works, and the roadmap of expansion -- see `docs/MANUAL.md`.
 6. Brings up input: a PS/2 keyboard on ISA IRQ1, and -- if an xHCI
    controller with a USB HID boot keyboard is present -- enumerates that
    device and polls its interrupt endpoint. Both paths feed one queue.
-7. Brings up storage: finds an AHCI controller over PCI, resets it,
-   IDENTIFYs the disk, and -- with a single read, never a write --
-   mounts its own key/value save format if the disk already carries
-   one. Saves are copy-on-write: a power cut mid-save leaves the old
-   value or the new one, never neither. A blank or foreign disk is left untouched; the shell's `format`
-   command provisions it after showing the device and asking for
-   confirmation. Any failure downgrades to "no persistence" with a
+7. Brings up AHCI SATA, NVMe (including supported Intel client VMD),
+   and xHCI USB Bulk-Only storage. PCI discovery includes firmware-assigned
+   buses behind bridges. It probes disks without writing and selects a
+   unique mounted Wisp store, or a unique eligible format target. Saves
+   are copy-on-write: a power cut leaves the old value or the new one.
+   Boot leaves blank and foreign disks untouched. The shell's `format`
+   provisions eligible raw disks or an existing Wisp save partition after
+   naming the target and requiring confirmation; foreign partitions are refused. Any failure downgrades to "no persistence" with a
    message, never a hang.
 8. Hands the machine to the shell.
 
@@ -159,7 +188,10 @@ src/                  the kernel (no_std, no_main)
   keyboard.rs              PS/2 keyboard driver and the shared key queue
   xhci.rs                  xHCI host controller: rings, slots, transfers
   usb_hid.rs                USB HID boot-protocol keyboard -> key queue
-  pci.rs / ahci.rs           PCI enumeration and the AHCI disk driver
+  pci.rs                     PCI buses, 64-bit BARs and Intel client VMD domains
+  ahci.rs / nvme.rs            SATA and polled NVMe disk drivers
+  usb_storage.rs / usb_bot.rs   xHCI Bulk-Only SCSI storage and wire formats
+  storage.rs / storage_policy.rs shared sector interface and disk selection
   save_format.rs             the hand-designed key/value store on disk
   gfx.rs / font.rs            direct-framebuffer console, 8x16 bitmap font
   fs.rs                        FAT32 reads via UEFI protocols (pre-exit)
@@ -167,6 +199,8 @@ src/                  the kernel (no_std, no_main)
   disk_layout.rs               streaming GPT/FAT32 writer and save-partition discovery
   shell.rs                      the `>` prompt and its commands
   line_editor.rs                 cursor editing and history for every typed line
+  editor.rs / ide.rs             text buffer and native Wisp Studio interface
+  projects.rs                    saved WISP sources under prog.<name>
   libc_shims.rs                  freestanding `wcslen`
   wisp/                           lexer -> parser -> tree-walking interpreter
                                    (one Session per program, or per `wisp` prompt)
@@ -181,6 +215,10 @@ esp/
   APPS/*.wisp                the bundled WISP demo programs
 scripts/                 USB installers, make_iso.sh, make_release.sh
 tests/
+  ide_test.py               Studio editing, checking, running and reboot persistence (PS/2 or USB)
+  nvme_test.py              NVMe discovery, partition protection and reboot persistence
+  usb_storage_test.py       USB storage and keyboard coexistence, saves across reboot
+  storage_selection_test.py Ambiguous disks, explicit selection and separate stores
   installer_test.py         live ISO installation and standalone boot in QEMU
   iso_test.py               boot-image bytes, names and image-output safeguards
   console_capture.py        exact framebuffer text decoding without OCR
@@ -250,9 +288,12 @@ CHANGES.md                 engineering log: the specific decisions and why
 - USB input needs an **xHCI** controller and a boot-protocol keyboard on
   a **root port**: no hubs, no hot-plug, no EHCI/OHCI/UHCI. Older
   machines fall back to firmware PS/2 emulation. See `USB_INSTALL.md`.
-- Persistence needs an **AHCI** controller; NVMe and IDE-mode SATA are
-  not supported. Without one the shell runs fine with `save`/`load`
-  disabled, and says so.
+- Persistence supports **AHCI SATA**, **NVMe**, and **xHCI USB Bulk-Only**
+  disks with native 512-byte sectors. 4 KiB-native NVMe/USB media can be
+  read, but the v2 save layout refuses writes to preserve its atomicity.
+  USB storage needs a root port and BOT/SCSI interface (class `08/06/50`);
+  UAS, hubs and hot-plug are not implemented. Intel client VMD discovery
+  includes `8086:467f`; physical VMD operation remains unverified.
 - Only the boot processor is used; there is no SMP bring-up. Interrupts
   are polled for USB rather than delivered by MSI/MSI-X.
 - There is no AML interpreter, so ACPI is read for the MADT only.
@@ -267,16 +308,26 @@ CHANGES.md                 engineering log: the specific decisions and why
 
 ## Requirements
 
-- Rust nightly with the `x86_64-unknown-uefi` target and `rust-src`
-  component (`rust-toolchain.toml` selects the nightly channel; `rustup`
-  fetches it automatically the first time you build). v1.1.0 was built
-  and fully tested with `rustc 1.101.0-nightly (07e526db9 2026-10-19)`;
-  if a later nightly ever breaks the build, install that one with
-  `rustup toolchain install nightly-2026-10-20` and build with it -- or
-  just use the prebuilt EFI from the release archive.
-- `qemu-system-x86_64` and an OVMF firmware image, to run/test without
-  real hardware.
-- Python 3 with `numpy` (for `tools/train_tiny_nn.py`), `Pillow` (for
-  the test suites' screenshot capture) and `pytesseract`/`tesseract`
-  (for their OCR assertions) -- all dev-only, not part of the shipped
-  binary.
+- Rust `nightly-2026-10-21` with the `x86_64-unknown-uefi` target and
+  `rust-src` component. `rust-toolchain.toml` pins the compiler and `rustup`
+  installs it automatically. Release builds use `--locked` dependencies.
+- `qemu-system-x86_64` and OVMF firmware to run/test without real hardware.
+- Python 3.11 or later for the host tools and VM suites. Screen assertions
+  decode the embedded bitmap font directly and need no OCR or image packages.
+  NumPy is needed only to retrain the bundled neural network.
+
+## Verification and distribution
+
+Run `cargo test --manifest-path tests/host/Cargo.toml --release --locked` for
+hardware-independent tests. Run `python3 -m unittest discover -s tests -p '*_test.py'`
+for host tooling checks; VM suites also have executable entry points in `tests/`.
+The regression matrix and limitations are recorded in [release notes](docs/RELEASE_NOTES.md)
+and [TODO.md](TODO.md). VM evidence is kept in separate run directories.
+
+`scripts/make_release.sh --iso` produces source archives, a minimal
+`wisp-os-v1.2.0-runtime.zip`, the standalone EFI executable, and a live installer
+ISO. The runtime archive contains the boot image, bundled apps, user documentation
+and USB installers; it excludes source, tests and build tools. All release assets
+have SHA-256 checksums, and `BUILD_INFO.json` records compiler, target, source
+identity and binary hash. Set `SOURCE_DATE_EPOCH` to reproduce archive and ISO
+metadata. Generation failures leave previously published local packages intact.

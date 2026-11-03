@@ -327,6 +327,119 @@ fn a_corrupted_generation_cannot_promote_a_stale_copy() {
 }
 
 #[test]
+fn changed_superblock_rejects_every_mounted_operation_before_cleanup() {
+    for foreign in [false, true] {
+        let hba = store_with_stale_copy();
+        let disk = save_format::SaveDisk::new(hba, DISK_SECTORS as u64, true);
+        let mut sb = disk.hba().media()[0];
+        if foreign {
+            sb[0] ^= 0xff;
+        } else {
+            sb[9] = 255;
+        }
+        disk.hba().seed(0, &sb);
+        let before = disk.hba().media();
+        let writes = disk.hba().writes.get();
+        assert!(disk.save("new", &Value::Int(3)).is_err());
+        assert_eq!(disk.hba().writes.get(), writes, "save reclaimed changed media");
+        assert!(disk.delete("b").is_err());
+        assert!(disk.save("a", &Value::Nil).is_err());
+        assert!(disk.load("b").is_err());
+        assert!(disk.keys().is_err());
+        assert_eq!(disk.hba().writes.get(), writes);
+        assert!(disk.hba().pending().is_empty());
+        assert_eq!(disk.hba().media(), before);
+    }
+}
+
+fn corrupt_stale_generation(hba: &Hba) -> usize {
+    let media = hba.media();
+    let stale = (0..64)
+        .find(|&i| media[1 + i * 8][0] == 2 && media[1 + i * 8][1] == b'a' && media[1 + i * 8][41] == 1)
+        .unwrap();
+    let mut sector = media[1 + stale * 8];
+    sector[48] ^= 0x40;
+    hba.seed(1 + stale as u64 * 8, &sector);
+    (0..64)
+        .find(|&i| media[1 + i * 8][0] == 2 && media[1 + i * 8][1] == b'a' && media[1 + i * 8][41] == 2)
+        .unwrap()
+}
+
+#[test]
+fn corrupt_generations_cannot_reclaim_a_valid_copy_during_unrelated_mutations() {
+    for op in [Op::Save("b", Value::Int(8)), Op::Save("new", Value::Int(9)), Op::Delete("b")] {
+        let hba = store_with_stale_copy();
+        corrupt_stale_generation(&hba);
+        let before = hba.media();
+        let writes = hba.writes.get();
+        assert!(op.apply(&hba).is_err(), "unchecked generation authorized reclamation");
+        assert_eq!(hba.writes.get(), writes);
+        assert_eq!(hba.media(), before);
+        assert!(hba.pending().is_empty());
+    }
+}
+
+#[test]
+fn explicit_corruption_recovery_keeps_valid_copy_until_replacement_commits() {
+    for stop_after in 0..=2 {
+        let hba = store_with_stale_copy();
+        let valid_slot = corrupt_stale_generation(&hba);
+        let before = hba.media();
+        hba.ops.set(0);
+        hba.fail_after_ops.set(Some(stop_after));
+        let result = unsafe { save_format::save(&hba, "a", &Value::Int(7)) };
+        if stop_after < 2 {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(hba.media()[1 + valid_slot * 8], before[1 + valid_slot * 8]);
+    }
+    let hba = store_with_stale_copy();
+    corrupt_stale_generation(&hba);
+    put(&hba, "a", Value::Int(7));
+    assert!(get(&hba, "a") == Some(Value::Int(7)));
+    assert_eq!(occupied(&hba.media()), 2, "recovery must retire all old copies");
+}
+
+#[test]
+fn corrupt_full_store_cannot_sacrifice_its_valid_copy_for_recovery_space() {
+    let hba = formatted();
+    put(&hba, "a", Value::Int(1));
+    for index in 1..MAX_KEYS {
+        put(&hba, &format!("key{index}"), Value::Int(index as i64));
+    }
+    hba.ops.set(0);
+    hba.fail_after_ops.set(Some(2));
+    put(&hba, "a", Value::Int(2));
+    hba.fail_after_ops.set(None);
+    hba.power_loss();
+    assert_eq!(occupied(&hba.media()), 64);
+    corrupt_stale_generation(&hba);
+    let before = hba.media();
+    let writes = hba.writes.get();
+    let error = unsafe { save_format::save(&hba, "a", &Value::Int(3)) }.unwrap_err();
+    assert!(error.contains("no free slot"), "{error}");
+    assert_eq!(hba.writes.get(), writes);
+    assert_eq!(hba.media(), before);
+}
+
+#[test]
+fn explicit_recovery_does_not_mistake_io_failure_for_record_corruption() {
+    let hba = store_with_stale_copy();
+    let before = hba.media();
+    let writes = hba.writes.get();
+    hba.reads.set(0);
+    // Fail the integrity reread after discovery, superblock validation and
+    // all 64 slot headers, at the point where reclamation validates a winner.
+    hba.fail_read_at.set(Some(2 + 64));
+    assert_eq!(unsafe { save_format::save(&hba, "a", &Value::Int(3)) }, Err("mock: injected read failure"));
+    assert_eq!(hba.writes.get(), writes);
+    assert_eq!(hba.media(), before);
+    assert!(hba.pending().is_empty());
+}
+
+#[test]
 fn the_documented_worked_example_is_byte_exact() {
     // docs/SAVE_FORMAT.md, "Worked example".
     let hba = formatted();
@@ -407,11 +520,12 @@ fn lookups_read_one_sector_per_slot() {
     put(&hba, "big", s(&"x".repeat(4000)));
     hba.reads.set(0);
     get(&hba, "big");
-    // One region-discovery sector, 64 headers, then the matching copy.
-    assert_eq!(hba.reads.get(), 1 + 64 + 8);
+    // Discovery and current-superblock validation, 64 headers, then the
+    // matching copy. Validation protects against media changed after mount.
+    assert_eq!(hba.reads.get(), 2 + 64 + 8);
     hba.reads.set(0);
     assert!(get(&hba, "missing").is_none());
-    assert_eq!(hba.reads.get(), 1 + 64);
+    assert_eq!(hba.reads.get(), 2 + 64);
 }
 
 #[test]

@@ -65,21 +65,47 @@ pub fn run_source(source: &str, host: &mut dyn interp::Host) -> Result<(), WispE
 /// the very end of the input, so any other mistake is still reported, as
 /// the original parse found it.
 pub fn parse_interactive(source: &str) -> Result<ast::Program, WispError> {
-    let tokens = lexer::lex(source)?;
+    let mut tokens = lexer::lex(source)?;
     match parser::parse(&tokens) {
         Ok(program) => Ok(program),
         Err(first) => {
-            let trimmed = source.trim_end();
-            if trimmed.ends_with(';') {
+            if tokens.len() >= lexer::MAX_TOKENS {
                 return Err(first);
             }
-            let mut patched = String::from(trimmed);
-            patched.push(';');
-            lexer::lex(&patched)
-                .and_then(|tokens| parser::parse(&tokens))
-                .map_err(|_| first)
+            if tokens.iter().rev().nth(1).is_some_and(|token| matches!(token.tok, lexer::Tok::Semi)) {
+                return Err(first);
+            }
+            // Comments are absent from tokens: inserting before EOF works
+            // even when the source ends in a comment, without copying and
+            // lexing the whole source a second time.
+            let eof = tokens.pop().expect("the lexer always appends EOF");
+            tokens.try_reserve(2).map_err(|_| WispError::new(eof.line, interp::OUT_OF_MEMORY_MESSAGE))?;
+            tokens.push(lexer::Token { tok: lexer::Tok::Semi, line: eof.line });
+            tokens.push(eof);
+            parser::parse(&tokens).map_err(|_| first)
         }
     }
+}
+
+/// One unfinished interactive piece is bounded separately from boot apps.
+pub const MAX_INTERACTIVE_SOURCE_BYTES: usize = 16 * 1024;
+
+/// Append a prompt line atomically. Callers can discard an oversized piece
+/// and continue using the same session; no partial newline is left behind.
+pub fn append_interactive_line(pending: &mut String, line: &str) -> Result<(), &'static str> {
+    let separator = usize::from(!pending.is_empty());
+    let added = line.len().checked_add(separator).ok_or("interactive source limit is 16 KiB")?;
+    if pending.len() > MAX_INTERACTIVE_SOURCE_BYTES
+        || added > MAX_INTERACTIVE_SOURCE_BYTES.saturating_sub(pending.len())
+    {
+        return Err("interactive source limit is 16 KiB");
+    }
+    pending.try_reserve(added).map_err(|_| interp::OUT_OF_MEMORY_MESSAGE)?;
+    if separator != 0 {
+        pending.push('\n');
+    }
+    pending.push_str(line);
+    Ok(())
 }
 
 /// How many more `(`, `[` and `{` than `)`, `]` and `}` `source` has,

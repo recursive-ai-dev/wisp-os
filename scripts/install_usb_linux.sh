@@ -102,17 +102,31 @@ partition_path() {
     fi
 }
 
+# --force relaxes only transport/removability. A partition or mapper node
+# is never a whole-disk destination for this GPT installer.
+require_whole_disk() {
+    local disk="$1" kind
+    if ! kind="$(lsblk -dno TYPE -- "$disk")" || [[ "$kind" != "disk" ]]; then
+        echo "error: '$disk' must be one whole disk (lsblk TYPE=disk); partitions, mapper devices and unknown targets are refused, including with --force." >&2
+        exit 1
+    fi
+}
+
 cmd_install() {
     require_root
-    require_cmds lsblk parted mkfs.vfat blockdev findmnt
+    require_cmds lsblk parted mkfs.vfat blockdev findmnt readlink
 
     local disk="" force=0 source_dir="$DEFAULT_SOURCE"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force) force=1; shift ;;
-            --source) source_dir="$2"; shift 2 ;;
+            --source)
+                [[ $# -ge 2 && -n "$2" ]] || { echo "error: --source needs a directory" >&2; exit 1; }
+                source_dir="$2"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
-            /dev/*) disk="$1"; shift ;;
+            /dev/*)
+                [[ -z "$disk" ]] || { echo "error: specify exactly one target disk" >&2; exit 1; }
+                disk="$1"; shift ;;
             *) echo "error: unrecognized argument '$1'" >&2; usage; exit 1 ;;
         esac
     done
@@ -122,6 +136,11 @@ cmd_install() {
         usage
         exit 1
     fi
+    require_whole_disk "$disk"
+    # Resolve /dev/disk/by-id aliases before deriving partition paths or
+    # comparing the root disk. This does not follow a different target
+    # after the operator's confirmations.
+    disk="$(readlink -f -- "$disk")"
     if [[ ! -b "$disk" ]]; then
         echo "error: '$disk' is not a block device. Run '$0 list' to see candidates." >&2
         exit 1
@@ -194,11 +213,15 @@ cmd_install() {
         exit 1
     fi
 
-    echo "==> Unmounting any partitions of $disk (should be none, already checked)..."
-    for part in "$disk"?*; do
-        [[ -b "$part" ]] || continue
-        umount "$part" 2>/dev/null || true
-    done
+    # Confirmation can take time. Recheck the safety boundary immediately
+    # before partitioning, and never unmount devices by a name glob (e.g.
+    # /dev/nvme0n1?* also matches a different namespace /dev/nvme0n10).
+    require_whole_disk "$disk"
+    mounts="$(disk_mountpoints "$disk")"
+    if [[ -n "$mounts" ]]; then
+        echo "error: '$disk' became mounted during confirmation; refusing to erase it." >&2
+        exit 1
+    fi
 
     echo "==> Writing GPT partition table with a single FAT32 EFI System Partition..."
     parted --script "$disk" mklabel gpt
@@ -277,4 +300,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

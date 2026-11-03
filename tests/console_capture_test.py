@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import console_capture
+import acceptance_test
 
 
 class ConsoleCaptureTests(unittest.TestCase):
@@ -43,6 +44,22 @@ class ConsoleCaptureTests(unittest.TestCase):
             path.write_bytes(b"P6\n8 16\n255\nshort")
             with self.assertRaises(ValueError):
                 console_capture.text(path)
+
+    def test_graphics_assertions_check_channels_coordinates_and_missing_colors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "screen.ppm"
+            path.write_bytes(b"P6\n2 2\n255\n" + bytes((255, 0, 0, 0, 255, 0,
+                                                          0, 0, 255, 0, 0, 0)))
+            self.assertEqual(console_capture.pixel(path, 1, 0), (0, 255, 0))
+            acceptance_test.assert_colors_present(path, [(255, 0, 0), (0, 0, 255)], "colors", 0)
+            acceptance_test.assert_pixel_near(path, 1, 0, (0, 255, 0), "pixel", 0)
+            with self.assertRaises(RuntimeError):
+                acceptance_test.assert_colors_present(path, [(255, 255, 255)], "missing", 0)
+            with self.assertRaises(RuntimeError):
+                acceptance_test.assert_pixel_near(path, 0, 0, (0, 0, 255), "wrong channel", 0)
+            for x, y in ((-1, 0), (2, 0), (0, -1), (0, 2)):
+                with self.assertRaises(ValueError):
+                    console_capture.pixel(path, x, y)
 
 
 if __name__ == "__main__":

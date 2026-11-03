@@ -9,6 +9,11 @@ use alloc::vec::Vec;
 
 use super::WispError;
 
+/// Includes the final EOF token. A token occupies 24 bytes on x86_64,
+/// so even dense source uses at most 768 KiB for the token vector.
+pub const MAX_TOKENS: usize = 32 * 1024;
+pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(i64),
@@ -89,6 +94,9 @@ fn keyword(ident: &str) -> Option<Tok> {
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
+    if src.len() > MAX_SOURCE_BYTES {
+        return Err(WispError::new(1, "source limit is 256 KiB"));
+    }
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut line = 1u32;
@@ -101,6 +109,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
 
     while i < bytes.len() {
         let c = bytes[i];
+
+        if !matches!(c, b' ' | b'\t' | b'\r' | b'\n' | b'#') {
+            if tokens.len() >= MAX_TOKENS - 1 {
+                return Err(WispError::new(line, "program has too many tokens (limit is 32768 including EOF)"));
+            }
+            // Keep room for both this token and EOF. Vec's geometric
+            // growth stays within MAX_TOKENS (a power of two).
+            tokens.try_reserve(2).map_err(|_| WispError::new(line, super::interp::OUT_OF_MEMORY_MESSAGE))?;
+        }
 
         match c {
             b' ' | b'\t' | b'\r' => {
@@ -336,6 +353,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
         }
     }
 
+    tokens.try_reserve(1).map_err(|_| WispError::new(line, super::interp::OUT_OF_MEMORY_MESSAGE))?;
     tokens.push(Token {
         tok: Tok::Eof,
         line,

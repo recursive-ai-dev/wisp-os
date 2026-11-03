@@ -1,0 +1,69 @@
+{
+  "source": "https://api.osv.dev/v1/querybatch",
+  "packages": [
+    {
+      "name": "bit_field",
+      "version": "0.10.3"
+    },
+    {
+      "name": "bitflags",
+      "version": "2.13.1"
+    },
+    {
+      "name": "cfg-if",
+      "version": "1.0.4"
+    },
+    {
+      "name": "log",
+      "version": "0.4.33"
+    },
+    {
+      "name": "proc-macro2",
+      "version": "1.0.107"
+    },
+    {
+      "name": "ptr_meta",
+      "version": "0.2.0"
+    },
+    {
+      "name": "ptr_meta_derive",
+      "version": "0.2.0"
+    },
+    {
+      "name": "quote",
+      "version": "1.0.47"
+    },
+    {
+      "name": "syn",
+      "version": "1.0.109"
+    },
+    {
+      "name": "syn",
+      "version": "2.0.119"
+    },
+    {
+      "name": "ucs2",
+      "version": "0.3.3"
+    },
+    {
+      "name": "uefi",
+      "version": "0.30.0"
+    },
+    {
+      "name": "uefi-macros",
+      "version": "0.14.0"
+    },
+    {
+      "name": "uefi-raw",
+      "version": "0.6.0"
+    },
+    {
+      "name": "uguid",
+      "version": "2.2.1"
+    },
+    {
+      "name": "unicode-ident",
+      "version": "1.0.24"
+    }
+  ]
+}

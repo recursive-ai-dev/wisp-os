@@ -96,7 +96,7 @@ def build_fault_test_binary():
     print("==> Building BOOTX64.efi (release, fault-test-hooks feature, isolated target dir)")
     subprocess.run(
         [
-            "cargo", "+nightly", "build", "--release",
+            "cargo", "build", "--locked", "--release",
             "--target", "x86_64-unknown-uefi",
             "--features", "fault-test-hooks",
             "--target-dir", BUILD_TARGET_DIR,
@@ -316,8 +316,10 @@ def extract_guard_ranges(log: str) -> list:
 
 
 def main():
-    shutil.rmtree(OUT_DIR, ignore_errors=True)
-    os.makedirs(OUT_DIR, exist_ok=True)
+    global OUT_DIR, BUILD_TARGET_DIR, ESP_DIR
+    OUT_DIR = acceptance_test.new_run_directory(OUT_DIR)
+    BUILD_TARGET_DIR = os.path.join(OUT_DIR, "target")
+    ESP_DIR = os.path.join(OUT_DIR, "esp")
 
     build_fault_test_binary()
 

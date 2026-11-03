@@ -21,6 +21,10 @@ if [[ -n "${WISP_INSTALL_DISK:-}" && -z "${WISP_ISO:-}" ]]; then
     printf 'error: WISP_INSTALL_DISK requires WISP_ISO\n' >&2
     exit 2
 fi
+case "${WISP_SAVE_TRANSPORT:-ahci}" in
+    ahci|nvme|usb) ;;
+    *) printf 'error: WISP_SAVE_TRANSPORT must be ahci, nvme or usb\n' >&2; exit 2 ;;
+esac
 if [[ -n "${WISP_ISO:-}" && ! -f "$WISP_ISO" ]]; then
     printf 'error: live ISO missing: %s\n' "$WISP_ISO" >&2
     exit 1
@@ -112,6 +116,21 @@ elif [[ -n "${WISP_BOOT_DISK:-}" ]]; then
     disk_args=(-drive "id=system,if=none,format=raw,file=${WISP_BOOT_DISK//,/,,}"
                -device ahci,id=ahci0 -device ide-hd,drive=system,bus=ahci0.0)
 fi
+
+# Exercise native storage drivers with ordinary image files. The same
+# selected image is used for installation, standalone boot or save data.
+disk_image="$SAVE_IMG"
+if [[ -n "${WISP_BOOT_DISK:-}" ]]; then disk_image="$WISP_BOOT_DISK"; fi
+case "${WISP_SAVE_TRANSPORT:-ahci}" in
+    nvme)
+        disk_args=(-drive "id=native,if=none,format=raw,file=${disk_image//,/,,}"
+                   -device nvme,drive=native,serial=WISP-QEMU-NVME)
+        ;;
+    usb)
+        disk_args=(-drive "id=native,if=none,format=raw,file=${disk_image//,/,,}"
+                   -device usb-storage,drive=native,bus=xhci.0)
+        ;;
+esac
 
 # The ESP is mounted through QEMU's vvfat driver READ-ONLY (`fat:esp`, not
 # `fat:rw:esp`). This was not the original choice -- read-write was, so

@@ -28,6 +28,9 @@ __pycache__/
 /tests/out_fault/
 /tests/out_ahci/
 /tests/out_installer/
+/tests/out_ide/
+/tests/out_nvme/
+/tests/out_usb_storage/
 
 # Release archives, live ISOs and checksums from the release/build scripts.
 /dist/

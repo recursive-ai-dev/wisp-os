@@ -31,12 +31,10 @@
 //!   is noticed within 10 ms, which is below the threshold anyone can
 //!   perceive while typing, and the poll itself is a handful of MMIO
 //!   reads on a ring that is almost always empty.
-//! - **One device, one interface, one endpoint.** The first port
-//!   reporting a connected device whose descriptors identify a HID
-//!   boot-protocol keyboard is brought up and used; anything else
-//!   (a mouse, a hub, a mass-storage device) is enumerated far enough to
-//!   identify it, logged, and left alone. This kernel has no USB stack
-//!   ambitions beyond "read the keyboard."
+//! - One HID boot keyboard and up to four bulk-only SCSI storage devices
+//!   on root ports. Storage uses LUN0, synchronous bounded transfers and
+//!   explicit SCSI cache flushes. Other classes and USB Attached SCSI
+//!   interfaces are left alone.
 //! - **No hubs.** A device behind an external hub is not reachable. Root
 //!   ports only.
 //! - **No USB3 streams, no LTM, no bandwidth negotiation.** None of it
@@ -58,10 +56,13 @@
 //! `paging.rs`), so a frame's physical address is directly usable as a
 //! pointer here with no translation at all.
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::clock::{self, poll_until};
+use crate::usb_bot::{self, interface as find_mass_storage_interface};
+use crate::usb_storage::DiskInfo as StorageInfo;
 use crate::{debugcon, paging, pci, pmm};
 
 /// PCI classification for an xHCI host controller: class 0x0C (serial
@@ -263,7 +264,6 @@ unsafe fn write64(addr: u64, value: u64) {
     }
 }
 
-
 /// A producer ring (command ring, or an endpoint's transfer ring): a
 /// page of TRBs with a Link TRB in the last slot pointing back to the
 /// start, plus this driver's enqueue pointer and cycle state.
@@ -288,7 +288,11 @@ struct ProducerRing {
 impl ProducerRing {
     fn new() -> Result<Self, &'static str> {
         let phys = alloc_zeroed_frame()?;
-        let ring = ProducerRing { phys, enqueue: 0, cycle: 1 };
+        let ring = ProducerRing {
+            phys,
+            enqueue: 0,
+            cycle: 1,
+        };
         // The last slot is a Link TRB back to the ring's own start, with
         // Toggle Cycle set so the controller flips its consumer cycle
         // state when it follows the link -- that toggle is what keeps
@@ -353,6 +357,7 @@ impl ProducerRing {
 }
 
 /// One event read off the event ring.
+#[derive(Clone, Copy)]
 struct Event {
     trb_type: u32,
     completion_code: u32,
@@ -409,6 +414,8 @@ pub struct Xhci {
     owned_frames: Vec<u64>,
     /// The connected HID boot keyboard, once enumerated.
     keyboard: Option<Keyboard>,
+    storage: Vec<MassStorage>,
+    deferred_events: Vec<Event>,
 }
 
 /// Everything needed to keep pulling reports from one HID boot-protocol
@@ -441,6 +448,46 @@ struct Keyboard {
 }
 
 impl Xhci {
+    unsafe fn legacy_handoff(&self) -> Result<(), &'static str> {
+        // xHCI 1.2 section 7.1: acquire OS ownership before resetting a
+        // controller still managed by firmware's SMI USB legacy service.
+        let mut offset = u64::from(self.cap_read32(CAP_HCCPARAMS1) >> 16) * 4;
+        for _ in 0..64 {
+            if offset == 0 {
+                return Ok(());
+            }
+            if offset + 8 > MMIO_MAP_SIZE {
+                return Err("xhci: extended capability outside mapped registers");
+            }
+            let address = self.mmio + offset;
+            let cap = unsafe { read32(address) };
+            if cap & 0xff == 1 {
+                unsafe {
+                    write32(address, cap | (1 << 24));
+                }
+                if !poll_until(
+                    clock::deadline_after_ticks(500),
+                    || unsafe { read32(address) } & (1 << 16) == 0,
+                ) {
+                    return Err("xhci: firmware did not release USB controller ownership");
+                }
+                // Disable legacy SMI enables; status bits are write-one-to-clear.
+                unsafe {
+                    write32(address + 4, read32(address + 4) & 0xffff_0000);
+                }
+                return Ok(());
+            }
+            let next = u64::from((cap >> 8) & 0xff) * 4;
+            if next == 0 {
+                return Ok(());
+            }
+            offset = offset
+                .checked_add(next)
+                .ok_or("xhci: invalid extended capability list")?;
+        }
+        Err("xhci: extended capability list is too long")
+    }
+
     fn cap_read8(&self, offset: usize) -> u8 {
         // SAFETY: `self.mmio` is mapped for `MMIO_MAP_SIZE` bytes and
         // every capability offset is within the first 0x20 of it.
@@ -491,9 +538,11 @@ impl Xhci {
 /// ordering requirement that bit this project once already in `ahci.rs`;
 /// see `CHANGES.md`), and at most once.
 pub unsafe fn init() -> Result<Xhci, &'static str> {
-    let devices = pci::enumerate_bus0();
+    let devices = pci::enumerate_devices();
     let Some(controller) = devices.iter().copied().find(|d| {
-        d.class == PCI_CLASS_SERIAL_BUS && d.subclass == PCI_SUBCLASS_USB && d.prog_if == PCI_PROGIF_XHCI
+        d.class == PCI_CLASS_SERIAL_BUS
+            && d.subclass == PCI_SUBCLASS_USB
+            && d.prog_if == PCI_PROGIF_XHCI
     }) else {
         return Err("no xHCI controller found on PCI bus 0");
     };
@@ -508,29 +557,10 @@ pub unsafe fn init() -> Result<Xhci, &'static str> {
     ));
 
     pci::enable_bus_master_and_memory_space(controller.address);
-
-    // xHCI's MMIO window is BAR0, and unlike AHCI's ABAR it is
-    // architecturally allowed to be a 64-bit BAR -- which on a real
-    // controller it invariably is. A 64-bit memory BAR is encoded as
-    // bits 2:1 == 0b10 in the low BAR, with the upper 32 bits of the
-    // address living in the *next* BAR slot; reading only BAR0 and
-    // masking would silently truncate a window mapped above 4 GiB to a
-    // wrong low address.
-    let bar0 = pci::read_bar(controller.address, 0);
-    if bar0 & 0x1 != 0 {
-        return Err("xhci: BAR0 is an I/O-space BAR -- not a conformant xHCI controller");
-    }
-    let mmio_phys = match (bar0 >> 1) & 0x3 {
-        0b00 => u64::from(bar0 & 0xFFFF_FFF0),
-        0b10 => {
-            let bar1 = pci::read_bar(controller.address, 1);
-            u64::from(bar0 & 0xFFFF_FFF0) | (u64::from(bar1) << 32)
-        }
-        _ => return Err("xhci: BAR0 reports a reserved memory BAR type"),
-    };
-    if mmio_phys == 0 {
-        return Err("xhci: BAR0 reads back as 0 -- controller not assigned an address by firmware");
-    }
+    // Firmware may have enabled MSI-X. A polled driver must mask that
+    // delivery before resetting rings or inheriting firmware vectors.
+    pci::disable_interrupts(controller.address)?;
+    let mmio_phys = pci::memory_bar(controller.address, 0)?;
     if mmio_phys % paging::PAGE_SIZE != 0 {
         return Err("xhci: BAR0 is not page-aligned");
     }
@@ -556,6 +586,8 @@ pub unsafe fn init() -> Result<Xhci, &'static str> {
         dcbaa_phys: 0,
         owned_frames: Vec::new(),
         keyboard: None,
+        storage: Vec::new(),
+        deferred_events: Vec::new(),
     };
     hc.owned_frames.push(hc.command_ring.phys);
 
@@ -580,7 +612,9 @@ pub unsafe fn init() -> Result<Xhci, &'static str> {
     // than by computing an operational base of `mmio + 0` and writing
     // the reset bit into the capability registers.
     if caplength == 0 || hciversion == 0xFFFF {
-        return Err("xhci: capability registers read back as nothing -- the MMIO window is not responding");
+        return Err(
+            "xhci: capability registers read back as nothing -- the MMIO window is not responding",
+        );
     }
 
     hc.op = mmio_phys + u64::from(caplength);
@@ -602,6 +636,7 @@ pub unsafe fn init() -> Result<Xhci, &'static str> {
         hc.context_size,
     ));
 
+    unsafe { hc.legacy_handoff()? };
     unsafe { hc.reset_and_start(max_slots, scratchpads)? };
     unsafe { hc.find_keyboard(max_ports)? };
     Ok(hc)
@@ -621,7 +656,11 @@ impl Xhci {
     ///
     /// # Safety
     /// Register access on a mapped, live controller; call once.
-    unsafe fn reset_and_start(&mut self, max_slots: u8, scratchpads: u32) -> Result<(), &'static str> {
+    unsafe fn reset_and_start(
+        &mut self,
+        max_slots: u8,
+        scratchpads: u32,
+    ) -> Result<(), &'static str> {
         // Wait for the controller to finish whatever it is already doing
         // before touching a single operational register: every write
         // while CNR is set is silently discarded (xHCI 1.2, 5.4.2), so
@@ -666,7 +705,9 @@ impl Xhci {
             self.owned_frames.push(array);
             let max_in_page = (paging::PAGE_SIZE / 8) as u32;
             if scratchpads > max_in_page {
-                return Err("xhci: controller requests more scratchpad buffers than one page can index");
+                return Err(
+                    "xhci: controller requests more scratchpad buffers than one page can index",
+                );
             }
             for i in 0..scratchpads {
                 let buf = alloc_zeroed_frame()?;
@@ -805,8 +846,25 @@ impl Xhci {
     /// middle of whatever else is happening, and a driver that treated
     /// an unexpected event type as a failure would break the moment
     /// someone unplugged something at the wrong moment.
-    fn wait_for_event(&mut self, wanted_type: u32) -> Result<Event, &'static str> {
-        let deadline = clock::deadline_after_ticks(TIMEOUT_TICKS);
+    fn wait_for_event(
+        &mut self,
+        wanted_type: u32,
+        pointer: u64,
+        slot: u8,
+        endpoint: u8,
+    ) -> Result<Event, &'static str> {
+        self.wait_for_event_timeout(wanted_type, pointer, slot, endpoint, TIMEOUT_TICKS)
+    }
+
+    fn wait_for_event_timeout(
+        &mut self,
+        wanted_type: u32,
+        pointer: u64,
+        slot: u8,
+        endpoint: u8,
+        ticks: u64,
+    ) -> Result<Event, &'static str> {
+        let deadline = clock::deadline_after_ticks(ticks);
         let mut found: Option<Event> = None;
         // Drains every event currently on the ring per poll, so a burst of
         // unrelated events ahead of the wanted one is consumed in one pass
@@ -815,9 +873,23 @@ impl Xhci {
         // every other wait in this driver.
         let arrived = poll_until(deadline, || {
             while let Some(event) = self.next_event() {
-                if event.trb_type == wanted_type {
+                if event.trb_type == wanted_type
+                    && (wanted_type == TRB_TYPE_COMMAND_COMPLETION && event.pointer == pointer
+                        || wanted_type == TRB_TYPE_TRANSFER_EVENT
+                            && event.slot_id == slot
+                            && event.endpoint_id == endpoint)
+                {
                     found = Some(event);
                     return true;
+                }
+                if event.trb_type == TRB_TYPE_TRANSFER_EVENT
+                    && self.keyboard.as_ref().is_some_and(|kbd| {
+                        event.slot_id == kbd.slot_id
+                            && u32::from(event.endpoint_id) == kbd.endpoint_dci
+                    })
+                {
+                    self.deferred_events.push(event);
+                    continue;
                 }
                 if event.trb_type == TRB_TYPE_PORT_STATUS_CHANGE {
                     continue;
@@ -845,14 +917,22 @@ impl Xhci {
     ///
     /// # Safety
     /// Controller must be running.
-    unsafe fn run_command(&mut self, d0: u32, d1: u32, d2: u32, d3: u32) -> Result<Event, &'static str> {
+    unsafe fn run_command(
+        &mut self,
+        d0: u32,
+        d1: u32,
+        d2: u32,
+        d3: u32,
+    ) -> Result<Event, &'static str> {
         let trb_phys = unsafe { self.command_ring.push(d0, d1, d2, d3) };
         compiler_fence(Ordering::SeqCst);
         self.ring_doorbell(0, 0);
 
-        let event = self.wait_for_event(TRB_TYPE_COMMAND_COMPLETION)?;
+        let event = self.wait_for_event(TRB_TYPE_COMMAND_COMPLETION, trb_phys, 0, 0)?;
         if event.pointer != trb_phys {
-            return Err("xhci: command completion event names a different command TRB than the one issued");
+            return Err(
+                "xhci: command completion event names a different command TRB than the one issued",
+            );
         }
         if event.completion_code != COMPLETION_SUCCESS {
             let _ = debugcon::write_fmt(format_args!(
@@ -908,7 +988,9 @@ impl Xhci {
                 unsafe { write32(reg, (portsc & !PORTSC_RW1C_MASK) | PORTSC_PP) };
                 let deadline = clock::deadline_after_ticks(TIMEOUT_TICKS);
                 if !poll_until(deadline, || unsafe { read32(reg) } & PORTSC_PP != 0) {
-                    let _ = debugcon::write_fmt(format_args!("[xhci] port {port}: would not power on, skipping\n"));
+                    let _ = debugcon::write_fmt(format_args!(
+                        "[xhci] port {port}: would not power on, skipping\n"
+                    ));
                     continue;
                 }
             }
@@ -925,13 +1007,14 @@ impl Xhci {
             // resets what needs it.
             if portsc & PORTSC_PED == 0 {
                 if let Err(msg) = unsafe { self.reset_port(port) } {
-                    let _ = debugcon::write_fmt(format_args!("[xhci] port {port}: {msg}, skipping\n"));
+                    let _ =
+                        debugcon::write_fmt(format_args!("[xhci] port {port}: {msg}, skipping\n"));
                     continue;
                 }
             }
 
             match unsafe { self.enumerate_device(port, speed) } {
-                Ok(true) => return Ok(()),
+                Ok(true) => {}
                 Ok(false) => {
                     let _ = debugcon::write_fmt(format_args!(
                         "[xhci] port {port}: device is not a HID boot keyboard, leaving it alone\n",
@@ -942,11 +1025,13 @@ impl Xhci {
                     // on the others -- a hub or an unpowered dock on one
                     // port must not stop the keyboard on the next one
                     // from being found.
-                    let _ = debugcon::write_fmt(format_args!("[xhci] port {port}: enumeration failed: {msg}\n"));
+                    let _ = debugcon::write_fmt(format_args!(
+                        "[xhci] port {port}: enumeration failed: {msg}\n"
+                    ));
                 }
             }
         }
-        Err("no USB HID boot keyboard found on any root port")
+        Ok(())
     }
 }
 
@@ -1068,6 +1153,7 @@ impl Xhci {
         // Setup Stage: the 8-byte setup packet travels *inside* the TRB
         // (the Immediate Data bit), which is why dwords 0 and 1 are the
         // packet itself rather than a pointer to it.
+        let mut data_trb = 0;
         unsafe {
             ring.push(
                 u32::from(setup.request_type)
@@ -1078,11 +1164,11 @@ impl Xhci {
                 (TRB_TYPE_SETUP_STAGE << 10) | TRB_IDT | (trt << 16),
             );
             if has_data {
-                ring.push(
+                data_trb = ring.push(
                     buffer_phys as u32,
                     (buffer_phys >> 32) as u32,
                     u32::from(setup.length),
-                    (TRB_TYPE_DATA_STAGE << 10) | (u32::from(dir_in) << 16),
+                    (TRB_TYPE_DATA_STAGE << 10) | (u32::from(dir_in) << 16) | (1 << 2),
                 );
             }
         }
@@ -1106,9 +1192,13 @@ impl Xhci {
         // Doorbell target 1 is Device Context Index 1 -- endpoint 0.
         self.ring_doorbell(slot, 1);
 
-        let event = self.wait_for_event(TRB_TYPE_TRANSFER_EVENT)?;
-        if event.pointer != status_trb {
-            return Err("xhci: transfer event names a different TRB than the control transfer issued");
+        let mut event = self.wait_for_event(TRB_TYPE_TRANSFER_EVENT, status_trb, slot, 1)?;
+        let mut transferred = u32::from(setup.length);
+        if event.completion_code == COMPLETION_SHORT_PACKET && event.pointer == data_trb {
+            transferred = transferred
+                .checked_sub(event.transfer_length)
+                .ok_or("xhci: invalid control transfer residual")?;
+            event = self.wait_for_event(TRB_TYPE_TRANSFER_EVENT, status_trb, slot, 1)?;
         }
         if event.completion_code != COMPLETION_SUCCESS {
             let _ = debugcon::write_fmt(format_args!(
@@ -1117,14 +1207,20 @@ impl Xhci {
             ));
             return Err("xhci: device rejected a control transfer");
         }
+        if event.pointer != status_trb {
+            return Err(
+                "xhci: transfer event names a different TRB than the control transfer issued",
+            );
+        }
         // A Transfer Event reports the *residual* untransferred bytes,
         // not the transferred count -- reading it as the latter is a
         // classic xHCI mistake that produces plausible-looking but
         // wrong short-read handling.
-        Ok(u32::from(setup.length).saturating_sub(event.transfer_length))
+        transferred
+            .checked_sub(event.transfer_length)
+            .ok_or("xhci: invalid control transfer residual")
     }
 }
-
 
 /// Command TRB type 13: Evaluate Context -- used here only to correct
 /// endpoint 0's Max Packet Size once the device has reported its real
@@ -1272,17 +1368,24 @@ impl Xhci {
             index: 0,
             length: 8,
         };
-        unsafe { self.control_transfer(slot, &setup, data_buf)? };
+        if unsafe { self.control_transfer(slot, &setup, data_buf)? } != 8 {
+            return Err("xhci: truncated USB device descriptor");
+        }
         // SAFETY: the controller DMA'd 8 bytes into `data_buf`, an owned
         // identity-mapped frame.
         let reported_mps0 = unsafe { core::ptr::read_volatile((data_buf as *const u8).add(7)) };
         // For Super speed the field is a power-of-two exponent, not a
         // byte count (USB 3.2, 9.6.1): 9 means 512.
-        let reported_mps0 = if speed == SPEED_SUPER {
-            1u16 << reported_mps0
+        let reported_mps0 = if speed == SPEED_SUPER && reported_mps0 == 9 {
+            512
+        } else if speed == SPEED_SUPER {
+            return Err("xhci: invalid SuperSpeed endpoint zero packet size");
         } else {
             u16::from(reported_mps0)
         };
+        if !matches!(reported_mps0, 8 | 16 | 32 | 64 | 512) {
+            return Err("xhci: invalid endpoint zero packet size");
+        }
 
         if reported_mps0 != 0 && reported_mps0 != max_packet_size {
             let _ = debugcon::write_fmt(format_args!(
@@ -1323,7 +1426,9 @@ impl Xhci {
             index: 0,
             length: 9,
         };
-        unsafe { self.control_transfer(slot, &setup, data_buf)? };
+        if unsafe { self.control_transfer(slot, &setup, data_buf)? } != 9 {
+            return Err("xhci: truncated USB configuration header");
+        }
         // SAFETY: nine bytes were DMA'd into `data_buf`.
         let total_length = unsafe {
             let p = data_buf as *const u8;
@@ -1348,7 +1453,16 @@ impl Xhci {
         // SAFETY: `got` bytes (never more than `fetch_len`, itself
         // clamped to the frame) were DMA'd into `data_buf`.
         let config = unsafe { core::slice::from_raw_parts(data_buf as *const u8, got as usize) };
-        let Some(iface) = find_hid_keyboard_interface(config) else {
+        if self.storage.len() < 4 {
+            if let Some(iface) = find_mass_storage_interface(config) {
+                unsafe {
+                    self.configure_storage(slot, port, speed, input_ctx, data_buf, iface)?;
+                }
+                return Ok(true);
+            }
+        }
+        let Some(iface) = find_hid_keyboard_interface(config).filter(|_| self.keyboard.is_none())
+        else {
             return Ok(false);
         };
         let _ = debugcon::write_fmt(format_args!(
@@ -1508,7 +1622,15 @@ impl Xhci {
     /// # Safety
     /// Controller must be running.
     pub unsafe fn poll(&mut self, mut on_report: impl FnMut(&[u8; 8])) {
-        while let Some(event) = self.next_event() {
+        loop {
+            let event = if self.deferred_events.is_empty() {
+                self.next_event()
+            } else {
+                Some(self.deferred_events.remove(0))
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event.trb_type {
                 TRB_TYPE_TRANSFER_EVENT => {
                     let Some(kbd) = self.keyboard else { continue };
@@ -1578,7 +1700,8 @@ impl Xhci {
                     debugcon::write_str("[xhci] port status change (hot-plug is not handled)\n");
                 }
                 other => {
-                    let _ = debugcon::write_fmt(format_args!("[xhci] unhandled event type {other}\n"));
+                    let _ =
+                        debugcon::write_fmt(format_args!("[xhci] unhandled event type {other}\n"));
                 }
             }
         }
@@ -1620,7 +1743,11 @@ fn find_hid_keyboard_interface(config: &[u8]) -> Option<HidKeyboardInterface> {
                     && desc[6] == HID_SUBCLASS_BOOT
                     && desc[7] == HID_PROTOCOL_KEYBOARD;
                 current = Some((desc[2], u8::from(is_boot_keyboard)));
-                candidate = if is_boot_keyboard { Some(desc[2]) } else { None };
+                candidate = if is_boot_keyboard {
+                    Some(desc[2])
+                } else {
+                    None
+                };
             }
             DESC_TYPE_ENDPOINT if len >= 7 => {
                 // Only endpoints belonging to a boot-keyboard interface
@@ -1652,4 +1779,412 @@ fn find_hid_keyboard_interface(config: &[u8]) -> Option<HidKeyboardInterface> {
         offset += len;
     }
     None
+}
+
+// USB Mass Storage Bulk-Only Transport 1.0:
+// https://www.usb.org/sites/default/files/usbmassbulk_10.pdf
+// SCSI commands follow SBC/SPC: INQUIRY, TUR, REQUEST SENSE, READ CAPACITY,
+// READ/WRITE(16), SYNCHRONIZE CACHE(10). One LUN and one command at a time.
+struct MassStorage {
+    slot: u8,
+    input_dci: u8,
+    output_dci: u8,
+    input_ring: ProducerRing,
+    output_ring: ProducerRing,
+    cbw_phys: u64,
+    data_phys: u64,
+    csw_phys: u64,
+    tag: u32,
+    failed: bool,
+    info: StorageInfo,
+}
+
+impl Xhci {
+    unsafe fn configure_storage(
+        &mut self,
+        slot: u8,
+        port: u8,
+        speed: u32,
+        input_ctx: u64,
+        scratch: u64,
+        interface: usb_bot::Interface,
+    ) -> Result<(), &'static str> {
+        let setup = Setup {
+            request_type: 0,
+            request: USB_REQ_SET_CONFIGURATION,
+            value: u16::from(interface.configuration),
+            index: 0,
+            length: 0,
+        };
+        unsafe {
+            self.control_transfer(slot, &setup, 0)?;
+        }
+        let input_ring = ProducerRing::new()?;
+        let output_ring = ProducerRing::new()?;
+        self.owned_frames.push(input_ring.phys);
+        self.owned_frames.push(output_ring.phys);
+        let input_dci = (interface.input.address & 0xf) * 2 + 1;
+        let output_dci = (interface.output.address & 0xf) * 2;
+        let cs = self.context_size;
+        unsafe {
+            // Rebuild the entire input context. The Slot Context is copied
+            // from our known root-port configuration; EP0 is not changed.
+            core::ptr::write_bytes(input_ctx as *mut u8, 0, paging::PAGE_SIZE as usize);
+            ctx_write(
+                input_ctx,
+                cs,
+                0,
+                1,
+                ADD_FLAG_SLOT | (1 << input_dci) | (1 << output_dci),
+            );
+            ctx_write(
+                input_ctx,
+                cs,
+                1,
+                0,
+                (speed << 20) | (u32::from(input_dci.max(output_dci)) << 27),
+            );
+            ctx_write(input_ctx, cs, 1, 1, u32::from(port) << 16);
+            for (endpoint, ring, dci, endpoint_type) in [
+                (interface.input, input_ring, input_dci, 6u32),
+                (interface.output, output_ring, output_dci, 2u32),
+            ] {
+                let index = usize::from(dci) + 1;
+                ctx_write(
+                    input_ctx,
+                    cs,
+                    index,
+                    1,
+                    (3 << 1)
+                        | (endpoint_type << 3)
+                        | (u32::from(endpoint.max_burst) << 8)
+                        | (u32::from(endpoint.packet_size) << 16),
+                );
+                ctx_write(input_ctx, cs, index, 2, ring.phys as u32 | 1);
+                ctx_write(input_ctx, cs, index, 3, (ring.phys >> 32) as u32);
+                // Bulk endpoints have no ESIT payload and no interval.
+                ctx_write(input_ctx, cs, index, 4, 512);
+            }
+            self.run_command(
+                input_ctx as u32,
+                (input_ctx >> 32) as u32,
+                0,
+                (TRB_TYPE_CONFIGURE_ENDPOINT << 10) | (u32::from(slot) << 24),
+            )?;
+        }
+
+        // Single-LUN devices may stall Get Max LUN. Reset EP0's halted
+        // controller state and skip the retired TD before assuming LUN0.
+        let setup = Setup {
+            request_type: 0xa1,
+            request: 0xfe,
+            value: 0,
+            index: u16::from(interface.number),
+            length: 1,
+        };
+        if unsafe { self.control_transfer(slot, &setup, scratch) }.is_err() {
+            unsafe {
+                self.run_command(0, 0, 0, (14 << 10) | (1 << 16) | (u32::from(slot) << 24))?;
+                let ring = self
+                    .ep0_ring
+                    .as_ref()
+                    .ok_or("usb-storage: missing control ring")?;
+                let next = ring.phys + (ring.enqueue * 16) as u64;
+                self.run_command(
+                    next as u32 | ring.cycle,
+                    (next >> 32) as u32,
+                    0,
+                    (16 << 10) | (1 << 16) | (u32::from(slot) << 24),
+                )?;
+            }
+        }
+        let cbw_phys = alloc_zeroed_frame()?;
+        let data_phys = alloc_zeroed_frame()?;
+        let csw_phys = alloc_zeroed_frame()?;
+        self.owned_frames
+            .extend_from_slice(&[cbw_phys, data_phys, csw_phys]);
+        let mut disk = MassStorage {
+            slot,
+            input_dci,
+            output_dci,
+            input_ring,
+            output_ring,
+            cbw_phys,
+            data_phys,
+            csw_phys,
+            tag: 0,
+            failed: false,
+            info: StorageInfo {
+                total_sectors: 0,
+                block_size: 512,
+                model: String::new(),
+                serial: String::new(),
+            },
+        };
+        unsafe {
+            self.scsi_retry(&mut disk, &[0x12, 0, 0, 0, 36, 0], true, 36)?;
+            let inquiry = core::slice::from_raw_parts(data_phys as *const u8, 36);
+            if inquiry[0] & 0x1f != 0 {
+                return Err("usb-storage: LUN0 is not a direct-access disk");
+            }
+            disk.info.model = ascii_identifier(&inquiry[8..32]);
+            self.scsi_retry(&mut disk, &[0, 0, 0, 0, 0, 0], false, 0)?;
+            self.scsi_retry(&mut disk, &[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0], true, 8)?;
+            let cap = core::slice::from_raw_parts(data_phys as *const u8, 8);
+            let last32 = u32::from_be_bytes(cap[..4].try_into().unwrap());
+            let mut last_block = u64::from(last32);
+            let mut block_size = u32::from_be_bytes(cap[4..8].try_into().unwrap());
+            if last32 == u32::MAX {
+                let mut cdb = [0; 16];
+                cdb[0] = 0x9e;
+                cdb[1] = 0x10;
+                cdb[10..14].copy_from_slice(&32u32.to_be_bytes());
+                self.scsi_retry(&mut disk, &cdb, true, 32)?;
+                let cap = core::slice::from_raw_parts(data_phys as *const u8, 32);
+                last_block = u64::from_be_bytes(cap[..8].try_into().unwrap());
+                block_size = u32::from_be_bytes(cap[8..12].try_into().unwrap());
+            }
+            disk.info.total_sectors = usb_bot::capacity(last_block, block_size)?;
+            disk.info.block_size = block_size;
+        }
+        // Slot/port is a location, not a fabricated permanent serial number.
+        disk.info.serial = alloc::format!("USB port {port} LUN0");
+        let _ = debugcon::write_fmt(format_args!(
+            "[usb-storage] disk {} model='{}' sectors={} logical_block_size={} slot={} port={}\n",
+            self.storage.len(),
+            disk.info.model,
+            disk.info.total_sectors,
+            disk.info.block_size,
+            slot,
+            port
+        ));
+        self.storage.push(disk);
+        Ok(())
+    }
+
+    unsafe fn bulk(
+        &mut self,
+        disk: &mut MassStorage,
+        input: bool,
+        phys: u64,
+        len: u32,
+        timeout: u64,
+    ) -> Result<u32, &'static str> {
+        if disk.failed {
+            return Err("usb-storage: disk is offline after a transport failure");
+        }
+        if len == 0 || len > paging::PAGE_SIZE as u32 {
+            return Err("usb-storage: bulk transfer size is invalid");
+        }
+        let (ring, dci) = if input {
+            (&mut disk.input_ring, disk.input_dci)
+        } else {
+            (&mut disk.output_ring, disk.output_dci)
+        };
+        let trb = unsafe {
+            ring.push(
+                phys as u32,
+                (phys >> 32) as u32,
+                len,
+                (TRB_TYPE_NORMAL << 10) | TRB_IOC | (1 << 2),
+            )
+        };
+        compiler_fence(Ordering::SeqCst);
+        self.ring_doorbell(disk.slot, u32::from(dci));
+        let result = self
+            .wait_for_event_timeout(TRB_TYPE_TRANSFER_EVENT, trb, disk.slot, dci, timeout)
+            .and_then(|event| {
+                if event.pointer != trb {
+                    return Err("usb-storage: bulk completion names a different transfer");
+                }
+                if !matches!(
+                    event.completion_code,
+                    COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET
+                ) {
+                    let _ = debugcon::write_fmt(format_args!(
+                        "[usb-storage] bulk completion code {}\n",
+                        event.completion_code
+                    ));
+                    return Err("usb-storage: bulk endpoint failed or stalled");
+                }
+                len.checked_sub(event.transfer_length)
+                    .ok_or("usb-storage: invalid bulk residual")
+            });
+        if result.is_err() {
+            // Do not reuse the transfer ring or DMA buffer after an ambiguous
+            // timeout. Frames are retained for the controller's whole life.
+            disk.failed = true;
+        }
+        result
+    }
+
+    unsafe fn scsi(
+        &mut self,
+        disk: &mut MassStorage,
+        cdb: &[u8],
+        input: bool,
+        len: u32,
+    ) -> Result<(), &'static str> {
+        if disk.failed {
+            return Err("usb-storage: disk is offline after a transport failure");
+        }
+        disk.tag = disk.tag.wrapping_add(1);
+        let timeout = if cdb.first() == Some(&0x35) {
+            3000
+        } else {
+            500
+        };
+        let cbw = usb_bot::cbw(disk.tag, input, len, cdb)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(cbw.as_ptr(), disk.cbw_phys as *mut u8, 31);
+        }
+        if unsafe { self.bulk(disk, false, disk.cbw_phys, 31, timeout)? } != 31 {
+            disk.failed = true;
+            return Err("usb-storage: incomplete command wrapper");
+        }
+        let transferred = if len != 0 {
+            unsafe { self.bulk(disk, input, disk.data_phys, len, timeout)? }
+        } else {
+            0
+        };
+        let got = unsafe { self.bulk(disk, true, disk.csw_phys, 13, timeout)? };
+        let status =
+            unsafe { core::slice::from_raw_parts(disk.csw_phys as *const u8, got as usize) };
+        let result = usb_bot::csw(status, disk.tag, len, transferred);
+        if result.is_err_and(|error| error != usb_bot::COMMAND_FAILED) {
+            disk.failed = true;
+        }
+        result
+    }
+
+    unsafe fn scsi_retry(
+        &mut self,
+        disk: &mut MassStorage,
+        cdb: &[u8],
+        input: bool,
+        len: u32,
+    ) -> Result<(), &'static str> {
+        for _ in 0..3 {
+            match unsafe { self.scsi(disk, cdb, input, len) } {
+                Ok(()) => return Ok(()),
+                Err(usb_bot::COMMAND_FAILED) => {
+                    // Clear UNIT ATTENTION after reset, or discover a not-ready
+                    // medium, before retrying. Transport failures are never retried.
+                    unsafe {
+                        self.scsi(disk, &[3, 0, 0, 0, 18, 0], true, 18)?;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("usb-storage: SCSI disk did not become ready")
+    }
+
+    pub(crate) fn storage_infos(&self) -> Vec<StorageInfo> {
+        self.storage.iter().map(|disk| disk.info.clone()).collect()
+    }
+
+    pub(crate) fn storage_failed(&self, index: usize) -> bool {
+        self.storage.get(index).is_none_or(|disk| disk.failed)
+    }
+
+    unsafe fn storage_io(
+        &mut self,
+        index: usize,
+        lba: u64,
+        output: Option<&[u8; 512]>,
+        mut input: Option<&mut [u8; 512]>,
+    ) -> Result<(), &'static str> {
+        let info = self
+            .storage
+            .get(index)
+            .ok_or("usb-storage: invalid disk index")?;
+        if info.failed {
+            return Err("usb-storage: disk is offline after a transport failure");
+        }
+        if lba >= info.info.total_sectors {
+            return Err("usb-storage: sector is outside the disk");
+        }
+        let mut disk = self.storage.remove(index);
+        let result = (|| {
+            let sectors_per_block = u64::from(disk.info.block_size / 512);
+            let block = lba / sectors_per_block;
+            let offset = (lba % sectors_per_block) as usize * 512;
+            if output.is_none() || disk.info.block_size != 512 {
+                let (cdb, command_len) = usb_bot::rw_cdb(block, false);
+                let len = disk.info.block_size;
+                unsafe {
+                    self.scsi(&mut disk, &cdb[..command_len], true, len)?;
+                }
+            }
+            if let Some(data) = output {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        (disk.data_phys as *mut u8).add(offset),
+                        512,
+                    );
+                }
+                let (cdb, command_len) = usb_bot::rw_cdb(block, true);
+                let len = disk.info.block_size;
+                unsafe {
+                    self.scsi(&mut disk, &cdb[..command_len], false, len)?;
+                }
+            } else if let Some(out) = input.as_mut() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (disk.data_phys as *const u8).add(offset),
+                        out.as_mut_ptr(),
+                        512,
+                    );
+                }
+            }
+            Ok(())
+        })();
+        self.storage.insert(index, disk);
+        result
+    }
+
+    pub(crate) unsafe fn storage_read(
+        &mut self,
+        index: usize,
+        lba: u64,
+        out: &mut [u8; 512],
+    ) -> Result<(), &'static str> {
+        unsafe { self.storage_io(index, lba, None, Some(out)) }
+    }
+
+    pub(crate) unsafe fn storage_write(
+        &mut self,
+        index: usize,
+        lba: u64,
+        data: &[u8; 512],
+    ) -> Result<(), &'static str> {
+        unsafe { self.storage_io(index, lba, Some(data), None) }
+    }
+
+    pub(crate) unsafe fn storage_flush(&mut self, index: usize) -> Result<(), &'static str> {
+        if index >= self.storage.len() {
+            return Err("usb-storage: invalid disk index");
+        }
+        let mut disk = self.storage.remove(index);
+        let result = unsafe { self.scsi(&mut disk, &[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0], false, 0) };
+        self.storage.insert(index, disk);
+        result
+    }
+}
+
+fn ascii_identifier(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&byte| {
+            if (0x20..=0x7e).contains(&byte) {
+                byte as char
+            } else {
+                '?'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }

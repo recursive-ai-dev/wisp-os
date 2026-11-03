@@ -89,8 +89,8 @@ impl Console {
     ///
     /// # Safety
     /// `fb` must point to a mapped, writable region of at least `fb_len`
-    /// bytes, valid for the entire remaining lifetime of the program (true
-    /// here because Boot Services is never exited). `width`, `height`, and
+    /// bytes, valid while this console is in use, including after Boot
+    /// Services exits. `width`, `height`, and
     /// `stride` must match the values reported by the active GOP mode.
     ///
     /// # Errors
@@ -119,6 +119,19 @@ impl Console {
                 );
             }
         };
+
+        // Firmware supplies both geometry and a separate mapping length.
+        // Validate their relationship before clear() or any pixel write.
+        let required = stride.checked_mul(height).and_then(|n| n.checked_mul(4))
+            .ok_or("framebuffer geometry overflows its address space")?;
+        if fb.is_null() || !(fb as usize).is_multiple_of(core::mem::align_of::<u32>()) {
+            return Err("framebuffer pointer must be non-null and pixel-aligned");
+        }
+        if stride < width || required > fb_len || required > isize::MAX as usize
+            || (fb as usize).checked_add(required).is_none()
+        {
+            return Err("framebuffer geometry exceeds its mapped buffer");
+        }
 
         let cols = width / GLYPH_WIDTH;
         let rows = height / GLYPH_HEIGHT;
@@ -381,15 +394,10 @@ impl Console {
         }
         let value = self.encode(color);
 
-        // All the arithmetic below is `i64`, including the far edge
-        // (`x + w`, `y + h`), so a huge `w`/`h` added to an extreme `x`/`y`
-        // saturates at `i64::MAX` instead of silently wrapping past it
-        // and back around to a small (very wrong) coordinate -- a script
-        // can set `x`/`y`/`w`/`h` to whatever it likes, independently, so
-        // this must hold even for combinations no legitimate script would
-        // ever construct on purpose.
-        let x1 = x.saturating_add(w as i64);
-        let y1 = y.saturating_add(h as i64);
+        // A usize extent can exceed i64::MAX. Widen before adding so
+        // clipping is exact even when the rectangle spans the signed range.
+        let x1 = x as i128 + w as i128;
+        let y1 = y as i128 + h as i128;
 
         // Clip to `[0, width) x [0, height)`. `.max(0)` folds a negative
         // edge up to 0 before the `as usize` cast (never cast a negative
@@ -399,8 +407,8 @@ impl Console {
         // `plot_pixel`'s doc comment above.
         let clip_x0 = x.max(0) as usize;
         let clip_y0 = y.max(0) as usize;
-        let clip_x1 = (x1.max(0) as usize).min(self.width);
-        let clip_y1 = (y1.max(0) as usize).min(self.height);
+        let clip_x1 = x1.clamp(0, self.width as i128) as usize;
+        let clip_y1 = y1.clamp(0, self.height as i128) as usize;
         if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
             return; // entirely off-screen in at least one axis
         }
@@ -450,20 +458,11 @@ impl Console {
     /// be walked for an unbounded number of steps regardless of what any
     /// future caller passes it.
     pub fn draw_line(&mut self, x1: i64, y1: i64, x2: i64, y2: i64, color: Color) {
-        // `.wrapping_sub()`, not `-`: with overflow-checks off (this
-        // project's release default -- see this section's module-level
-        // note above), plain `-` would silently wrap on an adversarial
-        // input anyway, but `wrapping_sub` says so explicitly rather than
-        // relying on that default. `.unsigned_abs()`, not `.abs()`: unlike
-        // `.abs()`, which cannot represent `-i64::MIN` and either panics
-        // (debug) or wraps back to a *negative* `i64::MIN` (release) --
-        // silently defeating a magnitude check like the one right below
-        // -- `.unsigned_abs()` returns a `u64` and is correct for every
-        // possible `i64` input, including `i64::MIN`, with no panic and no
-        // wraparound-to-negative ever.
-        let raw_dx = x2.wrapping_sub(x1);
-        let raw_dy = y2.wrapping_sub(y1);
-        if raw_dx.unsigned_abs().max(raw_dy.unsigned_abs()) > Self::MAX_LINE_STEPS {
+        // Measure the true distance: signed wrapping subtraction can make
+        // opposite extremes appear adjacent and defeat the work bound.
+        let raw_dx = x2.abs_diff(x1);
+        let raw_dy = y2.abs_diff(y1);
+        if raw_dx.max(raw_dy) > Self::MAX_LINE_STEPS {
             return;
         }
 
@@ -476,9 +475,9 @@ impl Console {
         // slope-dependent branch. Verified by hand against horizontal,
         // vertical, diagonal, shallow, steep, and single-point (`x1==x2`
         // and `y1==y2`) cases before landing on this exact form.
-        let dx = raw_dx.unsigned_abs() as i64;
+        let dx = raw_dx as i64;
         let sx: i64 = if x1 < x2 { 1 } else { -1 };
-        let dy = -(raw_dy.unsigned_abs() as i64);
+        let dy = -(raw_dy as i64);
         let sy: i64 = if y1 < y2 { 1 } else { -1 };
         let mut error = dx + dy;
         let (mut px, mut py) = (x1, y1);

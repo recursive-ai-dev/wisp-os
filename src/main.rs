@@ -2,7 +2,7 @@
 //! only long enough to snapshot its filesystem and exit Boot Services, then
 //! running on its own hand-written GDT/IDT, W^X page tables, heap and frame
 //! allocators, ACPI/APIC interrupt routing (with an 8259/PIT fallback),
-//! PS/2 and USB keyboard drivers, and AHCI storage for the rest of its
+//! PS/2 and USB keyboard drivers, and AHCI/NVMe/USB storage for the rest of its
 //! life. No Linux code, no borrowed drivers, no borrowed boot protocol, no
 //! network stack -- every piece past `exit_boot_services` is our own
 //! `no_std` Rust, in the same spirit as the WISP language it runs.
@@ -26,10 +26,12 @@ extern crate alloc;
 
 mod acpi;
 mod ahci;
+mod ahci_format;
 mod allocator;
 mod clock;
 mod debugcon;
 mod disk_layout;
+mod editor;
 mod fs;
 mod font;
 mod gdt;
@@ -37,20 +39,28 @@ mod gfx;
 mod idt;
 mod ioapic;
 mod installer;
+mod ide;
 mod keyboard;
 mod lapic;
 mod libc_shims;
 mod line_editor;
+mod nvme;
+mod nvme_format;
 mod panic;
 mod paging;
 mod pci;
 mod pic;
 mod pit;
 mod pmm;
+mod projects;
 mod save_format;
 mod shell;
+mod storage;
+mod storage_policy;
 mod sync;
 mod usb_hid;
+mod usb_bot;
+mod usb_storage;
 mod wisp;
 mod xhci;
 
@@ -486,50 +496,18 @@ extern "C" fn continue_boot_on_new_stack(ctx: *mut BootContinuation) -> ! {
         bring_up_apic(&mut console, info);
     }
 
-    // Phase 2, Part B, Build Order Step 2: enumerate every PCI function on
-    // bus 0 and log what was found -- no AHCI driver code yet, just proof
-    // the config-space primitives and enumeration walk actually work
-    // against real (emulated) hardware. Pure port I/O, needs neither
-    // interrupts nor any particular page mapping, so its exact placement
-    // in the boot sequence relative to `sti` is not load-bearing on its
-    // own -- it runs after `sti` here only because it feeds straight into
-    // `ahci::init()`, which is.
-    let pci_devices = pci::enumerate_bus0();
+    // Discover firmware-assigned PCI buses and Intel VMD domains once;
+    // every native driver shares this read-only inventory.
+    let pci_devices = pci::enumerate_devices();
     pci::dump_devices(&pci_devices);
 
-    // Phase 2, Part B, Build Order Steps 3-8: find the AHCI controller,
-    // bring it up, and mount an existing save store on it -- read-only;
-    // boot never formats or otherwise writes to the disk. Every failure
-    // along this chain ("no AHCI controller present," "no usable disk on
-    // any port," "disk doesn't support what this driver needs," "disk is
-    // not formatted for WISP") is a first-class, expected outcome, not a
-    // reason to stop booting -- `bring_up_save_disk` logs whichever one
-    // happens, and `save`/`load` report "unavailable."
-    //
-    // On success the returned `Hba` is handed to the shell rather than
-    // dropped: unlike `identify`/the boot-time probe (every command
-    // issued through it up to this point has already completed before
-    // `bring_up_save_disk` returns), `save`/`load` issue commands *later*,
-    // from inside the shell's command loop -- something must keep owning
-    // the live command engine for that to be safe, and the shell is it.
-    let save_disk = bring_up_save_disk(&mut console);
-
-    // Phase 3, Build Order Steps 5-6: find a USB keyboard. Deliberately
-    // last in the boot sequence, after everything else is already
-    // working: a machine with no xHCI controller, no USB device, or a
-    // USB device that isn't a keyboard hits one of `xhci::init`'s
-    // first-class "not available" paths every single boot, and none of
-    // them may disturb anything above.
-    //
-    // On a machine that still has a PS/2 controller (every one QEMU
-    // emulates by default, and most desktops) this is purely additive:
-    // both keyboards feed the same queue and either one works. On a
-    // machine that does not -- the actual reason this phase exists --
-    // it is the only way a keystroke reaches this kernel at all.
+    // Keep xHCI alive even without a keyboard: it also owns mass-storage
+    // rings. Install it before discovering the available save disks.
     match unsafe { xhci::init() } {
         Ok(hc) => {
-            if hc.has_keyboard() {
-                usb_hid::install(hc);
+            let has_keyboard = hc.has_keyboard();
+            usb_hid::install(hc);
+            if has_keyboard {
                 console.write_str("USB HID keyboard ready.\n");
             } else {
                 console.write_str("USB: controller up, but no HID boot keyboard attached.\n");
@@ -546,7 +524,8 @@ extern "C" fn continue_boot_on_new_stack(ctx: *mut BootContinuation) -> ! {
         }
     }
 
-    let mut sh = shell::Shell::new(apps, save_disk);
+    let (disks, selected) = bring_up_save_disks(&mut console);
+    let mut sh = shell::Shell::new(apps, disks, selected);
     sh.run(&mut console);
 }
 
@@ -702,114 +681,133 @@ fn report_apic_fallback(console: &mut Console, msg: &'static str) {
     debugcon::write_str(" -- legacy 8259 remains the live interrupt controller\n");
 }
 
-/// Find the AHCI controller (if any), reset and enable it, map its ABAR,
-/// bring up the first port with a usable SATA disk attached, IDENTIFY it,
-/// and *probe* -- read-only -- whether it already carries a WISP save
-/// store. Every step's own doc comment explains what's a first-class
-/// expected failure versus a real bug; this function's whole job is
-/// turning "did every step succeed" into a single `Option`, logging
-/// exactly where the chain stopped either way.
-///
-/// This storage probe never writes to the disk. A blank or foreign disk
-/// is reported and left untouched; provisioning requires the installer
-/// or the shell's `format`, both with explicit confirmation. (Earlier versions formatted any
-/// unrecognized disk automatically and ran a write/read-back/restore
-/// self-test against its last sector -- both destroyed data that did not
-/// belong to WISP.)
-///
-/// Returns `None` if no usable disk was found -- callers must treat that
-/// as "persistent storage is unavailable this boot," never as a reason to
-/// stop booting. `Some` with an unmounted disk means a disk exists but is
-/// not (yet) formatted for WISP.
-fn bring_up_save_disk(console: &mut Console) -> Option<save_format::SaveDisk> {
-    let mut hba = match unsafe { ahci::init() } {
-        Ok(hba) => {
+/// Identify native disks and probe their stores without media writes.
+/// Preserve every candidate for the shell's explicit disk selector;
+/// automatically select only an unambiguous mounted store or format target.
+fn bring_up_save_disks(
+    console: &mut Console,
+) -> (alloc::vec::Vec<save_format::SaveDisk>, Option<usize>) {
+    use alloc::vec::Vec;
+    use storage::Disk;
+    let mut found: Vec<Disk> = Vec::new();
+    match unsafe { ahci::init() } {
+        Ok(mut hba) => {
             console.write_str("AHCI controller found and ABAR mapped.\n");
-            hba
+            match unsafe { hba.identify() } {
+                Ok(info) => {
+                    let _ = core::fmt::Write::write_fmt(
+                        console,
+                        format_args!(
+                            "AHCI disk identified: '{}' on port {}, {} sectors ({} MiB).\n",
+                            info.model(),
+                            hba.port(),
+                            info.total_sectors,
+                            info.total_sectors / 2048
+                        ),
+                    );
+                    let mut sector0 = [0u8; 512];
+                    if unsafe { hba.read_sector(0, &mut sector0) }.is_ok() {
+                        ahci::debug_dump_sector(&sector0);
+                    }
+                    if let Ok(disk) = Disk::from_ahci(hba) {
+                        found.push(disk);
+                    }
+                }
+                Err(message) => {
+                    let _ = core::fmt::Write::write_fmt(
+                        console,
+                        format_args!("AHCI IDENTIFY failed: {message}\n"),
+                    );
+                    let _ =
+                        debugcon::write_fmt(format_args!("[ahci] identify failed: {message}\n"));
+                }
+            }
         }
-        Err(msg) => {
-            let _ = core::fmt::Write::write_fmt(console, format_args!("AHCI: {msg} (persistent storage unavailable)\n"));
-            debugcon::write_str("[ahci] ");
-            debugcon::write_str(msg);
-            debugcon::write_str("\n");
-            return None;
+        Err(message) => {
+            let _ = core::fmt::Write::write_fmt(
+                console,
+                format_args!("AHCI: {message} (checking other storage)\n"),
+            );
+            let _ = debugcon::write_fmt(format_args!("[ahci] {message}\n"));
         }
-    };
-
-    let disk = match unsafe { hba.identify() } {
-        Ok(disk) => {
+    }
+    match unsafe { nvme::init() } {
+        Ok(controller) => {
+            if let Ok(disk) = Disk::from_nvme(controller) {
+                let info = disk.info().unwrap();
+                let _ = core::fmt::Write::write_fmt(
+                    console,
+                    format_args!(
+                        "NVMe disk identified: '{}' ({} MiB).\n",
+                        info.model(),
+                        info.total_sectors / 2048
+                    ),
+                );
+                found.push(disk);
+            }
+        }
+        Err(message) => {
+            let _ = debugcon::write_fmt(format_args!("[nvme] {message}\n"));
+            let _ = core::fmt::Write::write_fmt(console, format_args!("NVMe: {message}\n"));
+        }
+    }
+    for usb in usb_storage::disks() {
+        if let Ok(disk) = Disk::from_usb(usb) {
+            let info = disk.info().unwrap();
             let _ = core::fmt::Write::write_fmt(
                 console,
                 format_args!(
-                    "AHCI disk identified: '{}' on port {}, {} sectors ({} MiB).\n",
-                    disk.model(),
-                    hba.port(),
-                    disk.total_sectors,
-                    (disk.total_sectors * u64::from(ahci::SECTOR_SIZE)) / (1024 * 1024),
+                    "USB disk identified: '{}' ({} MiB).\n",
+                    info.model(),
+                    info.total_sectors / 2048
                 ),
             );
-            disk
-        }
-        Err(msg) => {
-            let _ = core::fmt::Write::write_fmt(console, format_args!("AHCI IDENTIFY failed: {msg} (persistent storage unavailable)\n"));
-            debugcon::write_str("[ahci] identify failed: ");
-            debugcon::write_str(msg);
-            debugcon::write_str("\n");
-            return None;
-        }
-    };
-
-    // Read-only proof that the read path works: LBA 0, dumped byte for
-    // byte to debugcon. `probe` below reads the same sector again; the
-    // dump is diagnostics only.
-    let mut sector0 = [0u8; ahci::SECTOR_SIZE as usize];
-    match unsafe { hba.read_sector(0, &mut sector0) } {
-        Ok(()) => ahci::debug_dump_sector(&sector0),
-        Err(msg) => {
-            debugcon::write_str("[ahci] read_sector(0) failed: ");
-            debugcon::write_str(msg);
-            debugcon::write_str("\n");
+            found.push(disk);
         }
     }
-
-    let probe = unsafe { save_format::probe(&hba, disk.total_sectors) };
-    let mounted = matches!(probe, Ok(save_format::Probe::Formatted));
-    let (line, log): (&str, &str) = match probe {
-        Ok(save_format::Probe::Formatted) => (
-            "AHCI save disk mounted (save/load available).",
-            "[save_format] existing save store mounted (read-only probe, no writes)",
-        ),
-        Ok(save_format::Probe::Blank) => (
-            "AHCI disk is blank -- not formatted for WISP. Left untouched; run 'format' to use it for save/load.",
-            "[save_format] disk is blank; left untouched (not mounted)",
-        ),
-        Ok(save_format::Probe::Foreign) => (
-            "AHCI disk holds non-WISP data. Left untouched; save/load unavailable ('format' checks disk ownership).",
-            "[save_format] disk holds foreign data; left untouched (not mounted)",
-        ),
-        Ok(save_format::Probe::Unsupported) => (
-            "AHCI disk has a WISP save store this version does not understand. Left untouched.",
-            "[save_format] unsupported save-store version/geometry; left untouched (not mounted)",
-        ),
-        Err(msg) => {
-            console.set_fg(gfx::ERROR);
-            let _ = core::fmt::Write::write_fmt(console, format_args!("AHCI save-disk probe FAILED: {msg} (save/load unavailable)\n"));
-            console.set_fg(gfx::FOREGROUND);
-            debugcon::write_str("[save_format] probe FAILED: ");
-            debugcon::write_str(msg);
-            debugcon::write_str("\n");
-            return Some(save_format::SaveDisk::new(hba, disk.total_sectors, false));
-        }
-    };
-    if !mounted {
-        console.set_fg(gfx::ERROR);
+    let mut disks = Vec::new();
+    let mut states = Vec::new();
+    for disk in found {
+        let total = disk.info().unwrap().total_sectors;
+        let transport = disk.transport();
+        let probe = unsafe { save_format::probe(&disk, total) };
+        let mounted = matches!(probe, Ok(save_format::Probe::Formatted));
+        let (message, marker) = match probe {
+            Ok(save_format::Probe::Formatted) => ("save disk mounted (save/load available).", "existing save store mounted (read-only probe, no writes)"),
+            Ok(save_format::Probe::Blank) => ("disk is blank -- not formatted for WISP. Left untouched; run 'format' to use it for save/load.", "disk is blank; left untouched (not mounted)"),
+            Ok(save_format::Probe::Foreign) => ("disk holds non-WISP data. Left untouched; save/load unavailable ('format' checks disk ownership).", "disk holds foreign data; left untouched (not mounted)"),
+            Ok(save_format::Probe::Unsupported) => ("disk has a WISP save store this version does not understand. Left untouched.", "unsupported save-store version/geometry; left untouched (not mounted)"),
+            Err(message) => {
+                let _ = core::fmt::Write::write_fmt(console, format_args!("{transport} save-disk probe FAILED: {message} (save/load unavailable)\n"));
+                let _ = debugcon::write_fmt(format_args!("[save_format] probe FAILED: {message}\n"));
+                ("disk could not be mounted; left untouched.", "disk probe failed; left untouched")
+            }
+        };
+        let _ = core::fmt::Write::write_fmt(console, format_args!("{transport} {message}\n"));
+        let _ = debugcon::write_fmt(format_args!("[save_format] {marker}\n"));
+        let save = save_format::SaveDisk::new(disk, total, mounted);
+        states.push(storage_policy::Candidate {
+            mounted,
+            format_allowed: save.format_range().is_ok(),
+            failed: save.hba().is_failed(),
+        });
+        disks.push(save);
     }
-    console.write_str(line);
-    console.write_str("\n");
-    console.set_fg(gfx::FOREGROUND);
-    debugcon::write_str(log);
-    debugcon::write_str("\n");
-    Some(save_format::SaveDisk::new(hba, disk.total_sectors, mounted))
+    let selected = storage_policy::automatic_selection(&states);
+    if let Some(index) = selected {
+        let _ = core::fmt::Write::write_fmt(
+            console,
+            format_args!(
+                "Storage: selected disk {index}: {}.\n",
+                disks[index].hba().location()
+            ),
+        );
+    } else if !disks.is_empty() {
+        console.write_str("Storage: use 'disks' and 'disk <n>' to select a save disk.\n");
+    } else {
+        console.write_str("Storage: no supported disk found; persistence unavailable.\n");
+    }
+    (disks, selected)
 }
 
 /// The running image's base address and size, from the firmware's

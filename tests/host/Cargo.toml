@@ -17,6 +17,10 @@ publish = false
 # Stand-alone: not part of the kernel's (non-)workspace.
 [workspace]
 
+[dev-dependencies]
+# Compile the actual framebuffer console with the firmware's pixel-format type.
+uefi = { version = "=0.30.0", default-features = false }
+
 [profile.release]
 opt-level = "s"
 debug-assertions = true

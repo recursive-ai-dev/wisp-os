@@ -10,7 +10,7 @@ if ! command -v rustup >/dev/null; then
     exit 1
 fi
 # rust-toolchain.toml selects nightly, the UEFI target and rust-src automatically.
-cargo build --release --target x86_64-unknown-uefi
+cargo build --locked --release --target x86_64-unknown-uefi
 
 EFI_BIN="target/x86_64-unknown-uefi/release/BOOTX64.efi"
 if [[ ! -f "$EFI_BIN" ]]; then

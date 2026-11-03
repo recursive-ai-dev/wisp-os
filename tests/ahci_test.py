@@ -73,6 +73,7 @@ Usage: tests/ahci_test.py [output_dir]
 """
 import hashlib
 import os
+from pathlib import Path
 import re
 import shutil
 import struct
@@ -92,7 +93,21 @@ ESP_DIR = os.path.join(OUT_DIR, "esp")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import acceptance_test  # noqa: E402 -- screendump() writes under this module's OUT_DIR global
-from acceptance_test import Monitor, wait_for_boot, ocr_text  # noqa: E402
+from acceptance_test import Monitor as BaseMonitor, wait_for_debug_marker  # noqa: E402
+import console_capture  # noqa: E402
+
+
+class Monitor(BaseMonitor):
+    def screendump(self, name):
+        return str(console_capture.capture(self, Path(acceptance_test.OUT_DIR) / (name + ".ppm")))
+
+
+def assert_screen(path, expected, context):
+    expected = [expected] if isinstance(expected, str) else expected
+    screen = console_capture.text(path)
+    missing = [part for part in expected if part.casefold() not in screen.casefold()]
+    if missing:
+        raise AssertionError(f"{context}: missing {missing!r}:\n{screen}")
 
 BOOT_MARKERS = ["[pmm] self-test OK", "[boot] interrupts enabled"]
 
@@ -142,7 +157,7 @@ def build_test_binary():
     print("==> Building BOOTX64.efi (release, isolated target dir)")
     subprocess.run(
         [
-            "cargo", "+nightly", "build", "--release",
+            "cargo", "build", "--locked", "--release",
             "--target", "x86_64-unknown-uefi",
             "--target-dir", BUILD_TARGET_DIR,
         ],
@@ -286,7 +301,9 @@ def run_and_capture(scenario: str, scenario_dir: str, save_img: str = None, cont
         # already established.
         acceptance_test.OUT_DIR = scenario_dir
         mon = Monitor(monitor_sock)
-        banner_shot = wait_for_boot(mon, timeout=40.0)
+        wait_for_debug_marker(debug_log, ["[shell] ready"], 45)
+        banner_shot = mon.screendump("boot")
+        assert_screen(banner_shot, "Custom Kernel", f"{scenario} boot")
 
         if interact is not None:
             interact(mon)
@@ -315,17 +332,17 @@ def assert_save_load_report_unavailable(mon, scenario: str):
     mon.type_text("save x y")
     mon.enter()
     time.sleep(0.3)
-    acceptance_test.assert_ocr(
+    assert_screen(
         mon.screendump("save_unavailable"),
-        "no AHCI save disk available this boot",
+        "no save disk selected",
         f"{scenario} (save reports unavailable, not a crash)",
     )
     mon.type_text("load x")
     mon.enter()
     time.sleep(0.3)
-    acceptance_test.assert_ocr(
+    assert_screen(
         mon.screendump("load_unavailable"),
-        "no AHCI save disk available this boot",
+        "no save disk selected",
         f"{scenario} (load reports unavailable, not a crash)",
     )
 
@@ -408,7 +425,7 @@ def scenario_full_stack():
         mon.type_text("save greeting too early")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("01_save_before_format"),
             "not formatted",
             f"{scenario} (save refuses an unformatted disk)",
@@ -420,7 +437,7 @@ def scenario_full_stack():
         mon.type_text("no")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("01_format_cancelled"),
             "cancelled",
             f"{scenario} (format can be cancelled)",
@@ -431,7 +448,7 @@ def scenario_full_stack():
         mon.type_text("ERASE")
         mon.enter()
         time.sleep(1.0)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("01_format_done"),
             "save disk formatted",
             f"{scenario} (explicit format)",
@@ -456,7 +473,7 @@ def scenario_full_stack():
         mon.type_text("save greeting hello world")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("02_after_save"),
             ["saved", "greeting"],
             f"{scenario} (save confirmation)",
@@ -465,7 +482,7 @@ def scenario_full_stack():
         mon.type_text("load greeting")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("03_after_load"),
             "hello world",
             f"{scenario} (load echoes back the saved value)",
@@ -474,7 +491,7 @@ def scenario_full_stack():
         mon.type_text("load nonexistent_key_xyz")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("04_after_load_missing"),
             "not found",
             f"{scenario} (load reports a clean 'not found' for an unsaved key)",
@@ -489,7 +506,7 @@ def scenario_full_stack():
         mon.type_text("load greeting")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("05_after_update"),
             "hello again",
             f"{scenario} (an updated value loads back)",
@@ -500,7 +517,7 @@ def scenario_full_stack():
         mon.type_text("keys")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("06_keys"),
             ["greeting", "note", f"2 of {SAVE_MAX_KEYS} keys"],
             f"{scenario} (keys lists both keys and the capacity)",
@@ -511,7 +528,7 @@ def scenario_full_stack():
         mon.type_text("keys")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("07_after_delete"),
             ["deleted", f"1 of {SAVE_MAX_KEYS} keys"],
             f"{scenario} (delete frees the key)",
@@ -681,12 +698,18 @@ def scenario_foreign_disk_untouched():
         mon.type_text("save x y")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
-            mon.screendump("save_refused"), "not formatted", f"{scenario} (save refuses a foreign disk)"
+        assert_screen(
+            mon.screendump("save_refused"), "no save disk selected", f"{scenario} (save refuses a foreign disk)"
         )
         mon.type_text("load x")
         mon.enter()
         time.sleep(0.3)
+        mon.type_text("disk 0")
+        mon.enter()
+        mon.type_text("format")
+        mon.enter()
+        time.sleep(0.3)
+        assert_screen(mon.screendump("format_refused"), "format refused", f"{scenario} (foreign partitions protected)")
 
     log, _ = run_and_capture(scenario, scenario_dir, save_img=save_img, interact=interact)
     assert_boot_markers_once(log, scenario)
@@ -745,7 +768,7 @@ def scenario_legacy_v1_store():
         mon.type_text("keys")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("01_v1_values_read"),
             ["41", "keep going", f"2 of {SAVE_MAX_KEYS} keys"],
             f"{scenario} (version-1 values read back)",
@@ -756,7 +779,7 @@ def scenario_legacy_v1_store():
         mon.type_text("load counter")
         mon.enter()
         time.sleep(0.3)
-        acceptance_test.assert_ocr(
+        assert_screen(
             mon.screendump("02_v1_store_updated"),
             ["saved", "42"],
             f"{scenario} (first save to a version-1 store)",
@@ -803,8 +826,10 @@ def scenario_legacy_v1_store():
 
 
 def main():
-    shutil.rmtree(OUT_DIR, ignore_errors=True)
-    os.makedirs(OUT_DIR, exist_ok=True)
+    global OUT_DIR, BUILD_TARGET_DIR, ESP_DIR
+    OUT_DIR = acceptance_test.new_run_directory(OUT_DIR)
+    BUILD_TARGET_DIR = os.path.join(OUT_DIR, "target")
+    ESP_DIR = os.path.join(OUT_DIR, "esp")
 
     build_test_binary()
 

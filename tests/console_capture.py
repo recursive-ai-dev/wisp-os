@@ -122,3 +122,18 @@ def text(path):
             line.append(character if character is not None else "\ufffd")
         lines.append("".join(line).rstrip())
     return "\n".join(lines).rstrip()
+
+
+def pixel(path, x, y):
+    """Read a framebuffer pixel, rejecting coordinates outside the image."""
+    width, height, raster = _ppm(path)
+    if not (0 <= x < width and 0 <= y < height):
+        raise ValueError("pixel coordinates are outside the screenshot")
+    offset = (y * width + x) * 3
+    return tuple(raster[offset:offset + 3])
+
+
+def palette(path):
+    """Return every RGB color in a screenshot, including arbitrary graphics."""
+    _, _, raster = _ppm(path)
+    return set(zip(raster[0::3], raster[1::3], raster[2::3]))
