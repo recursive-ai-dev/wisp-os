@@ -36,6 +36,7 @@ pub const KEY_F1: u8 = 0x90;
 
 const ENTER: u8 = 0x0d;
 const BACKSPACE: u8 = 0x08;
+const TAB: u8 = 0x09;
 const ESC: u8 = 0x1b;
 
 /// Longest line the editor accepts; further keystrokes are ignored. Far
@@ -67,6 +68,20 @@ pub trait Screen {
     /// Redraw cell `(col, row)` as `byte`, with the cursor marked on it
     /// (`on`) or not. Does not move the cursor.
     fn mark(&mut self, col: usize, row: usize, byte: u8, on: bool);
+    /// Scroll the view back into retained scrollback history (PageUp).
+    fn page_up(&mut self) {}
+    /// Scroll the view forward toward the live screen (PageDown).
+    fn page_down(&mut self) {}
+    /// Return `true` if the screen is currently showing historical scrollback
+    /// rather than the live bottom view.
+    fn is_scrolled_back(&self) -> bool {
+        false
+    }
+    /// Snap out of scrollback view back to the live screen. Returns `true`
+    /// if the screen was scrolled back and just restored the live view.
+    fn exit_scrollback(&mut self) -> bool {
+        false
+    }
 }
 
 /// Earlier lines, newest last, for Up/Down to recall.
@@ -123,13 +138,45 @@ pub enum Outcome {
 pub fn read_line(
     screen: &mut dyn Screen,
     next_key: &mut dyn FnMut() -> u8,
+    history: Option<&mut History>,
+    esc_clears: bool,
+) -> Outcome {
+    read_line_with_completer(screen, next_key, history, esc_clears, None)
+}
+
+/// Like [`read_line`], with an optional Tab-completion callback that takes
+/// the text preceding the cursor and returns an expanded replacement for
+/// that prefix when a unique or common-prefix completion exists.
+pub fn read_line_with_completer(
+    screen: &mut dyn Screen,
+    next_key: &mut dyn FnMut() -> u8,
     mut history: Option<&mut History>,
     esc_clears: bool,
+    mut completer: Option<&mut dyn FnMut(&str) -> Option<String>>,
 ) -> Outcome {
     let mut ed = Editor::new(screen);
     ed.show_cursor(screen);
     loop {
         let key = next_key();
+        if key == KEY_PAGE_UP {
+            if !screen.is_scrolled_back() {
+                ed.hide_cursor(screen);
+            }
+            screen.page_up();
+            continue;
+        }
+        if key == KEY_PAGE_DOWN {
+            screen.page_down();
+            if !screen.is_scrolled_back() {
+                ed.redraw_from(screen, 0, 0);
+                ed.show_cursor(screen);
+            }
+            continue;
+        }
+        if screen.exit_scrollback() {
+            ed.redraw_from(screen, 0, 0);
+            ed.show_cursor(screen);
+        }
         match key {
             ENTER => {
                 ed.hide_cursor(screen);
@@ -148,6 +195,22 @@ pub fn read_line(
             ESC => {
                 ed.browsing = None;
                 ed.replace(screen, Vec::new());
+            }
+            TAB => {
+                if let Some(complete) = completer.as_deref_mut() {
+                    let current = ed.text();
+                    let (before, after) = current.split_at(ed.cursor);
+                    if let Some(expanded) = complete(before) {
+                        if expanded != before && expanded.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                            let mut combined = expanded.into_bytes();
+                            let new_cursor = combined.len().min(MAX_LINE);
+                            combined.extend_from_slice(after.as_bytes());
+                            combined.truncate(MAX_LINE);
+                            ed.browsing = None;
+                            ed.replace_at_cursor(screen, combined, new_cursor);
+                        }
+                    }
+                }
             }
             BACKSPACE => ed.backspace(screen),
             KEY_DELETE => ed.delete(screen),
@@ -169,6 +232,80 @@ pub fn read_line(
             _ => {}
         }
     }
+}
+
+/// Pure Tab-completion helper for the shell: completes command names on the
+/// first token, command names after `help`, layout names after `keymap`, and
+/// program/app names after `run`, `cat`, `ide`, `edit`, `rm`, `cp`, `mv`, or `export`.
+pub fn complete_shell_prefix(
+    prefix: &str,
+    commands: &[&str],
+    programs: &[String],
+    keymaps: &[&str],
+) -> Option<String> {
+    let leading_ws = prefix.len() - prefix.trim_start_matches(' ').len();
+    let trimmed = &prefix[leading_ws..];
+    if let Some((cmd, rest)) = trimmed.split_once(' ') {
+        let rest_ws = rest.len() - rest.trim_start_matches(' ').len();
+        let arg = &rest[rest_ws..];
+        if arg.contains(' ') {
+            return None;
+        }
+        let head = &prefix[..leading_ws + cmd.len() + 1 + rest_ws];
+        match cmd {
+            "help" => complete_from_slice(head, arg, commands, false),
+            "keymap" => complete_from_slice(head, arg, keymaps, false),
+            "run" | "cat" | "ide" | "edit" | "rm" | "cp" | "mv" | "export" => {
+                let prog_refs: Vec<&str> = programs.iter().map(String::as_str).collect();
+                complete_from_slice(head, arg, &prog_refs, false)
+            }
+            _ => None,
+        }
+    } else {
+        let head = &prefix[..leading_ws];
+        complete_from_slice(head, trimmed, commands, true)
+    }
+}
+
+fn complete_from_slice(
+    head: &str,
+    fragment: &str,
+    candidates: &[&str],
+    trailing_space_on_unique: bool,
+) -> Option<String> {
+    let matches: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|c| c.starts_with(fragment))
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    if matches.len() == 1 {
+        let mut out = String::from(head);
+        out.push_str(matches[0]);
+        if trailing_space_on_unique {
+            out.push(' ');
+        }
+        return Some(out);
+    }
+    let first = matches[0].as_bytes();
+    let mut lcp_len = first.len();
+    for m in &matches[1..] {
+        let bytes = m.as_bytes();
+        lcp_len = lcp_len.min(bytes.len());
+        let mut i = 0;
+        while i < lcp_len && first[i] == bytes[i] {
+            i += 1;
+        }
+        lcp_len = i;
+    }
+    if lcp_len <= fragment.len() {
+        return None;
+    }
+    let mut out = String::from(head);
+    out.push_str(&matches[0][..lcp_len]);
+    Some(out)
 }
 
 struct Editor {
@@ -333,11 +470,16 @@ impl Editor {
     /// Replace the whole line (Esc at a prompt, or recalling history),
     /// with the cursor at its end.
     fn replace(&mut self, screen: &mut dyn Screen, line: Vec<u8>) {
+        let len = line.len().min(MAX_LINE);
+        self.replace_at_cursor(screen, line, len);
+    }
+
+    fn replace_at_cursor(&mut self, screen: &mut dyn Screen, mut line: Vec<u8>, cursor: usize) {
         self.hide_cursor(screen);
+        line.truncate(MAX_LINE);
         let erase = self.buf.len().saturating_sub(line.len());
         self.buf = line;
-        self.buf.truncate(MAX_LINE);
-        self.cursor = self.buf.len();
+        self.cursor = cursor.min(self.buf.len());
         self.redraw_from(screen, 0, erase);
         self.show_cursor(screen);
     }

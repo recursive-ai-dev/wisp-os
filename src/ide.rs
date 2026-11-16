@@ -179,11 +179,29 @@ impl View {
             if confirming {
                 "Unsaved changes: [S]ave  [D]iscard  [Esc] Cancel"
             } else {
-                "F1 Help  F2 Save  F3 Open/New  F5 Run  F6 Check  F10 Quit"
+                "F1 Help  F2 Save  F3 Open  F4 Find  F5 Run  F6 Check  F7 Line  F10 Quit"
             },
             TEXT,
         );
         self.draw(console, cells);
+    }
+
+    fn prompt_bottom(&mut self, console: &mut Console, prompt: &str) -> Option<String> {
+        console.set_position(1, self.rows - 1);
+        console.set_fg(gfx::FOREGROUND);
+        console.write_str(&" ".repeat(self.cols.saturating_sub(2)));
+        console.set_position(1, self.rows - 1);
+        console.set_fg(gfx::ACCENT);
+        console.write_str(prompt);
+        console.set_fg(gfx::FOREGROUND);
+        keyboard::clear_stop_request();
+        let result = line_editor::read_line(console, &mut keyboard::wait_for_key, None, false);
+        keyboard::clear_stop_request();
+        self.invalidate(console);
+        match result {
+            line_editor::Outcome::Line(text) => Some(text),
+            line_editor::Outcome::Escaped(_) => None,
+        }
     }
 
     fn help(&mut self, console: &mut Console) {
@@ -193,8 +211,10 @@ impl View {
             "",
             " F2           Save to prog.<name> on the save disk",
             " F3           Open a saved program or bundled example; new names start empty",
+            " F4           Search forward for text (wraps around; Enter repeats last search)",
             " F5           Run this buffer in a fresh WISP session; Esc stops the program",
             " F6           Check syntax without running; errors jump to their line",
+            " F7           Jump directly to a 1-based line number",
             " F10 / Esc    Leave the editor; unsaved changes require a choice",
             "",
             " Arrows       Move through the source",
@@ -206,7 +226,7 @@ impl View {
             "",
             " Saved programs override bundled examples with the same name.",
             " Names: 1-27 letters, digits, underscores or hyphens; .wisp is optional.",
-            " The editor holds 16 KiB; current save slots hold 4042 source bytes.",
+            " The editor and multi-slot save store hold up to 64 KiB (65536 bytes).",
             " Without a formatted save disk, editing and running still work in memory.",
             " Use the shell's format command to provision a blank save disk.",
             " The font displays ASCII; other characters are preserved and shown as ?.",
@@ -350,6 +370,8 @@ fn highlight(text: &str) -> Vec<u8> {
                     | "nil"
             ) {
                 styles[start..i].fill(KEYWORD);
+            } else if wisp::builtins::is_builtin(word.as_str()) {
+                styles[start..i].fill(ACCENT);
             }
         } else {
             if chars[i].is_ascii_digit() {
@@ -429,6 +451,7 @@ pub fn run(
         status = "Memory only: no formatted save disk. Use 'disks' at the shell; F1 for help.".to_string();
     }
     let mut error = false;
+    let mut last_search = String::new();
     let mut view = View::new(console);
     view.invalidate(console);
     keyboard::clear_stop_request();
@@ -473,6 +496,30 @@ pub fn run(
                     }
                 }
             }
+            k if k == KEY_F1 + 3 => {
+                let prompt = if last_search.is_empty() {
+                    String::from("Find: ")
+                } else {
+                    format!("Find [{last_search}]: ")
+                };
+                if let Some(typed) = view.prompt_bottom(console, &prompt) {
+                    let needle = if typed.is_empty() {
+                        last_search.clone()
+                    } else {
+                        last_search.clone_from(&typed);
+                        typed
+                    };
+                    if !needle.is_empty() {
+                        if editor.search_next(&needle) {
+                            status = format!("Found '{needle}'");
+                            error = false;
+                        } else {
+                            status = format!("'{needle}' not found");
+                            error = true;
+                        }
+                    }
+                }
+            }
             k if k == KEY_F1 + 4 => {
                 view.invalidate(console);
                 console.write_str(&format!("Running {name}.wisp -- Esc stops the program\n\n"));
@@ -509,6 +556,24 @@ pub fn run(
                         editor.go_to_line(problem.line.saturating_sub(1) as usize);
                         status = problem.to_display_string();
                         error = true;
+                    }
+                }
+            }
+            k if k == KEY_F1 + 6 => {
+                if let Some(typed) = view.prompt_bottom(console, "Go to line: ") {
+                    let trimmed = typed.trim();
+                    if !trimmed.is_empty() {
+                        match trimmed.parse::<usize>() {
+                            Ok(n) if n >= 1 => {
+                                editor.go_to_line(n - 1);
+                                status = format!("Jumped to line {}", editor.position().0 + 1);
+                                error = false;
+                            }
+                            _ => {
+                                status = String::from("Expected a positive line number");
+                                error = true;
+                            }
+                        }
                     }
                 }
             }

@@ -506,3 +506,62 @@ fn random_editing_keeps_the_screen_exact() {
     }
     assert_eq!(runs, 6 * 4 * 2 * 12);
 }
+
+#[test]
+fn tab_completion_expands_commands_common_prefixes_and_arguments() {
+    use wisp_host_tests::line_editor::{complete_shell_prefix, read_line_with_completer};
+
+    let commands = &["cat", "clear", "date", "dmesg", "help", "keymap", "lspci", "run", "uptime"];
+    let programs = vec![
+        String::from("adventure"),
+        String::from("calc"),
+        String::from("canvas"),
+        String::from("hello"),
+    ];
+    let keymaps = &["us", "uk", "de", "fr", "es", "dvorak", "colemak"];
+
+    // Unique command match adds a trailing space.
+    assert_eq!(
+        complete_shell_prefix("up", commands, &programs, keymaps).as_deref(),
+        Some("uptime ")
+    );
+    // "cat" and "clear" share only "c", while "calc" and "canvas" share "ca".
+    assert_eq!(
+        complete_shell_prefix("c", commands, &programs, keymaps).as_deref(),
+        None
+    );
+    assert_eq!(
+        complete_shell_prefix("run ca", commands, &programs, keymaps).as_deref(),
+        None
+    );
+    assert_eq!(
+        complete_shell_prefix("run c", commands, &programs, keymaps).as_deref(),
+        Some("run ca")
+    );
+    assert_eq!(
+        complete_shell_prefix("run hel", commands, &programs, keymaps).as_deref(),
+        Some("run hello")
+    );
+    assert_eq!(
+        complete_shell_prefix("help dm", commands, &programs, keymaps).as_deref(),
+        Some("help dmesg")
+    );
+    assert_eq!(
+        complete_shell_prefix("keymap dv", commands, &programs, keymaps).as_deref(),
+        Some("keymap dvorak")
+    );
+
+    // End-to-end through `read_line_with_completer`: type "ru\thel\t\r"
+    let mut grid = FakeScreen::new(40, 5);
+    grid.write("> ");
+    let keys = b"ru\thel\t\r";
+    let mut idx = 0usize;
+    let mut next_key = || {
+        let k = keys[idx];
+        idx += 1;
+        k
+    };
+    let mut completer = |prefix: &str| complete_shell_prefix(prefix, commands, &programs, keymaps);
+    let out = read_line_with_completer(&mut grid, &mut next_key, None, true, Some(&mut completer));
+    assert_eq!(line_of(&out), "run hello");
+}

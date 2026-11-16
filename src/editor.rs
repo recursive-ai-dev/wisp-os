@@ -5,8 +5,8 @@ use alloc::string::String;
 
 use crate::line_editor::{KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
-pub const MAX_SOURCE_BYTES: usize = 16 * 1024;
-const FULL_MESSAGE: &str = "editor source limit is 16 KiB";
+pub const MAX_SOURCE_BYTES: usize = 64 * 1024;
+const FULL_MESSAGE: &str = "editor source limit is 64 KiB";
 const INDENT: usize = 4;
 
 pub struct Editor {
@@ -57,6 +57,31 @@ impl Editor {
     pub fn go_to_line(&mut self, line: usize) {
         self.cursor = self.offset_at(line.min(self.line_count() - 1), 0);
         self.preferred_column = None;
+    }
+
+    /// Find the next occurrence of `needle` after the cursor, wrapping around
+    /// to the beginning of the buffer if needed.
+    pub fn search_next(&mut self, needle: &str) -> bool {
+        if needle.is_empty() || self.source.is_empty() {
+            return false;
+        }
+        let search_from = self.source[self.cursor..]
+            .chars()
+            .next()
+            .map_or(self.cursor, |ch| self.cursor + ch.len_utf8());
+        if search_from <= self.source.len() {
+            if let Some(rel) = self.source[search_from..].find(needle) {
+                self.cursor = search_from + rel;
+                self.preferred_column = None;
+                return true;
+            }
+        }
+        if let Some(pos) = self.source.find(needle) {
+            self.cursor = pos;
+            self.preferred_column = None;
+            return true;
+        }
+        false
     }
 
     /// Keep the desired column while crossing shorter lines. Page keys

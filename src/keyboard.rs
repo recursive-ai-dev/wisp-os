@@ -22,8 +22,6 @@ const DATA_PORT: u16 = 0x60;
 
 /// ASCII carriage return, matching `shell.rs`'s `ENTER` constant.
 const ENTER: u8 = 0x0d;
-/// ASCII backspace, matching `shell.rs`'s `BACKSPACE` constant.
-const BACKSPACE: u8 = 0x08;
 /// ASCII escape. Decoded from the Esc key on both keyboards; besides being
 /// queued like any other byte, it raises the stop request (see
 /// [`request_stop`]).
@@ -37,47 +35,13 @@ fn in8(port: u16) -> u8 {
     value
 }
 
-/// Unshifted scancode-set-1 make-code -> ASCII table, indexed by scancode.
-/// `0` marks a code with no ASCII mapping (modifiers,
-/// unmapped punctuation-adjacent codes, etc.) -- those are dropped, not
-/// substituted with a wrong character. F1 through F10 are decoded
-/// separately before this table is consulted.
-#[rustfmt::skip]
-const UNSHIFTED: [u8; 0x59] = [
-    0,    ESC,  b'1', b'2', b'3', b'4', b'5', b'6', // 0x00-0x07 (0x01=Esc)
-    b'7', b'8', b'9', b'0', b'-', b'=', BACKSPACE, 9, // 0x08-0x0F (0x0F=Tab)
-    b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', // 0x10-0x17
-    b'o', b'p', b'[', b']', ENTER, 0,    b'a', b's', // 0x18-0x1F (0x1D=LCtrl)
-    b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', // 0x20-0x27
-    b'\'', b'`', 0,    b'\\', b'z', b'x', b'c', b'v', // 0x28-0x2F (0x2A=LShift)
-    b'b', b'n', b'm', b',', b'.', b'/', 0,    b'*', // 0x30-0x37 (0x36=RShift)
-    0,    b' ', 0,    0,    0,    0,    0,    0,    // 0x38-0x3F (0x38=LAlt,0x39=Space,0x3A=CapsLock,0x3B..=F1..)
-    0,    0,    0,    0,    0,    0,    0,    0,    // 0x40-0x47
-    0,    0,    0,    0,    0,    0,    0,    0,    // 0x48-0x4F
-    0,    0,    0,    0,    0,    0,    0,    0,    // 0x50-0x57
-    0,                                                // 0x58
-];
-
-#[rustfmt::skip]
-const SHIFTED: [u8; 0x59] = [
-    0,    ESC,  b'!', b'@', b'#', b'$', b'%', b'^',
-    b'&', b'*', b'(', b')', b'_', b'+', BACKSPACE, 9,
-    b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I',
-    b'O', b'P', b'{', b'}', ENTER, 0,    b'A', b'S',
-    b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':',
-    b'"', b'~', 0,    b'|', b'Z', b'X', b'C', b'V',
-    b'B', b'N', b'M', b'<', b'>', b'?', 0,    b'*',
-    0,    b' ', 0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    0,    0,    0,    0,
-    0,
-];
-
 const LSHIFT_MAKE: u8 = 0x2A;
 const LSHIFT_BREAK: u8 = 0xAA;
 const RSHIFT_MAKE: u8 = 0x36;
 const RSHIFT_BREAK: u8 = 0xB6;
+const CAPSLOCK_MAKE: u8 = 0x3A;
+const RALT_MAKE: u8 = 0x38;
+const RALT_BREAK: u8 = 0xB8;
 const EXTENDED_PREFIX: u8 = 0xE0;
 /// Highest bit of a scancode marks a break (key-release) code in set 1.
 const BREAK_BIT: u8 = 0x80;
@@ -95,6 +59,8 @@ struct RingBuffer {
     pending_extended: bool,
     left_shift: bool,
     right_shift: bool,
+    right_alt: bool,
+    caps_lock: bool,
 }
 
 impl RingBuffer {
@@ -107,6 +73,8 @@ impl RingBuffer {
             pending_extended: false,
             left_shift: false,
             right_shift: false,
+            right_alt: false,
+            caps_lock: false,
         }
     }
 
@@ -201,10 +169,21 @@ pub fn on_irq() {
 impl RingBuffer {
     fn on_scancode(&mut self, scancode: u8) {
         if self.pending_extended {
-            // Second byte of an 0xE0-prefixed sequence: an editing key, or
-            // something (right Ctrl/Alt, a release, a fake shift) that is
-            // not bound to anything.
+            // Second byte of an 0xE0-prefixed sequence: an editing key,
+            // Right Alt (AltGr), or something (right Ctrl, a release, a fake
+            // shift) that is not bound to anything.
             self.pending_extended = false;
+            match scancode {
+                RALT_MAKE => {
+                    self.right_alt = true;
+                    return;
+                }
+                RALT_BREAK => {
+                    self.right_alt = false;
+                    return;
+                }
+                _ => {}
+            }
             let key = extended_key(scancode);
             if key != 0 {
                 self.push(key);
@@ -224,6 +203,10 @@ impl RingBuffer {
                 self.right_shift = scancode == RSHIFT_MAKE;
                 return;
             }
+            CAPSLOCK_MAKE => {
+                self.caps_lock = !self.caps_lock;
+                return;
+            }
             _ => {}
         }
         if scancode & BREAK_BIT != 0 {
@@ -238,18 +221,20 @@ impl RingBuffer {
             self.push(KEY_F1 + scancode - 0x3b);
             return;
         }
-        let index = scancode as usize;
-        let table = if self.left_shift || self.right_shift { &SHIFTED } else { &UNSHIFTED };
-        let Some(&ascii) = table.get(index) else {
-            return;
-        };
+        let shift = self.left_shift || self.right_shift;
+        let ascii = crate::keymap::translate_ps2(
+            crate::keymap::active(),
+            scancode,
+            shift,
+            self.caps_lock,
+            self.right_alt,
+        );
         if ascii == ESC {
             request_stop();
         }
         if ascii != 0 {
             self.push(ascii);
         }
-
     }
 }
 

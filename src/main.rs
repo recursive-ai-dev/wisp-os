@@ -41,9 +41,11 @@ mod ioapic;
 mod installer;
 mod ide;
 mod keyboard;
+mod keymap;
 mod lapic;
 mod libc_shims;
 mod line_editor;
+mod log;
 mod nvme;
 mod nvme_format;
 mod panic;
@@ -52,7 +54,9 @@ mod pci;
 mod pic;
 mod pit;
 mod pmm;
+mod power;
 mod projects;
+mod rtc;
 mod save_format;
 mod shell;
 mod storage;
@@ -90,6 +94,9 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // `uefi` crate's own `global_allocator`/`panic_handler` Cargo features
     // are disabled in Cargo.toml specifically so ours are the only ones.)
     unsafe { allocator::init() };
+    if log::init_serial() {
+        debugcon::write_str("[serial] COM1 16550 UART online (115200 8N1)\n");
+    }
 
     if let Err(e) = uefi::helpers::init(&mut st) {
         return e.status();
@@ -175,6 +182,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // firmware publishes no ACPI tables at all -- a first-class outcome
     // this kernel keeps booting through, on the legacy 8259 path.
     let rsdp_addr = acpi::find_rsdp(&st);
+    rtc::init(&st);
 
     console.write_str("Exiting UEFI Boot Services...\n");
 
@@ -189,7 +197,8 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // about; our heap is a static array, not a Boot Services allocation)
     // would be folded into -- it does not affect what becomes free, only
     // how this call's own bookkeeping allocation is typed.
-    let (_runtime_st, mmap) = unsafe { st.exit_boot_services(MemoryType::LOADER_DATA) };
+    let (runtime_st, mmap) = unsafe { st.exit_boot_services(MemoryType::LOADER_DATA) };
+    power::init(runtime_st);
 
     // From here on, Boot Services no longer exists. Nothing below this
     // line may reference `bs`, `st_for_bs`, or any UEFI protocol.

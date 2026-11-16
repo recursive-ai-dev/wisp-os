@@ -7,13 +7,13 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::save_format::{SaveDisk, VALUE_MAX_LEN};
+use crate::save_format::{SaveDisk, MAX_CHAINED_VALUE_LEN};
 use crate::wisp::value::Value;
 
 const PREFIX: &str = "prog.";
 const MAX_NAME_BYTES: usize = 32 - PREFIX.len();
 /// A serialized string has a one-byte tag and four-byte length prefix.
-pub const MAX_SAVED_SOURCE_BYTES: usize = VALUE_MAX_LEN - 5;
+pub const MAX_SAVED_SOURCE_BYTES: usize = MAX_CHAINED_VALUE_LEN - 5;
 
 /// A portable, case-insensitive project name, without its `.wisp` suffix.
 pub fn normalize_name(input: &str) -> Result<String, &'static str> {
@@ -70,13 +70,56 @@ pub fn load_source(
 pub fn save_source(name: &str, source: &str, disk: Option<&SaveDisk>) -> Result<(), &'static str> {
     let name = normalize_name(name)?;
     if source.len() > MAX_SAVED_SOURCE_BYTES {
-        return Err("project exceeds the save store's 4042-byte source limit");
+        return Err("project exceeds the save store's multi-slot source limit");
     }
     let disk = disk.ok_or("no save disk selected (use 'disks' and 'disk <n>')")?;
-    disk.save(
+    disk.save_chained(
         &format!("{PREFIX}{name}"),
         &Value::Str(Rc::new(String::from(source))),
     )
+}
+
+/// Delete a saved project (`prog.<name>`) from the save disk.
+pub fn delete_source(name: &str, disk: Option<&SaveDisk>) -> Result<bool, &'static str> {
+    let name = normalize_name(name)?;
+    let disk = disk.ok_or("no save disk selected (use 'disks' and 'disk <n>')")?;
+    disk.delete(&format!("{PREFIX}{name}"))
+}
+
+/// Copy a saved or bundled project to a new saved project `prog.<dst>`.
+pub fn copy_source(
+    src: &str,
+    dst: &str,
+    apps: &[(String, String)],
+    disk: Option<&SaveDisk>,
+) -> Result<(), &'static str> {
+    let src_name = normalize_name(src)?;
+    let dst_name = normalize_name(dst)?;
+    let source = load_source(&src_name, apps, disk)?.ok_or("source project not found")?;
+    save_source(&dst_name, &source, disk)
+}
+
+/// Rename a saved project `prog.<src>` to `prog.<dst>`, deleting the old key
+/// only after the new copy has been durably committed.
+pub fn move_source(
+    src: &str,
+    dst: &str,
+    disk: Option<&SaveDisk>,
+) -> Result<(), &'static str> {
+    let src_name = normalize_name(src)?;
+    let dst_name = normalize_name(dst)?;
+    let disk_ref = disk.ok_or("no save disk selected (use 'disks' and 'disk <n>')")?;
+    let source = match disk_ref.load(&format!("{PREFIX}{src_name}"))? {
+        Some(Value::Str(s)) => (*s).clone(),
+        Some(_) => return Err("saved project contains a non-string value"),
+        None => return Err("saved project not found (bundled apps are read-only; use 'cp' to copy)"),
+    };
+    if src_name == dst_name {
+        return Ok(());
+    }
+    save_source(&dst_name, &source, disk)?;
+    let _ = disk_ref.delete(&format!("{PREFIX}{src_name}"));
+    Ok(())
 }
 
 /// Saved project names, sorted, excluding unrelated application data.

@@ -142,6 +142,7 @@ pub fn fault_screen(title: &str, args: core::fmt::Arguments) -> ! {
     // to honor the way `sync::without_interrupts` does for a call that will
     // return.
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    crate::log::force_unlock_for_fault();
 
     debugcon::write_str("\n[");
     debugcon::write_str(title);

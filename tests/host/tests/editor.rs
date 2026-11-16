@@ -149,3 +149,16 @@ fn empty_buffer_boundary_keys_and_unknown_commands_are_harmless() {
     assert_eq!(editor.line_count(), 1);
     assert!(!editor.is_dirty());
 }
+
+#[test]
+fn search_next_finds_forward_and_wraps_around() {
+    let mut editor = Editor::new("let a = 1;\nlet b = 2;\nlet a = 3;\n").unwrap();
+    assert!(editor.search_next("let b"));
+    assert_eq!(editor.position(), (1, 0));
+    assert!(editor.search_next("let a"));
+    assert_eq!(editor.position(), (2, 0));
+    // Wraps around to line 0.
+    assert!(editor.search_next("let a"));
+    assert_eq!(editor.position(), (0, 0));
+    assert!(!editor.search_next("nonexistent"));
+}

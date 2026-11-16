@@ -14,60 +14,106 @@ use super::WispError;
 /// The built-ins that call back into the interpreter, so they live in
 /// `interp.rs` (`Interp::call_higher_order`) rather than in [`call`].
 pub fn is_higher_order(name: &str) -> bool {
+    matches!(name, "map" | "filter" | "reduce" | "sort_by" | "pcall" | "import")
+}
+
+/// Reserved built-ins from WISP 1.1/1.2: user `fn` definitions may not use
+/// these names.
+pub fn is_hard_builtin(name: &str) -> bool {
     matches!(name, "map" | "filter" | "reduce" | "sort_by")
+        || matches!(
+            name,
+            "print"
+                | "input"
+                | "len"
+                | "str"
+                | "int"
+                | "rand"
+                | "sleep_ms"
+                | "time_ms"
+                | "clear"
+                | "push"
+                | "pop"
+                | "save"
+                | "load"
+                | "screen_width"
+                | "screen_height"
+                | "rgb"
+                | "plot"
+                | "rect"
+                | "line"
+                | "fill_screen"
+                | "split"
+                | "join"
+                | "find"
+                | "contains"
+                | "replace"
+                | "upper"
+                | "lower"
+                | "trim"
+                | "starts_with"
+                | "ends_with"
+                | "chr"
+                | "ord"
+                | "chars"
+                | "repeat"
+                | "insert"
+                | "remove"
+                | "sort"
+                | "reverse"
+                | "range"
+                | "abs"
+                | "min"
+                | "max"
+                | "type"
+                | "keys"
+                | "values"
+                | "get"
+        )
+}
+
+/// Soft built-ins added in WISP 1.3+: available by default, but a user `fn`
+/// or `let` binding of the same name shadows them so every 1.1/1.2 program
+/// keeps working unchanged.
+pub fn is_soft_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "date"
+            | "beep"
+            | "band"
+            | "bor"
+            | "bxor"
+            | "bnot"
+            | "shl"
+            | "shr"
+            | "lshr"
+            | "rgb_parts"
+            | "pad_left"
+            | "pad_right"
+            | "hex"
+            | "bin"
+            | "fixed"
+            | "fmt"
+            | "divmod"
+            | "pow"
+            | "isqrt"
+            | "muldiv"
+            | "sum"
+            | "enumerate"
+            | "last"
+            | "pcall"
+            | "error"
+            | "import"
+            | "read_file"
+            | "write_file"
+            | "append_file"
+            | "list_files"
+            | "delete_file"
+    )
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    is_higher_order(name)
-        || matches!(
-        name,
-        "print"
-            | "input"
-            | "len"
-            | "str"
-            | "int"
-            | "rand"
-            | "sleep_ms"
-            | "time_ms"
-            | "clear"
-            | "push"
-            | "pop"
-            | "save"
-            | "load"
-            | "screen_width"
-            | "screen_height"
-            | "rgb"
-            | "plot"
-            | "rect"
-            | "line"
-            | "fill_screen"
-            | "split"
-            | "join"
-            | "find"
-            | "contains"
-            | "replace"
-            | "upper"
-            | "lower"
-            | "trim"
-            | "starts_with"
-            | "ends_with"
-            | "chr"
-            | "ord"
-            | "chars"
-            | "repeat"
-            | "insert"
-            | "remove"
-            | "sort"
-            | "reverse"
-            | "range"
-            | "abs"
-            | "min"
-            | "max"
-            | "type"
-            | "keys"
-            | "values"
-            | "get"
-    )
+    is_hard_builtin(name) || is_soft_builtin(name)
 }
 
 // Never inlined into the interpreter: its frame (every builtin's locals)
@@ -146,6 +192,35 @@ pub fn call(
         "keys" => builtin_keys_values(objects, &args, line, "keys"),
         "values" => builtin_keys_values(objects, &args, line, "values"),
         "get" => builtin_get(&args, line),
+        "date" => builtin_date(host, objects, &args, line),
+        "beep" => builtin_beep(host, &args, line),
+        "band" => builtin_bit2(&args, line, "band", |a, b| a & b),
+        "bor" => builtin_bit2(&args, line, "bor", |a, b| a | b),
+        "bxor" => builtin_bit2(&args, line, "bxor", |a, b| a ^ b),
+        "bnot" => builtin_bnot(&args, line),
+        "shl" => builtin_shift(&args, line, "shl", |a, n| a.wrapping_shl(n)),
+        "shr" => builtin_shift(&args, line, "shr", |a, n| a.wrapping_shr(n)),
+        "lshr" => builtin_shift(&args, line, "lshr", |a, n| ((a as u64).wrapping_shr(n)) as i64),
+        "rgb_parts" => builtin_rgb_parts(objects, &args, line),
+        "pad_left" => builtin_pad(&args, line, "pad_left", true),
+        "pad_right" => builtin_pad(&args, line, "pad_right", false),
+        "hex" => builtin_radix(&args, line, "hex", 16),
+        "bin" => builtin_radix(&args, line, "bin", 2),
+        "fixed" => builtin_fixed(&args, line),
+        "fmt" => builtin_fmt(&args, line),
+        "divmod" => builtin_divmod(objects, &args, line),
+        "pow" => builtin_pow(&args, line),
+        "isqrt" => builtin_isqrt(&args, line),
+        "muldiv" => builtin_muldiv(&args, line),
+        "sum" => builtin_sum(&args, line),
+        "enumerate" => builtin_enumerate(objects, &args, line),
+        "last" => builtin_last(&args, line),
+        "error" => builtin_error(&args, line),
+        "read_file" => builtin_read_file(host, &args, line),
+        "write_file" => builtin_write_file(host, &args, line),
+        "append_file" => builtin_append_file(host, &args, line),
+        "list_files" => builtin_list_files(host, objects, &args, line),
+        "delete_file" => builtin_delete_file(host, &args, line),
         _ => unreachable!("is_builtin() must be checked, and higher-order built-ins routed to the interpreter, before call()"),
     }
 }
@@ -333,6 +408,65 @@ fn builtin_str(args: &[Value], line: u32) -> Result<Value, WispError> {
 }
 
 fn builtin_int(args: &[Value], line: u32) -> Result<Value, WispError> {
+    if args.len() == 2 {
+        let s = match &args[0] {
+            Value::Str(s) => s.as_str(),
+            other => {
+                return Err(WispError::new(
+                    line,
+                    format!(
+                        "int() with a base expects a string as its first argument, found {}",
+                        other.type_name()
+                    ),
+                ))
+            }
+        };
+        let base = expect_int(&args[1], "int", "base", line)?;
+        if !(2..=36).contains(&base) {
+            return Err(WispError::new(
+                line,
+                format!("int() base must be between 2 and 36, got {base}"),
+            ));
+        }
+        let trimmed = s.trim();
+        let (neg, rest) = if let Some(r) = trimmed.strip_prefix('-') {
+            (true, r)
+        } else if let Some(r) = trimmed.strip_prefix('+') {
+            (false, r)
+        } else {
+            (false, trimmed)
+        };
+        let digits = match base {
+            16 => rest
+                .strip_prefix("0x")
+                .or_else(|| rest.strip_prefix("0X"))
+                .unwrap_or(rest),
+            2 => rest
+                .strip_prefix("0b")
+                .or_else(|| rest.strip_prefix("0B"))
+                .unwrap_or(rest),
+            _ => rest,
+        };
+        if digits.is_empty() || digits.starts_with('+') || digits.starts_with('-') {
+            return Err(WispError::new(
+                line,
+                format!("int() could not parse \"{s}\" in base {base}"),
+            ));
+        }
+        let signed = if neg {
+            format!("-{digits}")
+        } else {
+            String::from(digits)
+        };
+        return i64::from_str_radix(&signed, base as u32)
+            .map(Value::Int)
+            .map_err(|_| {
+                WispError::new(
+                    line,
+                    format!("int() could not parse \"{s}\" in base {base}"),
+                )
+            });
+    }
     expect_arity(args, 1, "int", line)?;
     match &args[0] {
         Value::Int(i) => Ok(Value::Int(*i)),
@@ -1059,20 +1193,620 @@ fn builtin_abs(args: &[Value], line: u32) -> Result<Value, WispError> {
         .ok_or_else(|| WispError::new(line, format!("integer overflow in 'abs({n})'")))
 }
 
-/// `min(a, b)` / `max(a, b)`: two ints, or two strings (in the order `<`
-/// uses). On a tie, the first argument.
+/// `min(...)` / `max(...)`: two or more ints, two or more strings, or a single
+/// non-empty list of ints or strings. On a tie, the earlier argument wins.
 fn builtin_min_max(args: &[Value], line: u32, fn_name: &str) -> Result<Value, WispError> {
+    if args.len() == 1 {
+        if let Value::List(list) = &args[0] {
+            let items = list.borrow();
+            if items.is_empty() {
+                return Err(WispError::new(
+                    line,
+                    format!("{fn_name}() called on an empty list"),
+                ));
+            }
+            return min_max_slice(&items, line, fn_name);
+        }
+    }
+    if args.len() < 2 {
+        return Err(WispError::new(
+            line,
+            format!("{fn_name}() expects 2 arguments, got {}", args.len()),
+        ));
+    }
+    min_max_slice(args, line, fn_name)
+}
+
+fn min_max_slice(items: &[Value], line: u32, fn_name: &str) -> Result<Value, WispError> {
+    let mut best = &items[0];
+    for item in &items[1..] {
+        let ordering = match (best, item) {
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Str(a), Value::Str(b)) => a.as_str().cmp(b.as_str()),
+            (a, b) => {
+                return Err(WispError::new(
+                    line,
+                    format!(
+                        "{fn_name}() expects two ints or two strings, found {} and {}",
+                        a.type_name(),
+                        b.type_name()
+                    ),
+                ))
+            }
+        };
+        let replace = if fn_name == "min" {
+            ordering.is_gt()
+        } else {
+            ordering.is_lt()
+        };
+        if replace {
+            best = item;
+        }
+    }
+    Ok(best.clone())
+}
+
+fn builtin_date(
+    host: &mut dyn Host,
+    objects: &mut ObjectRegistry,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 0, "date", line)?;
+    let (year, month, day, hour, minute, second) = host
+        .now_datetime()
+        .ok_or_else(|| WispError::new(line, "date() failed: wall-clock time is unavailable"))?;
+    let mut entries = alloc::collections::BTreeMap::new();
+    for (k, v) in [
+        ("year", year),
+        ("month", i64::from(month)),
+        ("day", i64::from(day)),
+        ("hour", i64::from(hour)),
+        ("minute", i64::from(minute)),
+        ("second", i64::from(second)),
+    ] {
+        entries.insert(MapKey::Str(Rc::new(String::from(k))), Value::Int(v));
+    }
+    Ok(objects.new_map(entries))
+}
+
+fn builtin_beep(host: &mut dyn Host, args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "beep", line)?;
+    let hz = expect_int(&args[0], "beep", "frequency (hz)", line)?;
+    let ms = expect_int(&args[1], "beep", "duration (ms)", line)?;
+    if !(20..=20_000).contains(&hz) {
+        return Err(WispError::new(
+            line,
+            format!("beep() frequency must be between 20 and 20000 Hz, got {hz}"),
+        ));
+    }
+    if !(0..=60_000).contains(&ms) {
+        return Err(WispError::new(
+            line,
+            format!("beep() duration must be between 0 and 60000 ms, got {ms}"),
+        ));
+    }
+    host.beep(hz as u32, ms as u64);
+    if host.stop_requested() {
+        return Err(WispError::new(line, STOPPED_MESSAGE));
+    }
+    Ok(Value::Nil)
+}
+
+// ---- H2-1: bitwise built-ins -----------------------------------------------
+
+fn builtin_bit2(
+    args: &[Value],
+    line: u32,
+    fn_name: &str,
+    op: impl FnOnce(i64, i64) -> i64,
+) -> Result<Value, WispError> {
     expect_arity(args, 2, fn_name, line)?;
-    let ordering = match (&args[0], &args[1]) {
-        (Value::Int(a), Value::Int(b)) => a.cmp(b),
-        (Value::Str(a), Value::Str(b)) => a.as_str().cmp(b.as_str()),
-        (a, b) => {
+    let a = expect_int(&args[0], fn_name, "first operand", line)?;
+    let b = expect_int(&args[1], fn_name, "second operand", line)?;
+    Ok(Value::Int(op(a, b)))
+}
+
+fn builtin_bnot(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "bnot", line)?;
+    let a = expect_int(&args[0], "bnot", "the operand", line)?;
+    Ok(Value::Int(!a))
+}
+
+fn builtin_shift(
+    args: &[Value],
+    line: u32,
+    fn_name: &str,
+    op: impl FnOnce(i64, u32) -> i64,
+) -> Result<Value, WispError> {
+    expect_arity(args, 2, fn_name, line)?;
+    let a = expect_int(&args[0], fn_name, "value", line)?;
+    let n = expect_int(&args[1], fn_name, "shift count", line)?;
+    if !(0..=63).contains(&n) {
+        return Err(WispError::new(
+            line,
+            format!("{fn_name}() shift count must be between 0 and 63, got {n}"),
+        ));
+    }
+    Ok(Value::Int(op(a, n as u32)))
+}
+
+fn builtin_rgb_parts(
+    objects: &mut ObjectRegistry,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 1, "rgb_parts", line)?;
+    let color = expect_color(&args[0], "rgb_parts", line)?;
+    let r = i64::from((color >> 16) & 0xFF);
+    let g = i64::from((color >> 8) & 0xFF);
+    let b = i64::from(color & 0xFF);
+    Ok(objects.new_list(alloc::vec![Value::Int(r), Value::Int(g), Value::Int(b)]))
+}
+
+// ---- H2-2: formatting built-ins --------------------------------------------
+
+fn builtin_pad(
+    args: &[Value],
+    line: u32,
+    fn_name: &str,
+    pad_on_left: bool,
+) -> Result<Value, WispError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(WispError::new(
+            line,
+            format!("{fn_name}() expects 2 or 3 arguments, got {}", args.len()),
+        ));
+    }
+    let text = match &args[0] {
+        Value::Str(s) => (**s).clone(),
+        other => other.try_display_string().ok_or_else(|| {
+            WispError::new(
+                line,
+                format!("{fn_name}(): argument exceeds {MAX_DISPLAY_LEN} bytes"),
+            )
+        })?,
+    };
+    let width = expect_int(&args[1], fn_name, "width", line)?;
+    if width < 0 {
+        return Err(WispError::new(
+            line,
+            format!("{fn_name}() width must not be negative, got {width}"),
+        ));
+    }
+    let fill_ch = match args.get(2) {
+        None => ' ',
+        Some(Value::Str(s)) => {
+            let mut chars = s.chars();
+            let Some(ch) = chars.next() else {
+                return Err(WispError::new(
+                    line,
+                    format!("{fn_name}() fill must be a single-character string, got empty string"),
+                ));
+            };
+            if chars.next().is_some() {
+                return Err(WispError::new(
+                    line,
+                    format!("{fn_name}() fill must be a single-character string"),
+                ));
+            }
+            ch
+        }
+        Some(other) => {
             return Err(WispError::new(
                 line,
-                format!("{fn_name}() expects two ints or two strings, found {} and {}", a.type_name(), b.type_name()),
+                format!(
+                    "{fn_name}() expects a string for fill, found {}",
+                    other.type_name()
+                ),
             ))
         }
     };
-    let pick_second = if fn_name == "min" { ordering.is_gt() } else { ordering.is_lt() };
-    Ok(args[usize::from(pick_second)].clone())
+    let char_count = text.chars().count();
+    let target_width = width as usize;
+    if target_width <= char_count {
+        return Ok(Value::Str(Rc::new(text)));
+    }
+    let pad_count = target_width - char_count;
+    let added_bytes = pad_count
+        .checked_mul(fill_ch.len_utf8())
+        .ok_or_else(|| string_too_long(fn_name, line))?;
+    let total_bytes = text
+        .len()
+        .checked_add(added_bytes)
+        .filter(|&n| n <= MAX_STR_LEN)
+        .ok_or_else(|| string_too_long(fn_name, line))?;
+
+    let mut out = String::new();
+    out.try_reserve_exact(total_bytes)
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    if pad_on_left {
+        for _ in 0..pad_count {
+            out.push(fill_ch);
+        }
+        out.push_str(&text);
+    } else {
+        out.push_str(&text);
+        for _ in 0..pad_count {
+            out.push(fill_ch);
+        }
+    }
+    Ok(Value::Str(Rc::new(out)))
+}
+
+fn builtin_radix(
+    args: &[Value],
+    line: u32,
+    fn_name: &str,
+    radix: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 1, fn_name, line)?;
+    let n = expect_int(&args[0], fn_name, "the number", line)?;
+    let mag = n.unsigned_abs();
+    let s = match (n < 0, radix) {
+        (false, 16) => format!("{mag:x}"),
+        (true, 16) => format!("-{mag:x}"),
+        (false, 2) => format!("{mag:b}"),
+        (true, 2) => format!("-{mag:b}"),
+        _ => unreachable!(),
+    };
+    Ok(Value::Str(Rc::new(s)))
+}
+
+fn builtin_fixed(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "fixed", line)?;
+    let n = expect_int(&args[0], "fixed", "value", line)?;
+    let scale = expect_int(&args[1], "fixed", "scale", line)?;
+    if scale <= 0 {
+        return Err(WispError::new(
+            line,
+            format!("fixed() scale must be a positive power of 10, got {scale}"),
+        ));
+    }
+    let mut s = scale;
+    let mut decimals = 0usize;
+    while s > 1 && s % 10 == 0 {
+        s /= 10;
+        decimals += 1;
+    }
+    if s != 1 {
+        return Err(WispError::new(
+            line,
+            format!("fixed() scale must be a power of 10 (1, 10, 100, ...), got {scale}"),
+        ));
+    }
+    let sign = if n < 0 { "-" } else { "" };
+    let mag = n.unsigned_abs();
+    let scale_u = scale as u64;
+    let whole = mag / scale_u;
+    let frac = mag % scale_u;
+    let out = if decimals == 0 {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{frac:0>width$}", width = decimals)
+    };
+    Ok(Value::Str(Rc::new(out)))
+}
+
+fn builtin_fmt(args: &[Value], line: u32) -> Result<Value, WispError> {
+    if args.is_empty() {
+        return Err(WispError::new(
+            line,
+            "fmt() expects at least 1 argument (the format template), got 0",
+        ));
+    }
+    let template = match &args[0] {
+        Value::Str(s) => s.as_str(),
+        other => {
+            return Err(WispError::new(
+                line,
+                format!(
+                    "fmt() expects a string template as its first argument, found {}",
+                    other.type_name()
+                ),
+            ))
+        }
+    };
+    let values = &args[1..];
+    let placeholder_count = template.matches("{}").count();
+    if placeholder_count != values.len() {
+        return Err(WispError::new(
+            line,
+            format!(
+                "fmt() template has {placeholder_count} '{{}}' placeholder(s), but {} argument(s) were given",
+                values.len()
+            ),
+        ));
+    }
+    let mut out = String::new();
+    let mut rest = template;
+    for val in values {
+        let Some((before, after)) = rest.split_once("{}") else {
+            break;
+        };
+        let rendered = match val {
+            Value::Str(s) => (**s).clone(),
+            other => other.try_display_string().ok_or_else(|| {
+                WispError::new(
+                    line,
+                    format!("fmt(): formatted argument exceeds {MAX_DISPLAY_LEN} bytes"),
+                )
+            })?,
+        };
+        let added = before
+            .len()
+            .checked_add(rendered.len())
+            .ok_or_else(|| string_too_long("fmt", line))?;
+        if out.len().saturating_add(added) > MAX_STR_LEN {
+            return Err(string_too_long("fmt", line));
+        }
+        out.try_reserve(added)
+            .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+        out.push_str(before);
+        out.push_str(&rendered);
+        rest = after;
+    }
+    if out.len().saturating_add(rest.len()) > MAX_STR_LEN {
+        return Err(string_too_long("fmt", line));
+    }
+    out.try_reserve(rest.len())
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    out.push_str(rest);
+    Ok(Value::Str(Rc::new(out)))
+}
+
+// ---- H2-7 & H2-8: integer & collection helpers -----------------------------
+
+fn builtin_divmod(
+    objects: &mut ObjectRegistry,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 2, "divmod", line)?;
+    let a = expect_int(&args[0], "divmod", "dividend", line)?;
+    let b = expect_int(&args[1], "divmod", "divisor", line)?;
+    if b == 0 {
+        return Err(WispError::new(line, "division by zero"));
+    }
+    let (Some(q), Some(r)) = (a.checked_div(b), a.checked_rem(b)) else {
+        return Err(WispError::new(
+            line,
+            format!("integer overflow in 'divmod({a}, {b})'"),
+        ));
+    };
+    Ok(objects.new_list(alloc::vec![Value::Int(q), Value::Int(r)]))
+}
+
+fn builtin_pow(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 2, "pow", line)?;
+    let base = expect_int(&args[0], "pow", "base", line)?;
+    let exp = expect_int(&args[1], "pow", "exponent", line)?;
+    if exp < 0 {
+        return Err(WispError::new(
+            line,
+            format!("pow() exponent must not be negative, got {exp}"),
+        ));
+    }
+    let res = match u32::try_from(exp) {
+        Ok(e) => base.checked_pow(e),
+        Err(_) => match base {
+            1 => Some(1),
+            0 => Some(0),
+            -1 => Some(if exp % 2 == 0 { 1 } else { -1 }),
+            _ => None,
+        },
+    };
+    res.map(Value::Int)
+        .ok_or_else(|| WispError::new(line, format!("integer overflow in 'pow({base}, {exp})'")))
+}
+
+fn builtin_isqrt(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "isqrt", line)?;
+    let n = expect_int(&args[0], "isqrt", "the number", line)?;
+    if n < 0 {
+        return Err(WispError::new(
+            line,
+            format!("isqrt() expects a non-negative int, got {n}"),
+        ));
+    }
+    Ok(Value::Int(n.isqrt()))
+}
+
+fn builtin_muldiv(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 3, "muldiv", line)?;
+    let a = expect_int(&args[0], "muldiv", "first factor", line)?;
+    let b = expect_int(&args[1], "muldiv", "second factor", line)?;
+    let c = expect_int(&args[2], "muldiv", "divisor", line)?;
+    if c == 0 {
+        return Err(WispError::new(line, "division by zero"));
+    }
+    let prod = i128::from(a) * i128::from(b);
+    let quot = prod / i128::from(c);
+    i64::try_from(quot)
+        .map(Value::Int)
+        .map_err(|_| WispError::new(line, format!("integer overflow in 'muldiv({a}, {b}, {c})'")))
+}
+
+fn builtin_sum(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "sum", line)?;
+    let list = expect_list(&args[0], "sum", line)?.borrow();
+    let mut total: i64 = 0;
+    for item in list.iter() {
+        let Value::Int(n) = item else {
+            return Err(WispError::new(
+                line,
+                format!("sum() expects a list of ints, found {} in list", item.type_name()),
+            ));
+        };
+        total = total
+            .checked_add(*n)
+            .ok_or_else(|| WispError::new(line, "integer overflow in 'sum()'"))?;
+    }
+    Ok(Value::Int(total))
+}
+
+fn builtin_enumerate(
+    objects: &mut ObjectRegistry,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 1, "enumerate", line)?;
+    let list = expect_list(&args[0], "enumerate", line)?;
+    let snapshot: Vec<Value> = {
+        let items = list.borrow();
+        let mut v = Vec::new();
+        v.try_reserve_exact(items.len())
+            .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+        v.extend(items.iter().cloned());
+        v
+    };
+    let mut pairs = Vec::new();
+    pairs
+        .try_reserve_exact(snapshot.len())
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    for (idx, item) in snapshot.into_iter().enumerate() {
+        let pair = objects.new_list(alloc::vec![Value::Int(idx as i64), item]);
+        pairs.push(pair);
+    }
+    Ok(objects.new_list(pairs))
+}
+
+fn builtin_last(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "last", line)?;
+    let list = expect_list(&args[0], "last", line)?.borrow();
+    list.last()
+        .cloned()
+        .ok_or_else(|| WispError::new(line, "last() called on an empty list"))
+}
+
+fn builtin_error(args: &[Value], line: u32) -> Result<Value, WispError> {
+    expect_arity(args, 1, "error", line)?;
+    let msg = match &args[0] {
+        Value::Str(s) => (**s).clone(),
+        other => other.try_display_string().ok_or_else(|| {
+            WispError::new(
+                line,
+                format!("error(): message exceeds {MAX_DISPLAY_LEN} bytes"),
+            )
+        })?,
+    };
+    Err(WispError::new(line, msg))
+}
+
+fn string_too_long(fn_name: &str, line: u32) -> WispError {
+    WispError::new(
+        line,
+        format!("{fn_name}(): result exceeds the {MAX_STR_LEN}-byte string limit"),
+    )
+}
+
+// ---- H3-6: sandboxed `file.<name>` builtins --------------------------------
+
+fn validate_file_name(name: &str, fn_name: &str, line: u32) -> Result<String, WispError> {
+    if name.is_empty() {
+        return Err(WispError::new(
+            line,
+            format!("{fn_name}() file name cannot be empty"),
+        ));
+    }
+    if name.len() > 27 {
+        return Err(WispError::new(
+            line,
+            format!(
+                "{fn_name}() file name can contain at most 27 bytes, got {}",
+                name.len()
+            ),
+        ));
+    }
+    if name.starts_with('.')
+        || name.ends_with('.')
+        || name.contains("..")
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+    {
+        return Err(WispError::new(
+            line,
+            format!(
+                "{fn_name}() invalid file name '{name}' (use letters, digits, '_', '-', and '.')"
+            ),
+        ));
+    }
+    Ok(String::from(name))
+}
+
+fn builtin_read_file(
+    host: &mut dyn Host,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 1, "read_file", line)?;
+    let raw_name = expect_str(&args[0], "read_file", "file name", line)?;
+    let name = validate_file_name(raw_name, "read_file", line)?;
+    match host.file_read(&name) {
+        Ok(Some(text)) => Ok(Value::Str(Rc::new(text))),
+        Ok(None) => Ok(Value::Nil),
+        Err(msg) => Err(WispError::new(line, format!("read_file(): {msg}"))),
+    }
+}
+
+fn builtin_write_file(
+    host: &mut dyn Host,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 2, "write_file", line)?;
+    let raw_name = expect_str(&args[0], "write_file", "file name", line)?;
+    let text = expect_str(&args[1], "write_file", "text", line)?;
+    let name = validate_file_name(raw_name, "write_file", line)?;
+    host.file_write(&name, text)
+        .map(|()| Value::Nil)
+        .map_err(|msg| WispError::new(line, format!("write_file(): {msg}")))
+}
+
+fn builtin_append_file(
+    host: &mut dyn Host,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 2, "append_file", line)?;
+    let raw_name = expect_str(&args[0], "append_file", "file name", line)?;
+    let text = expect_str(&args[1], "append_file", "text", line)?;
+    let name = validate_file_name(raw_name, "append_file", line)?;
+    host.file_append(&name, text)
+        .map(|()| Value::Nil)
+        .map_err(|msg| WispError::new(line, format!("append_file(): {msg}")))
+}
+
+fn builtin_list_files(
+    host: &mut dyn Host,
+    objects: &mut ObjectRegistry,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 0, "list_files", line)?;
+    let mut names = host
+        .file_list()
+        .map_err(|msg| WispError::new(line, format!("list_files(): {msg}")))?;
+    names.sort();
+    let mut out = Vec::new();
+    out.try_reserve_exact(names.len())
+        .map_err(|_| WispError::new(line, OUT_OF_MEMORY_MESSAGE))?;
+    for n in names {
+        out.push(Value::Str(Rc::new(n)));
+    }
+    Ok(objects.new_list(out))
+}
+
+fn builtin_delete_file(
+    host: &mut dyn Host,
+    args: &[Value],
+    line: u32,
+) -> Result<Value, WispError> {
+    expect_arity(args, 1, "delete_file", line)?;
+    let raw_name = expect_str(&args[0], "delete_file", "file name", line)?;
+    let name = validate_file_name(raw_name, "delete_file", line)?;
+    host.file_delete(&name)
+        .map(Value::Bool)
+        .map_err(|msg| WispError::new(line, format!("delete_file(): {msg}")))
 }

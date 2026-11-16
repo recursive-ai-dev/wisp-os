@@ -97,3 +97,32 @@ fn seeded_clipped_lines_and_rectangles_never_touch_canaries() {
         assert_eq!(*pixels.last().unwrap(), GUARD);
     }
 }
+
+#[test]
+fn scrollback_retains_scrolled_rows_and_restores_live_screen() {
+    // 2 cols x 2 rows console (16x32 pixels).
+    let mut pixels = vec![0u32; 16 * 32];
+    let mut console = unsafe {
+        Console::new(
+            pixels.as_mut_ptr().cast(),
+            16 * 32 * 4,
+            16,
+            32,
+            16,
+            PixelFormat::Bgr,
+        )
+        .unwrap()
+    };
+    console.write_str("AA\nBB\nCC");
+    let live_snapshot = pixels.clone();
+    assert!(!console.is_scrolled_back());
+
+    console.scrollback_page_up();
+    assert!(console.is_scrolled_back());
+    // Scrolled back view must differ from the live bottom view ("AA" vs "BB"/"CC").
+    assert_ne!(pixels, live_snapshot);
+
+    assert!(console.exit_scrollback());
+    assert!(!console.is_scrolled_back());
+    assert_eq!(pixels, live_snapshot);
+}

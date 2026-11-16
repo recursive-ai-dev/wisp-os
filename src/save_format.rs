@@ -147,6 +147,9 @@ const KEY_MAX_LEN: usize = 32;
 const STATE_FREE: u8 = 0;
 const STATE_LEGACY: u8 = 1;
 const STATE_COMMITTED: u8 = 2;
+const STATE_CHAIN_HEAD: u8 = 3;
+const STATE_CHAIN_DATA: u8 = 4;
+const CHAIN_NONE: u16 = 0xFFFF;
 
 /// Header field offsets within a slot (and so within its first sector).
 const OFF_KEY: usize = 1;
@@ -158,9 +161,21 @@ const LEGACY_HEADER_LEN: usize = OFF_GENERATION;
 /// state (1) + key (`KEY_MAX_LEN`) + value length (4) + checksum (4) +
 /// generation (8).
 const SLOT_HEADER_LEN: usize = OFF_GENERATION + 8;
-/// The most a single value's serialized encoding can occupy: whatever's
+/// Chained head header adds a 2-byte `first_data_slot` index after `generation`.
+const CHAIN_HEAD_HEADER_LEN: usize = SLOT_HEADER_LEN + 2;
+const CHAIN_HEAD_PAYLOAD_MAX: usize = SLOT_SIZE as usize - CHAIN_HEAD_HEADER_LEN;
+/// Chained data slot header: state (1) + head_generation (8) + chunk_index (2)
+/// + next_slot (2) + chunk_len (2) = 15 bytes.
+const CHAIN_DATA_HEADER_LEN: usize = 15;
+const CHAIN_DATA_PAYLOAD_MAX: usize = SLOT_SIZE as usize - CHAIN_DATA_HEADER_LEN;
+/// The most a single-slot value's serialized encoding can occupy: whatever's
 /// left in a slot after its fixed header.
 pub const VALUE_MAX_LEN: usize = SLOT_SIZE as usize - SLOT_HEADER_LEN;
+/// Maximum serialized length of a multi-slot chained value: 64 KiB payload
+/// plus 5-byte string tag/length header (at most 17 slots out of 64, ensuring
+/// copy-on-write updates of maximum-size values always have room to commit
+/// before retiring the previous chain).
+pub const MAX_CHAINED_VALUE_LEN: usize = 64 * 1024 + 5;
 /// The same for a version-1 copy, whose header is 8 bytes shorter.
 const LEGACY_VALUE_MAX_LEN: usize = SLOT_SIZE as usize - LEGACY_HEADER_LEN;
 
@@ -330,76 +345,92 @@ fn fnv1a32(parts: &[&[u8]]) -> u32 {
 /// [`VALUE_MAX_LEN`]. Checked *before* appending, so no encoding ever
 /// grows beyond one slot's capacity no matter how large the value's
 /// expansion would be.
-fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), &'static str> {
-    if bytes.len() > VALUE_MAX_LEN - out.len() {
+fn put_bounded(out: &mut Vec<u8>, bytes: &[u8], max_len: usize) -> Result<(), &'static str> {
+    if bytes.len() > max_len.saturating_sub(out.len()) {
         return Err("save_format: serialized value is too large to fit in one slot");
     }
+    out.try_reserve(bytes.len())
+        .map_err(|_| "save_format: out of memory preparing the value for saving")?;
     out.extend_from_slice(bytes);
     Ok(())
 }
 
 /// Serialize `value` into `out` using the type-tagged binary format this
-/// module's doc comment describes. `depth` guards against unbounded
-/// recursion on a self-referential or pathologically deep list, mirroring
-/// `wisp::value::Value`'s own `MAX_VALUE_DEPTH`-bounded structural
-/// operations; [`put`] bounds total work by the output budget, which a
-/// depth limit alone cannot (a shallow graph can share sublists
-/// exponentially).
-fn serialize_value(value: &Value, depth: u32, out: &mut Vec<u8>) -> Result<(), &'static str> {
+/// module's doc comment describes.
+fn serialize_value(
+    value: &Value,
+    depth: u32,
+    out: &mut Vec<u8>,
+    max_len: usize,
+) -> Result<(), &'static str> {
     if depth >= MAX_VALUE_DEPTH {
         return Err("save_format: value nesting is too deep to serialize");
     }
     match value {
-        Value::Nil => put(out, &[TAG_NIL])?,
+        Value::Nil => put_bounded(out, &[TAG_NIL], max_len)?,
         // A function is a name, meaningful only to the program that holds
         // it; stored, it would read back after a reboot as a reference to
         // whatever happens to carry that name then.
         Value::Func(_) | Value::Closure(_) => return Err("save_format: a function cannot be saved"),
-        Value::Bool(b) => put(out, &[TAG_BOOL, u8::from(*b)])?,
+        Value::Bool(b) => put_bounded(out, &[TAG_BOOL, u8::from(*b)], max_len)?,
         Value::Int(i) => {
-            put(out, &[TAG_INT])?;
-            put(out, &i.to_le_bytes())?;
+            put_bounded(out, &[TAG_INT], max_len)?;
+            put_bounded(out, &i.to_le_bytes(), max_len)?;
         }
         Value::Str(s) => {
             let bytes = s.as_bytes();
             let len =
                 u32::try_from(bytes.len()).map_err(|_| "save_format: string is too long to serialize")?;
-            put(out, &[TAG_STR])?;
-            put(out, &len.to_le_bytes())?;
-            put(out, bytes)?;
+            put_bounded(out, &[TAG_STR], max_len)?;
+            put_bounded(out, &len.to_le_bytes(), max_len)?;
+            put_bounded(out, bytes, max_len)?;
         }
         Value::List(items) => {
             let items = items.borrow();
             let count =
                 u32::try_from(items.len()).map_err(|_| "save_format: list is too long to serialize")?;
-            put(out, &[TAG_LIST])?;
-            put(out, &count.to_le_bytes())?;
+            put_bounded(out, &[TAG_LIST], max_len)?;
+            put_bounded(out, &count.to_le_bytes(), max_len)?;
             for item in items.iter() {
-                serialize_value(item, depth + 1, out)?;
+                serialize_value(item, depth + 1, out, max_len)?;
             }
         }
         Value::Map(entries) => {
             let entries = entries.borrow();
             let count =
                 u32::try_from(entries.len()).map_err(|_| "save_format: map is too large to serialize")?;
-            put(out, &[TAG_MAP])?;
-            put(out, &count.to_le_bytes())?;
+            put_bounded(out, &[TAG_MAP], max_len)?;
+            put_bounded(out, &count.to_le_bytes(), max_len)?;
             for (key, item) in entries.iter() {
-                serialize_value(&key.to_value(), depth + 1, out)?;
-                serialize_value(item, depth + 1, out)?;
+                serialize_value(&key.to_value(), depth + 1, out, max_len)?;
+                serialize_value(item, depth + 1, out, max_len)?;
             }
         }
     }
     Ok(())
 }
 
-/// Encode `value` for storage, failing (without allocating beyond one
-/// slot's worth) if it does not fit in [`VALUE_MAX_LEN`] bytes.
+/// Encode `value` for single-slot storage, failing (without allocating beyond
+/// one slot's worth) if it does not fit in [`VALUE_MAX_LEN`] bytes.
 pub fn encode(value: &Value) -> Result<Vec<u8>, &'static str> {
     let mut out = Vec::new();
     out.try_reserve_exact(VALUE_MAX_LEN)
         .map_err(|_| "save_format: out of memory preparing the value for saving")?;
-    serialize_value(value, 0, &mut out)?;
+    serialize_value(value, 0, &mut out, VALUE_MAX_LEN)?;
+    Ok(out)
+}
+
+/// Encode `value` for multi-slot chained storage (up to [`MAX_CHAINED_VALUE_LEN`]).
+pub fn encode_chained(value: &Value) -> Result<Vec<u8>, &'static str> {
+    let mut out = Vec::new();
+    serialize_value(value, 0, &mut out, MAX_CHAINED_VALUE_LEN)
+        .map_err(|e| {
+            if e == "save_format: serialized value is too large to fit in one slot" {
+                "save_format: serialized value exceeds the multi-slot store capacity"
+            } else {
+                e
+            }
+        })?;
     Ok(out)
 }
 
@@ -599,33 +630,51 @@ pub unsafe fn provision(hba: &Hba, total_sectors: u64) -> Result<(), &'static st
 }
 
 /// One slot's decoded header.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Header {
     /// A version-1 copy: generation 0, checksum over the value only.
     legacy: bool,
+    /// A version-3 multi-slot chain head (`STATE_CHAIN_HEAD`).
+    chained: bool,
+    first_data_slot: u16,
     key: [u8; KEY_MAX_LEN],
     len: usize,
     checksum: u32,
     generation: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ChainDataHeader {
+    head_generation: u64,
+    chunk_index: u16,
+    next_slot: u16,
+    chunk_len: u16,
+}
+
 impl Header {
-    /// Where the value starts in the slot, and the most it may hold.
+    /// Where the value starts in the slot, and the most a single slot holds.
     fn value_start_and_max(&self) -> (usize, usize) {
         if self.legacy {
             (LEGACY_HEADER_LEN, LEGACY_VALUE_MAX_LEN)
+        } else if self.chained {
+            (CHAIN_HEAD_HEADER_LEN, MAX_CHAINED_VALUE_LEN)
         } else {
             (SLOT_HEADER_LEN, VALUE_MAX_LEN)
         }
     }
 
-    /// The slot bytes the copy occupies, if its recorded length fits.
+    /// The slot bytes the copy occupies in the head slot, if its recorded length fits.
     fn used_len(&self) -> Result<usize, &'static str> {
         let (start, max) = self.value_start_and_max();
-        if self.len > max {
+        if self.len > max || (self.chained && self.len <= VALUE_MAX_LEN) {
             return Err(CORRUPT_LENGTH);
         }
-        Ok(start + self.len)
+        let inline = if self.chained {
+            self.len.min(CHAIN_HEAD_PAYLOAD_MAX)
+        } else {
+            self.len
+        };
+        Ok(start + inline)
     }
 
     fn key_string(&self) -> String {
@@ -639,6 +688,7 @@ impl Header {
 enum Slot {
     Free,
     Copy(Header),
+    ChainData(ChainDataHeader),
     /// A state byte this driver does not know. Only corruption produces
     /// one; the slot belongs to no key and is never written, so whatever
     /// it holds is left for a human to look at.
@@ -646,10 +696,27 @@ enum Slot {
 }
 
 fn parse_header(sector: &[u8; SECTOR]) -> Slot {
-    let legacy = match sector[0] {
+    let (legacy, chained) = match sector[0] {
         STATE_FREE => return Slot::Free,
-        STATE_LEGACY => true,
-        STATE_COMMITTED => false,
+        STATE_LEGACY => (true, false),
+        STATE_COMMITTED => (false, false),
+        STATE_CHAIN_HEAD => (false, true),
+        STATE_CHAIN_DATA => {
+            let head_generation =
+                u64::from_le_bytes(sector[1..9].try_into().expect("8 bytes"));
+            let chunk_index =
+                u16::from_le_bytes(sector[9..11].try_into().expect("2 bytes"));
+            let next_slot =
+                u16::from_le_bytes(sector[11..13].try_into().expect("2 bytes"));
+            let chunk_len =
+                u16::from_le_bytes(sector[13..15].try_into().expect("2 bytes"));
+            return Slot::ChainData(ChainDataHeader {
+                head_generation,
+                chunk_index,
+                next_slot,
+                chunk_len,
+            });
+        }
         _ => return Slot::Unknown,
     };
     let mut key = [0u8; KEY_MAX_LEN];
@@ -661,7 +728,20 @@ fn parse_header(sector: &[u8; SECTOR]) -> Slot {
     } else {
         u64::from_le_bytes(sector[OFF_GENERATION..SLOT_HEADER_LEN].try_into().expect("8 bytes"))
     };
-    Slot::Copy(Header { legacy, key, len, checksum, generation })
+    let first_data_slot = if chained {
+        u16::from_le_bytes(sector[SLOT_HEADER_LEN..CHAIN_HEAD_HEADER_LEN].try_into().expect("2 bytes"))
+    } else {
+        CHAIN_NONE
+    };
+    Slot::Copy(Header {
+        legacy,
+        chained,
+        first_data_slot,
+        key,
+        len,
+        checksum,
+        generation,
+    })
 }
 
 /// Every slot's header, read from the first sector of each: one sector per
@@ -715,6 +795,49 @@ impl Scan {
         self.slots.iter().position(|s| matches!(s, Slot::Free)).map(|i| i as u16)
     }
 
+    fn free_slots(&self, count: usize) -> Option<Vec<u16>> {
+        let mut out = Vec::with_capacity(count);
+        for (i, s) in self.slots.iter().enumerate() {
+            if matches!(s, Slot::Free) {
+                out.push(i as u16);
+                if out.len() == count {
+                    return Some(out);
+                }
+            }
+        }
+        None
+    }
+
+    fn has_chain_data(&self) -> bool {
+        self.slots.iter().any(|s| matches!(s, Slot::ChainData(_)))
+    }
+
+    /// Collect the continuation slot indices linked from `h.first_data_slot`
+    /// using the already-scanned headers when they match `h.generation`.
+    fn chain_slots_for(&self, h: &Header) -> Vec<u16> {
+        if !h.chained {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut cur = h.first_data_slot;
+        let mut expected_chunk = 0u16;
+        while cur != CHAIN_NONE && (cur as usize) < self.slots.len() && out.len() < self.slots.len() {
+            if out.contains(&cur) {
+                break;
+            }
+            if let Slot::ChainData(cd) = self.slots[cur as usize] {
+                if cd.head_generation == h.generation && cd.chunk_index == expected_chunk {
+                    out.push(cur);
+                    cur = cd.next_slot;
+                    expected_chunk = expected_chunk.saturating_add(1);
+                    continue;
+                }
+            }
+            break;
+        }
+        out
+    }
+
     fn occupied(&self) -> usize {
         self.slots.iter().filter(|s| !matches!(s, Slot::Free)).count()
     }
@@ -729,10 +852,10 @@ unsafe fn free_slot(hba: &Region<'_>, slot_index: u16) -> Result<(), &'static st
     unsafe { write_region_sector(hba, slot_lba(slot_index), &[0u8; SECTOR]) }
 }
 
-/// Validate winners before freeing their stale copies. A forged generation
-/// must never authorize deletion of the only intact copy. An explicit
-/// replacement can repair a corrupt winner, but retains that key's copies
-/// until the new value commits. Transport errors always propagate.
+/// Validate winners before freeing their stale copies or orphaned chain data
+/// slots. A forged generation must never authorize deletion of the only intact
+/// copy. An explicit replacement can repair a corrupt winner, but retains that
+/// key's copies until the new value commits. Transport errors always propagate.
 ///
 /// # Safety
 /// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
@@ -742,7 +865,8 @@ unsafe fn reclaim_stale(
     replacing: Option<&[u8; KEY_MAX_LEN]>,
 ) -> Result<(), &'static str> {
     let stale = scan.stale();
-    if stale.is_empty() {
+    let has_chain_data = scan.has_chain_data();
+    if stale.is_empty() && !has_chain_data {
         return Ok(());
     }
     let mut verified = [None; SLOT_COUNT as usize];
@@ -751,14 +875,14 @@ unsafe fn reclaim_stale(
         let Slot::Copy(header) = scan.slots[slot_index as usize] else {
             continue;
         };
-        let (winner, header) = scan.winner(&header.key)
+        let (winner, winner_header) = scan.winner(&header.key)
             .ok_or("save_format: internal error -- stale copy has no winner")?;
         let safe = match verified[winner as usize] {
             Some(safe) => safe,
             None => {
-                let safe = match unsafe { read_copy(hba, winner, &header) } {
+                let safe = match unsafe { read_copy(hba, winner, &winner_header) } {
                     Ok(_) => true,
-                    Err(CORRUPT_CHECKSUM | CORRUPT_LENGTH) if replacing == Some(&header.key) => false,
+                    Err(CORRUPT_CHECKSUM | CORRUPT_LENGTH) if replacing == Some(&winner_header.key) => false,
                     Err(error) => return Err(error),
                 };
                 verified[winner as usize] = Some(safe);
@@ -767,22 +891,84 @@ unsafe fn reclaim_stale(
         };
         if safe {
             reclaim.push(slot_index);
+            for data_slot in scan.chain_slots_for(&header) {
+                if !reclaim.contains(&data_slot) {
+                    reclaim.push(data_slot);
+                }
+            }
         }
     }
+
+    let mut reclaim_data = Vec::new();
+    if has_chain_data {
+        let mut active_chain_slots = [false; SLOT_COUNT as usize];
+        for index in 0..scan.slots.len() {
+            let Slot::Copy(h) = scan.slots[index] else {
+                continue;
+            };
+            if !h.chained {
+                continue;
+            }
+            let is_winner = scan.winner(&h.key).is_some_and(|(w, _)| w as usize == index);
+            if !is_winner {
+                if !reclaim.contains(&(index as u16)) {
+                    for s in scan.chain_slots_for(&h) {
+                        active_chain_slots[s as usize] = true;
+                    }
+                }
+                continue;
+            }
+            let safe = match verified[index] {
+                Some(safe) => safe,
+                None => {
+                    let safe = match unsafe { read_copy(hba, index as u16, &h) } {
+                        Ok(_) => true,
+                        Err(CORRUPT_CHECKSUM | CORRUPT_LENGTH) if replacing == Some(&h.key) => false,
+                        Err(error) => return Err(error),
+                    };
+                    verified[index] = Some(safe);
+                    safe
+                }
+            };
+            let _ = safe;
+            for s in scan.chain_slots_for(&h) {
+                active_chain_slots[s as usize] = true;
+            }
+        }
+        for (idx, slot) in scan.slots.iter().enumerate() {
+            if matches!(slot, Slot::ChainData(_)) && !active_chain_slots[idx] {
+                let slot_u16 = idx as u16;
+                if !reclaim.contains(&slot_u16) && !reclaim_data.contains(&slot_u16) {
+                    reclaim_data.push(slot_u16);
+                }
+            }
+        }
+    }
+
     // Finish every validation before the first write so a corrupt winner
     // discovered later cannot leave a partially reclaimed store.
-    if reclaim.is_empty() {
+    if reclaim.is_empty() && reclaim_data.is_empty() {
         return Ok(());
     }
-    for slot_index in reclaim {
-        unsafe { free_slot(hba, slot_index)? };
-        scan.slots[slot_index as usize] = Slot::Free;
+    if !reclaim.is_empty() {
+        for slot_index in reclaim {
+            unsafe { free_slot(hba, slot_index)? };
+            scan.slots[slot_index as usize] = Slot::Free;
+        }
+        unsafe { hba.flush_cache()? };
     }
-    unsafe { hba.flush_cache() }
+    if !reclaim_data.is_empty() {
+        for slot_index in reclaim_data {
+            unsafe { free_slot(hba, slot_index)? };
+            scan.slots[slot_index as usize] = Slot::Free;
+        }
+        unsafe { hba.flush_cache()? };
+    }
+    Ok(())
 }
 
 /// Read the sectors of `slot_index` that the copy described by `h` covers
-/// (the first sector, and as many more as its value needs) and verify its
+/// (including continuation slots when `h.chained` is true) and verify its
 /// checksum. Returns the value's bytes.
 ///
 /// # Safety
@@ -802,21 +988,86 @@ unsafe fn read_copy(hba: &Region<'_>, slot_index: u16, h: &Header) -> Result<Vec
     let Slot::Copy(now) = parse_header(raw[..SECTOR].try_into().expect("one sector")) else {
         return Err("save_format: slot changed while it was being read");
     };
-    if now.key != h.key || now.generation != h.generation || now.len != h.len || now.legacy != h.legacy {
+    if now != *h {
         return Err("save_format: slot changed while it was being read");
     }
     let (start, _) = h.value_start_and_max();
-    let checksum = if h.legacy {
-        fnv1a32(&[&raw[start..used]])
-    } else {
-        fnv1a32(&[&raw[..OFF_CHECKSUM], &raw[OFF_GENERATION..used]])
-    };
+    if !h.chained {
+        let checksum = if h.legacy {
+            fnv1a32(&[&raw[start..used]])
+        } else {
+            fnv1a32(&[&raw[..OFF_CHECKSUM], &raw[OFF_GENERATION..used]])
+        };
+        if checksum != h.checksum {
+            return Err(CORRUPT_CHECKSUM);
+        }
+        raw.truncate(used);
+        raw.drain(..start);
+        return Ok(raw);
+    }
+
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(h.len)
+        .map_err(|_| "save_format: out of memory reading a multi-slot value")?;
+    payload.extend_from_slice(&raw[start..used]);
+
+    let mut cur_slot = h.first_data_slot;
+    let mut expected_chunk = 0u16;
+    let mut visited = [false; SLOT_COUNT as usize];
+    visited[slot_index as usize] = true;
+
+    while cur_slot != CHAIN_NONE {
+        if cur_slot >= SLOT_COUNT || visited[cur_slot as usize] {
+            return Err(CORRUPT_LENGTH);
+        }
+        visited[cur_slot as usize] = true;
+
+        let mut sec0 = [0u8; SECTOR];
+        unsafe { read_region_sector(hba, slot_lba(cur_slot), &mut sec0)? };
+        let Slot::ChainData(cd) = parse_header(&sec0) else {
+            return Err(CORRUPT_CHECKSUM);
+        };
+        if cd.head_generation != h.generation || cd.chunk_index != expected_chunk {
+            return Err(CORRUPT_CHECKSUM);
+        }
+        let chunk_len = cd.chunk_len as usize;
+        if chunk_len == 0
+            || chunk_len > CHAIN_DATA_PAYLOAD_MAX
+            || payload.len().saturating_add(chunk_len) > h.len
+        {
+            return Err(CORRUPT_LENGTH);
+        }
+        let data_used = CHAIN_DATA_HEADER_LEN + chunk_len;
+        let sectors = data_used.div_ceil(SECTOR);
+        let mut slot_raw = [0u8; SLOT_SIZE as usize];
+        slot_raw[..SECTOR].copy_from_slice(&sec0);
+        for i in 1..sectors {
+            unsafe {
+                read_region_sector(
+                    hba,
+                    slot_lba(cur_slot) + i as u64,
+                    (&mut slot_raw[i * SECTOR..(i + 1) * SECTOR]).try_into().expect("one sector"),
+                )?;
+            }
+        }
+        payload.extend_from_slice(&slot_raw[CHAIN_DATA_HEADER_LEN..data_used]);
+        cur_slot = cd.next_slot;
+        expected_chunk = expected_chunk.saturating_add(1);
+    }
+
+    if payload.len() != h.len {
+        return Err(CORRUPT_LENGTH);
+    }
+    let checksum = fnv1a32(&[
+        &raw[..OFF_CHECKSUM],
+        &raw[OFF_GENERATION..CHAIN_HEAD_HEADER_LEN],
+        &payload,
+    ]);
     if checksum != h.checksum {
         return Err(CORRUPT_CHECKSUM);
     }
-    raw.truncate(used);
-    raw.drain(..start);
-    Ok(raw)
+    Ok(payload)
 }
 
 /// Write a complete copy of `key` = `encoded` at `generation` into the free
@@ -857,6 +1108,89 @@ unsafe fn write_copy(
     }
     unsafe {
         write_region_sector(hba, base, &sector_at(0))?;
+        hba.flush_cache()
+    }
+}
+
+/// Write a multi-slot copy of `key` = `encoded` (`encoded.len() > VALUE_MAX_LEN`)
+/// at `generation` across `head_slot` and `data_slots` in crash-atomic order:
+/// 1. Write all `STATE_CHAIN_DATA` continuation slots (`data_slots`) and
+///    sectors `1..8` of `head_slot`, then `flush_cache()`. Until `head_slot`
+///    sector `0` is written, `head_slot` remains `STATE_FREE` and the
+///    continuation slots are unreferenced orphans (reclaimed on recovery).
+/// 2. Write sector `0` of `head_slot` (`STATE_CHAIN_HEAD = 3`, whole-chain
+///    checksum, `generation`, `first_data_slot`), then `flush_cache()`.
+///
+/// # Safety
+/// Same contract as [`Hba::write_sector`]/[`Hba::flush_cache`].
+unsafe fn write_chained_copy(
+    hba: &Region<'_>,
+    head_slot: u16,
+    data_slots: &[u16],
+    key: &str,
+    encoded: &[u8],
+    generation: u64,
+) -> Result<(), &'static str> {
+    if encoded.len() <= VALUE_MAX_LEN || data_slots.is_empty() {
+        return Err("save_format: internal error -- invalid multi-slot write parameters");
+    }
+    let rem = &encoded[CHAIN_HEAD_PAYLOAD_MAX..];
+    for (chunk_idx, &data_slot) in data_slots.iter().enumerate() {
+        let start = chunk_idx * CHAIN_DATA_PAYLOAD_MAX;
+        let end = ((chunk_idx + 1) * CHAIN_DATA_PAYLOAD_MAX).min(rem.len());
+        let chunk = &rem[start..end];
+        let next_slot = if chunk_idx + 1 < data_slots.len() {
+            data_slots[chunk_idx + 1]
+        } else {
+            CHAIN_NONE
+        };
+        let mut slot_raw = [0u8; SLOT_SIZE as usize];
+        slot_raw[0] = STATE_CHAIN_DATA;
+        slot_raw[1..9].copy_from_slice(&generation.to_le_bytes());
+        slot_raw[9..11].copy_from_slice(&(chunk_idx as u16).to_le_bytes());
+        slot_raw[11..13].copy_from_slice(&next_slot.to_le_bytes());
+        slot_raw[13..15].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+        let used = CHAIN_DATA_HEADER_LEN + chunk.len();
+        slot_raw[CHAIN_DATA_HEADER_LEN..used].copy_from_slice(chunk);
+
+        let sectors = used.div_ceil(SECTOR);
+        let base = slot_lba(data_slot);
+        for i in 0..sectors {
+            let sec: [u8; SECTOR] = slot_raw[i * SECTOR..(i + 1) * SECTOR]
+                .try_into()
+                .expect("one sector");
+            unsafe { write_region_sector(hba, base + i as u64, &sec)? };
+        }
+    }
+
+    let mut head_raw = [0u8; SLOT_SIZE as usize];
+    head_raw[0] = STATE_CHAIN_HEAD;
+    head_raw[OFF_KEY..OFF_LEN].copy_from_slice(&key_field(key));
+    head_raw[OFF_LEN..OFF_CHECKSUM].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+    head_raw[OFF_GENERATION..SLOT_HEADER_LEN].copy_from_slice(&generation.to_le_bytes());
+    head_raw[SLOT_HEADER_LEN..CHAIN_HEAD_HEADER_LEN]
+        .copy_from_slice(&data_slots[0].to_le_bytes());
+    head_raw[CHAIN_HEAD_HEADER_LEN..]
+        .copy_from_slice(&encoded[..CHAIN_HEAD_PAYLOAD_MAX]);
+    let checksum = fnv1a32(&[
+        &head_raw[..OFF_CHECKSUM],
+        &head_raw[OFF_GENERATION..CHAIN_HEAD_HEADER_LEN],
+        encoded,
+    ]);
+    head_raw[OFF_CHECKSUM..OFF_GENERATION].copy_from_slice(&checksum.to_le_bytes());
+
+    let head_base = slot_lba(head_slot);
+    for i in 1..(SECTORS_PER_SLOT as usize) {
+        let sec: [u8; SECTOR] = head_raw[i * SECTOR..(i + 1) * SECTOR]
+            .try_into()
+            .expect("one sector");
+        unsafe { write_region_sector(hba, head_base + i as u64, &sec)? };
+    }
+    unsafe { hba.flush_cache()? };
+
+    let sec0: [u8; SECTOR] = head_raw[..SECTOR].try_into().expect("one sector");
+    unsafe {
+        write_region_sector(hba, head_base, &sec0)?;
         hba.flush_cache()
     }
 }
@@ -945,21 +1279,110 @@ unsafe fn save_in(hba: &Region<'_>, key: &str, value: &Value) -> Result<(), &'st
         // Include any copies preserved while explicitly replacing a corrupt
         // winner. The new target was free in this scan and cannot be retired.
         let _ = (|| -> Result<(), &'static str> {
+            let mut data_to_free = Vec::new();
             for (slot, copy) in scan.slots.iter().enumerate() {
-                if matches!(copy, Slot::Copy(header) if header.key == field) {
-                    unsafe { free_slot(hba, slot as u16)? };
+                if let Slot::Copy(header) = copy {
+                    if header.key == field {
+                        unsafe { free_slot(hba, slot as u16)? };
+                        if header.chained {
+                            data_to_free.extend(scan.chain_slots_for(header));
+                        }
+                    }
                 }
             }
-            unsafe { hba.flush_cache() }
+            unsafe { hba.flush_cache()? };
+            if !data_to_free.is_empty() {
+                for data_slot in data_to_free {
+                    unsafe { free_slot(hba, data_slot)? };
+                }
+                unsafe { hba.flush_cache()? };
+            }
+            Ok(())
         })();
     }
     Ok(())
 }
 
-/// Delete `key`, freeing its slot. `Ok(true)` if it was stored, `Ok(false)`
-/// if there was nothing to delete. Crash-atomic in the same sense as
-/// [`save`]: stale copies are freed and flushed first, so a crash leaves
-/// either the current value or nothing -- never an older generation.
+/// Store `value` under `key`, allowing multi-slot chained storage up to
+/// [`MAX_CHAINED_VALUE_LEN`] bytes (`STATE_CHAIN_HEAD` + `STATE_CHAIN_DATA`)
+/// when the encoded value exceeds [`VALUE_MAX_LEN`], or single-slot
+/// `STATE_COMMITTED` when it fits in one slot.
+///
+/// # Safety
+/// Same contract as [`save_in`].
+unsafe fn save_chained_in(
+    hba: &Region<'_>,
+    key: &str,
+    value: &Value,
+) -> Result<(), &'static str> {
+    validate_key(key)?;
+    if matches!(value, Value::Nil) {
+        return unsafe { delete_in(hba, key) }.map(|_| ());
+    }
+    let encoded = encode_chained(value)?;
+    if encoded.len() <= VALUE_MAX_LEN {
+        return unsafe { save_in(hba, key, value) };
+    }
+    let field = key_field(key);
+    let mut scan = unsafe { Scan::read(hba)? };
+    unsafe { reclaim_stale(hba, &mut scan, Some(&field))? };
+
+    let old = scan.winner(&field);
+    if old.is_none() && scan.occupied() >= MAX_KEYS {
+        return Err("save_format: the save disk is full (63 keys is the limit) -- delete a key first");
+    }
+    let rem_len = encoded.len() - CHAIN_HEAD_PAYLOAD_MAX;
+    let data_slots_needed = rem_len.div_ceil(CHAIN_DATA_PAYLOAD_MAX);
+    let total_slots_needed = 1 + data_slots_needed;
+    let Some(free) = scan.free_slots(total_slots_needed) else {
+        return Err("save_format: not enough free slots on the save disk for this multi-slot value -- delete a key first");
+    };
+    let head_slot = free[0];
+    let data_slots = &free[1..];
+    let generation = match old {
+        Some((_, h)) => h
+            .generation
+            .checked_add(1)
+            .ok_or("save_format: corrupt slot -- generation counter exhausted")?,
+        None => 1,
+    };
+
+    unsafe {
+        ensure_current_version(hba)?;
+        write_chained_copy(hba, head_slot, data_slots, key, &encoded, generation)?;
+    }
+
+    if old.is_some() {
+        let _ = (|| -> Result<(), &'static str> {
+            let mut data_to_free = Vec::new();
+            for (slot, copy) in scan.slots.iter().enumerate() {
+                if let Slot::Copy(header) = copy {
+                    if header.key == field {
+                        unsafe { free_slot(hba, slot as u16)? };
+                        if header.chained {
+                            data_to_free.extend(scan.chain_slots_for(header));
+                        }
+                    }
+                }
+            }
+            unsafe { hba.flush_cache()? };
+            if !data_to_free.is_empty() {
+                for data_slot in data_to_free {
+                    unsafe { free_slot(hba, data_slot)? };
+                }
+                unsafe { hba.flush_cache()? };
+            }
+            Ok(())
+        })();
+    }
+    Ok(())
+}
+
+/// Delete `key`, freeing its slot (and any chained continuation slots).
+/// `Ok(true)` if it was stored, `Ok(false)` if there was nothing to delete.
+/// Crash-atomic in the same sense as [`save`]: stale copies are freed and
+/// flushed first, so a crash leaves either the current value or nothing --
+/// never an older generation.
 ///
 /// # Safety
 /// Same contract as [`save`].
@@ -969,10 +1392,16 @@ unsafe fn delete_in(hba: &Region<'_>, key: &str) -> Result<bool, &'static str> {
     unsafe { reclaim_stale(hba, &mut scan, None)? };
     match scan.winner(&key_field(key)) {
         None => Ok(false),
-        Some((slot_index, _)) => {
+        Some((slot_index, header)) => {
             unsafe {
                 free_slot(hba, slot_index)?;
                 hba.flush_cache()?;
+                if header.chained {
+                    for data_slot in scan.chain_slots_for(&header) {
+                        free_slot(hba, data_slot)?;
+                    }
+                    hba.flush_cache()?;
+                }
             }
             Ok(true)
         }
@@ -1032,6 +1461,15 @@ unsafe fn keys_in(hba: &Region<'_>) -> Result<Vec<(String, usize)>, &'static str
 /// The HBA must be identified and the selected region must have been mounted.
 pub unsafe fn save(hba: &Hba, key: &str, value: &Value) -> Result<(), &'static str> {
     unsafe { save_in(&Region::identified(hba)?, key, value) }
+}
+
+/// Store a value (up to [`MAX_CHAINED_VALUE_LEN`] bytes, using multi-slot
+/// chaining when needed) in the discovered raw store or WISP GPT save partition.
+///
+/// # Safety
+/// Same contract as [`save`].
+pub unsafe fn save_chained(hba: &Hba, key: &str, value: &Value) -> Result<(), &'static str> {
+    unsafe { save_chained_in(&Region::identified(hba)?, key, value) }
 }
 
 /// Delete a saved value from the discovered store.
@@ -1114,6 +1552,13 @@ impl SaveDisk {
         // SAFETY: the native driver was initialized and identified, and
         // `mounted` proves a valid superblock -- `save`'s contract.
         unsafe { save(&self.hba, key, value) }
+    }
+
+    /// [`save_chained`] against this disk, if it is mounted.
+    pub fn save_chained(&self, key: &str, value: &Value) -> Result<(), &'static str> {
+        self.usable()?;
+        // SAFETY: same reasoning as `SaveDisk::save`.
+        unsafe { save_chained(&self.hba, key, value) }
     }
 
     /// [`load`] against this disk, if it is mounted.

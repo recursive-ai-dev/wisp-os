@@ -43,6 +43,11 @@ pub enum Tok {
     Star,
     Slash,
     Percent,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
     EqEq,
     NotEq,
     Lt,
@@ -68,6 +73,7 @@ pub enum Tok {
 pub struct Token {
     pub tok: Tok,
     pub line: u32,
+    pub col: u32,
 }
 
 fn keyword(ident: &str) -> Option<Tok> {
@@ -100,19 +106,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut line = 1u32;
+    let mut line_start = 0usize;
     let mut tokens = Vec::new();
 
     // Skip UTF-8 BOM if present (0xEF 0xBB 0xBF)
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         i = 3;
+        line_start = 3;
     }
 
     while i < bytes.len() {
         let c = bytes[i];
+        let col = (i.saturating_sub(line_start) + 1) as u32;
 
         if !matches!(c, b' ' | b'\t' | b'\r' | b'\n' | b'#') {
             if tokens.len() >= MAX_TOKENS - 1 {
-                return Err(WispError::new(line, "program has too many tokens (limit is 32768 including EOF)"));
+                return Err(WispError::new(line, "program has too many tokens (limit is 32768 including EOF)").with_col(col));
             }
             // Keep room for both this token and EOF. Vec's geometric
             // growth stays within MAX_TOKENS (a power of two).
@@ -126,6 +135,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
             b'\n' => {
                 line += 1;
                 i += 1;
+                line_start = i;
             }
             b'#' => {
                 while i < bytes.len() && bytes[i] != b'\n' {
@@ -145,10 +155,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 let text = core::str::from_utf8(&bytes[start..i]).unwrap();
                 let value: i64 = text
                     .parse()
-                    .map_err(|_| WispError::new(line, "integer literal out of range"))?;
+                    .map_err(|_| WispError::new(line, "integer literal out of range").with_col(col))?;
                 tokens.push(Token {
                     tok: Tok::Int(value),
                     line,
+                    col,
                 });
             }
             b'"' => {
@@ -156,7 +167,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 let mut s = String::new();
                 loop {
                     if i >= bytes.len() {
-                        return Err(WispError::new(line, "unterminated string literal"));
+                        return Err(WispError::new(line, "unterminated string literal").with_col(col));
                     }
                     match bytes[i] {
                         b'"' => {
@@ -167,12 +178,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                             return Err(WispError::new(
                                 line,
                                 "unterminated string literal (newline before closing '\"')",
-                            ));
+                            ).with_col(col));
                         }
                         b'\\' => {
                             i += 1;
                             if i >= bytes.len() {
-                                return Err(WispError::new(line, "unterminated string literal"));
+                                return Err(WispError::new(line, "unterminated string literal").with_col(col));
                             }
                             let escaped = match bytes[i] {
                                 b'"' => '"',
@@ -186,7 +197,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                                             "unknown escape sequence '\\{}'",
                                             other as char
                                         ),
-                                    ));
+                                    ).with_col((i.saturating_sub(line_start)) as u32));
                                 }
                             };
                             s.push(escaped);
@@ -216,6 +227,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 tokens.push(Token {
                     tok: Tok::Str(Rc::new(s)),
                     line,
+                    col,
                 });
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
@@ -227,35 +239,62 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 }
                 let text = core::str::from_utf8(&bytes[start..i]).unwrap();
                 let tok = keyword(text).unwrap_or_else(|| Tok::Ident(Rc::new(text.into())));
-                tokens.push(Token { tok, line });
+                tokens.push(Token { tok, line, col });
             }
             b'+' => {
-                tokens.push(Token { tok: Tok::Plus, line });
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token { tok: Tok::PlusEq, line, col });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Plus, line, col });
+                    i += 1;
+                }
             }
             b'-' => {
-                tokens.push(Token { tok: Tok::Minus, line });
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token { tok: Tok::MinusEq, line, col });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Minus, line, col });
+                    i += 1;
+                }
             }
             b'*' => {
-                tokens.push(Token { tok: Tok::Star, line });
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token { tok: Tok::StarEq, line, col });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Star, line, col });
+                    i += 1;
+                }
             }
             b'/' => {
-                tokens.push(Token { tok: Tok::Slash, line });
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token { tok: Tok::SlashEq, line, col });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Slash, line, col });
+                    i += 1;
+                }
             }
             b'%' => {
-                tokens.push(Token {
-                    tok: Tok::Percent,
-                    line,
-                });
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token { tok: Tok::PercentEq, line, col });
+                    i += 2;
+                } else {
+                    tokens.push(Token {
+                        tok: Tok::Percent,
+                        line,
+                        col,
+                    });
+                    i += 1;
+                }
             }
             b'(' => {
                 tokens.push(Token {
                     tok: Tok::LParen,
                     line,
+                    col,
                 });
                 i += 1;
             }
@@ -263,6 +302,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 tokens.push(Token {
                     tok: Tok::RParen,
                     line,
+                    col,
                 });
                 i += 1;
             }
@@ -270,6 +310,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 tokens.push(Token {
                     tok: Tok::LBrace,
                     line,
+                    col,
                 });
                 i += 1;
             }
@@ -277,6 +318,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 tokens.push(Token {
                     tok: Tok::RBrace,
                     line,
+                    col,
                 });
                 i += 1;
             }
@@ -284,6 +326,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 tokens.push(Token {
                     tok: Tok::LBracket,
                     line,
+                    col,
                 });
                 i += 1;
             }
@@ -291,56 +334,57 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 tokens.push(Token {
                     tok: Tok::RBracket,
                     line,
+                    col,
                 });
                 i += 1;
             }
             b',' => {
-                tokens.push(Token { tok: Tok::Comma, line });
+                tokens.push(Token { tok: Tok::Comma, line, col });
                 i += 1;
             }
             b';' => {
-                tokens.push(Token { tok: Tok::Semi, line });
+                tokens.push(Token { tok: Tok::Semi, line, col });
                 i += 1;
             }
             b':' => {
-                tokens.push(Token { tok: Tok::Colon, line });
+                tokens.push(Token { tok: Tok::Colon, line, col });
                 i += 1;
             }
             b'=' => {
                 if bytes.get(i + 1) == Some(&b'=') {
-                    tokens.push(Token { tok: Tok::EqEq, line });
+                    tokens.push(Token { tok: Tok::EqEq, line, col });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Eq, line });
+                    tokens.push(Token { tok: Tok::Eq, line, col });
                     i += 1;
                 }
             }
             b'!' => {
                 if bytes.get(i + 1) == Some(&b'=') {
-                    tokens.push(Token { tok: Tok::NotEq, line });
+                    tokens.push(Token { tok: Tok::NotEq, line, col });
                     i += 2;
                 } else {
                     return Err(WispError::new(
                         line,
                         "unexpected '!' (did you mean 'not'?)",
-                    ));
+                    ).with_col(col));
                 }
             }
             b'<' => {
                 if bytes.get(i + 1) == Some(&b'=') {
-                    tokens.push(Token { tok: Tok::Le, line });
+                    tokens.push(Token { tok: Tok::Le, line, col });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Lt, line });
+                    tokens.push(Token { tok: Tok::Lt, line, col });
                     i += 1;
                 }
             }
             b'>' => {
                 if bytes.get(i + 1) == Some(&b'=') {
-                    tokens.push(Token { tok: Tok::Ge, line });
+                    tokens.push(Token { tok: Tok::Ge, line, col });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Gt, line });
+                    tokens.push(Token { tok: Tok::Gt, line, col });
                     i += 1;
                 }
             }
@@ -348,15 +392,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, WispError> {
                 return Err(WispError::new(
                     line,
                     alloc::format!("unexpected character '{}'", other as char),
-                ));
+                ).with_col(col));
             }
         }
     }
 
+    let eof_col = (i.saturating_sub(line_start) + 1) as u32;
     tokens.try_reserve(1).map_err(|_| WispError::new(line, super::interp::OUT_OF_MEMORY_MESSAGE))?;
     tokens.push(Token {
         tok: Tok::Eof,
         line,
+        col: eof_col,
     });
     Ok(tokens)
 }

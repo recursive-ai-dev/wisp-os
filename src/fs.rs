@@ -8,12 +8,36 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use uefi::proto::media::file::{Directory, File, FileAttribute, FileInfo, FileMode, RegularFile};
 use uefi::table::boot::BootServices;
 use uefi::{CString16, Error, Handle, Result, Status};
 
-use crate::debugcon;
+use crate::{debugcon, sync};
+
+static SKIPPED_APPS: AtomicUsize = AtomicUsize::new(0);
+static SNAPSHOTTED_LIBS: sync::Locked<Vec<(String, String)>> = sync::Locked::new(Vec::new());
+
+/// Number of `APPS/*.wisp` entries skipped during the boot-time snapshot
+/// (logged in detail to `dmesg`).
+pub fn skipped_apps_count() -> usize {
+    SKIPPED_APPS.load(Ordering::Relaxed)
+}
+
+/// Look up a `LIB/<name>.wisp` module source snapshotted from the boot volume.
+pub fn find_lib_source(name: &str) -> Option<String> {
+    let target = if name.ends_with(".wisp") {
+        String::from(name)
+    } else {
+        format!("{name}.wisp")
+    };
+    SNAPSHOTTED_LIBS.with(|libs| {
+        libs.iter()
+            .find(|(file, _)| file.eq_ignore_ascii_case(&target))
+            .map(|(_, src)| src.clone())
+    })
+}
 
 /// Largest single `.wisp` source admitted into the snapshot. Comfortably
 /// above any real program (the bundled ones are a few KiB) and small
@@ -109,6 +133,7 @@ pub fn read_file_to_bytes(bs: &BootServices, image: Handle, path: &str, max_byte
 /// if `APPS` itself can't be opened at all, since a shell with no
 /// installed programs is still a working shell.
 pub fn snapshot_apps(bs: &BootServices, image: Handle) -> Vec<(String, String)> {
+    SKIPPED_APPS.store(0, Ordering::Relaxed);
     // List filenames first, then drop every directory/filesystem handle
     // before reading any file contents. `read_file_to_string` below opens
     // its own fresh `SimpleFileSystem`/`Directory` for each file -- if the
@@ -119,7 +144,7 @@ pub fn snapshot_apps(bs: &BootServices, image: Handle) -> Vec<(String, String)> 
     // and reading files only after every listing handle has gone out of
     // scope avoids ever having two opens of the same protocol instance
     // alive at once.
-    let names = list_wisp_filenames(bs, image);
+    let names = list_wisp_filenames_in_dir(bs, image, "APPS", true);
 
     let mut apps = Vec::with_capacity(names.len());
     let mut used = 0usize;
@@ -133,6 +158,7 @@ pub fn snapshot_apps(bs: &BootServices, image: Handle) -> Vec<(String, String)> 
                 apps.push((name, source));
             }
             Err(e) => {
+                SKIPPED_APPS.fetch_add(1, Ordering::Relaxed);
                 let _ = debugcon::write_fmt(format_args!(
                     "\n[fs] snapshot_apps: skipping APPS/{name}: {:?}{}\n",
                     e.status(),
@@ -145,48 +171,85 @@ pub fn snapshot_apps(bs: &BootServices, image: Handle) -> Vec<(String, String)> 
             }
         }
     }
+
+    let lib_names = list_wisp_filenames_in_dir(bs, image, "LIB", false);
+    let mut libs = Vec::with_capacity(lib_names.len());
+    for name in lib_names {
+        let remaining = MAX_APPS_TOTAL_BYTES.saturating_sub(used + name.len());
+        let limit = remaining.min(MAX_APP_SOURCE_BYTES);
+        let path = format!("LIB/{name}");
+        match read_file_to_string(bs, image, &path, limit) {
+            Ok(source) => {
+                used += name.len() + source.len();
+                libs.push((name, source));
+            }
+            Err(e) => {
+                let _ = debugcon::write_fmt(format_args!(
+                    "\n[fs] snapshot_apps: skipping LIB/{name}: {:?}\n",
+                    e.status(),
+                ));
+            }
+        }
+    }
+    SNAPSHOTTED_LIBS.with(|slot| *slot = libs);
+
     apps
 }
 
-/// List every `*.wisp` filename directly under `APPS` on the boot volume.
+/// List every `*.wisp` filename directly under `dir_name` on the boot volume.
 /// Every filesystem handle this opens is dropped before returning, by
 /// construction (they're all local to this function), so the caller is
 /// free to open the filesystem again immediately afterward.
-fn list_wisp_filenames(bs: &BootServices, image: Handle) -> Vec<String> {
+fn list_wisp_filenames_in_dir(
+    bs: &BootServices,
+    image: Handle,
+    dir_name: &str,
+    count_skips: bool,
+) -> Vec<String> {
     let mut names = Vec::new();
 
     let mut fs = match bs.get_image_file_system(image) {
         Ok(fs) => fs,
         Err(e) => {
-            log_snapshot_error("get_image_file_system", e.status());
+            if count_skips {
+                log_snapshot_error("get_image_file_system", e.status());
+            }
             return names;
         }
     };
     let mut root: Directory = match fs.open_volume() {
         Ok(root) => root,
         Err(e) => {
-            log_snapshot_error("open_volume", e.status());
+            if count_skips {
+                log_snapshot_error("open_volume", e.status());
+            }
             return names;
         }
     };
-    let apps_path = match make_path("APPS") {
+    let dir_path = match make_path(dir_name) {
         Ok(p) => p,
         Err(e) => {
-            log_snapshot_error("make_path(APPS)", e.status());
+            if count_skips {
+                log_snapshot_error("make_path", e.status());
+            }
             return names;
         }
     };
-    let apps_handle = match root.open(&apps_path, FileMode::Read, FileAttribute::empty()) {
+    let dir_handle = match root.open(&dir_path, FileMode::Read, FileAttribute::empty()) {
         Ok(h) => h,
         Err(e) => {
-            log_snapshot_error("open(APPS)", e.status());
+            if count_skips {
+                log_snapshot_error("open(APPS)", e.status());
+            }
             return names;
         }
     };
-    let mut apps_dir = match apps_handle.into_directory() {
+    let mut apps_dir = match dir_handle.into_directory() {
         Some(d) => d,
         None => {
-            debugcon::write_str("\n[fs] snapshot_apps: APPS exists but is not a directory\n");
+            if count_skips {
+                debugcon::write_str("\n[fs] snapshot_apps: APPS exists but is not a directory\n");
+            }
             return names;
         }
     };
@@ -196,7 +259,9 @@ fn list_wisp_filenames(bs: &BootServices, image: Handle) -> Vec<String> {
             Ok(Some(entry)) => entry,
             Ok(None) => break,
             Err(e) => {
-                log_snapshot_error("read_entry_boxed", e.status());
+                if count_skips {
+                    log_snapshot_error("read_entry_boxed", e.status());
+                }
                 break;
             }
         };
@@ -208,6 +273,9 @@ fn list_wisp_filenames(bs: &BootServices, image: Handle) -> Vec<String> {
             continue;
         }
         if name.len() > MAX_APP_NAME_BYTES {
+            if count_skips {
+                SKIPPED_APPS.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = debugcon::write_fmt(format_args!(
                 "\n[fs] snapshot_apps: skipping a .wisp file with a {}-byte name (limit {MAX_APP_NAME_BYTES})\n",
                 name.len(),
@@ -215,6 +283,9 @@ fn list_wisp_filenames(bs: &BootServices, image: Handle) -> Vec<String> {
             continue;
         }
         if names.len() >= MAX_APP_COUNT {
+            if count_skips {
+                SKIPPED_APPS.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = debugcon::write_fmt(format_args!(
                 "\n[fs] snapshot_apps: more than {MAX_APP_COUNT} .wisp files; skipping {name} and any later ones\n",
             ));

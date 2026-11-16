@@ -229,6 +229,7 @@ impl Shell {
     /// shutdown -- there is no "return to firmware" path once Boot Services
     /// is gone.
     pub fn run(&mut self, console: &mut Console) -> ! {
+        self.load_saved_keymap();
         console.write_str(BANNER);
         // Boot-complete marker for the test harnesses: emitted exactly once,
         // after the banner is on screen and immediately before the first
@@ -238,12 +239,68 @@ impl Shell {
         // keystrokes when the host was busy running several VMs at once.
         crate::debugcon::write_str("[shell] ready\n");
 
+        self.run_autorun_if_configured(console);
+
         loop {
             self.print_prompt(console);
-            let line = read_line(console, LineMode::Prompt, Some(&mut self.history));
+            let programs = self.completable_program_names();
+            let line = read_shell_prompt_line(console, &mut self.history, &programs);
             console.newline();
             self.execute(line.trim(), console);
         }
+    }
+
+    fn load_saved_keymap(&self) {
+        let Some(disk) = self.save_disk.as_ref().filter(|d| d.is_mounted()) else {
+            return;
+        };
+        if let Ok(Some(Value::Str(name))) = disk.load("sys.keymap") {
+            if let Some(id) = crate::keymap::LayoutId::from_name(&name) {
+                crate::keymap::set_active(id);
+            }
+        }
+    }
+
+    fn run_autorun_if_configured(&mut self, console: &mut Console) {
+        let autorun_name = self
+            .save_disk
+            .as_ref()
+            .filter(|d| d.is_mounted())
+            .and_then(|d| d.load("sys.autorun").ok().flatten())
+            .and_then(|v| match v {
+                Value::Str(s) => {
+                    let trimmed = s.trim();
+                    (!trimmed.is_empty()).then(|| String::from(trimmed))
+                }
+                _ => None,
+            });
+        if let Some(name) = autorun_name {
+            let _ = writeln!(console, "Autorun (sys.autorun): {name}");
+            self.cmd_run(console, &name);
+        }
+    }
+
+    fn completable_program_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (file, _) in &self.apps {
+            let stem = file.strip_suffix(".wisp").unwrap_or(file.as_str());
+            out.push(String::from(stem));
+            out.push(file.clone());
+        }
+        if let Ok(saved) = crate::projects::list(self.save_disk.as_ref()) {
+            for name in saved {
+                let with_ext = format!("{name}.wisp");
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+                if !out.contains(&with_ext) {
+                    out.push(with_ext);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn print_prompt(&self, console: &mut Console) {
@@ -263,10 +320,15 @@ impl Shell {
         };
 
         match cmd {
-            "help" => self.cmd_help(console),
+            "help" => self.cmd_help(rest, console),
             "clear" => console.clear(),
             "echo" => self.cmd_echo(rest, console),
             "ls" => self.cmd_ls(rest, console),
+            "cat" => self.cmd_cat(rest, console),
+            "rm" => self.cmd_rm(rest, console),
+            "cp" => self.cmd_cp(rest, console),
+            "mv" => self.cmd_mv(rest, console),
+            "export" => self.cmd_export(rest, console),
             "run" => self.cmd_run(console, rest),
             "ide" | "edit" => {
                 if let Err(message) = crate::ide::run(console, &self.apps, &mut self.rng_state, self.save_disk.as_ref(), rest) {
@@ -277,6 +339,10 @@ impl Shell {
             }
             "wisp" => self.cmd_wisp(console),
             "uptime" => self.cmd_uptime(console),
+            "date" => self.cmd_date(console),
+            "dmesg" => self.cmd_dmesg(console),
+            "lspci" => self.cmd_lspci(console),
+            "keymap" => self.cmd_keymap(rest, console),
             "version" => self.cmd_version(console),
             "mem" => self.cmd_mem(console),
             "save" => self.cmd_save(rest, console),
@@ -286,6 +352,9 @@ impl Shell {
             "format" => self.cmd_format(console),
             "disks" => self.cmd_disks(console),
             "disk" => self.cmd_disk(rest, console),
+            "reboot" => self.cmd_reboot(console),
+            "poweroff" => self.cmd_poweroff(console),
+            "halt" => self.cmd_halt(console),
             // Hidden, feature-gated, never listed in `cmd_help`: exists
             // purely so `tests/fault_test.py` can prove the GDT/IDT/
             // fault-screen path built in this phase actually catches and
@@ -407,28 +476,67 @@ impl Shell {
         }
     }
 
-    fn cmd_help(&self, console: &mut Console) {
+    fn cmd_help(&self, rest: &str, console: &mut Console) {
+        let topic = rest.trim();
+        if !topic.is_empty() {
+            let detail = match topic {
+                "help" => "help [command] -- Show the command list or detailed usage for one command.",
+                "clear" => "clear -- Clear the framebuffer console.",
+                "echo" => "echo <text> -- Print <text> back to the screen.\n  Example: echo hello world",
+                "ls" => "ls [APPS|PROGRAMS] -- List bundled APPS and saved PROGRAMS with sizes and descriptions.",
+                "cat" => "cat <name> -- Print the WISP source of a saved program or bundled app.\n  Example: cat hello",
+                "rm" => "rm <name> -- Delete a saved program (prog.<name>) from the save disk.",
+                "cp" => "cp <src> <dst> -- Copy a saved program or bundled app to saved program prog.<dst>.",
+                "mv" => "mv <src> <dst> -- Rename saved program prog.<src> to prog.<dst>.",
+                "export" => "export <name> -- Emit a program's source framed with BEGIN/END markers to screen and serial.",
+                "run" => "run <name> -- Run a saved program (preferred) or bundled app.\n  Example: run hello",
+                "ide" | "edit" => "ide [name] (or edit [name]) -- Open Wisp Studio on <name> (default 'main').\n  Keys: F1 Help, F2 Save, F3 Open, F4 Search, F5 Run, F6 Check, F7 Line, F10/Esc Exit.",
+                "wisp" => "wisp -- Start the interactive WISP REPL ('vars' lists definitions, 'exit' leaves).",
+                "uptime" => "uptime -- Show elapsed time and timer ticks since boot.",
+                "date" => "date -- Show current wall-clock date/time (uses sys.tz minute offset if saved).",
+                "dmesg" => "dmesg -- Print the 32 KiB kernel diagnostic log ring.",
+                "lspci" => "lspci -- List discovered PCI and Intel VMD devices.",
+                "keymap" => "keymap [us|uk|de|fr|es|dvorak|colemak] -- Show or switch the active keyboard layout (persists in sys.keymap).",
+                "mem" => "mem -- Show kernel heap and physical frame allocator statistics.",
+                "version" => "version -- Show the kernel version, memory protections, and active clock.",
+                "save" => "save <key> <value> -- Crash-atomically save string <value> under <key>.",
+                "load" => "load <key> -- Load and print the value stored under <key>.",
+                "keys" => "keys -- List all keys stored on the selected save disk.",
+                "delete" => "delete <key> -- Delete <key> from the selected save disk.",
+                "disks" => "disks -- List discovered AHCI, NVMe and USB storage devices.",
+                "disk" => "disk <n> -- Select disk <n> for save/load operations without modifying it.",
+                "format" => "format -- Provision the selected disk for WISP saves (requires typing ERASE).",
+                "reboot" => "reboot -- Flush disk cache and cold-reset the machine.",
+                "poweroff" => "poweroff -- Flush disk cache and request firmware shutdown.",
+                "halt" => "halt -- Flush disk cache, disable interrupts, and halt the CPU.",
+                _ => {
+                    console.set_fg(gfx::ERROR);
+                    let _ = writeln!(console, "help: unknown command '{topic}'");
+                    console.set_fg(gfx::FOREGROUND);
+                    return;
+                }
+            };
+            let _ = writeln!(console, "{detail}");
+            return;
+        }
         console.write_str(
-            "Available commands:\n\
-             \x20\x20help          Show this list of commands\n\
-             \x20\x20clear         Clear the screen\n\
-             \x20\x20echo <text>   Print <text> back to the screen\n\
-             \x20\x20ls [APPS|PROGRAMS] List bundled apps and saved programs\n\
+            "Available commands (type 'help <cmd>' for details):\n\
+             \x20\x20help [cmd]    Show this list or help for one command\n\
+             \x20\x20clear / echo  Clear the screen / print text back\n\
+             \x20\x20ls / cat <n>  List APPS & PROGRAMS / print a program's source\n\
              \x20\x20run <name>    Run a saved program or bundled WISP app\n\
              \x20\x20ide [name]    Wisp Studio: edit, save, check and run ('edit' also works)\n\
              \x20\x20wisp          Interactive WISP prompt ('exit' to leave)\n\
-             \x20\x20uptime        Show elapsed time since boot (timer ticks)\n\
-             \x20\x20mem           Show heap and physical memory usage\n\
-             \x20\x20version       Show the kernel version and protections\n\
-             \x20\x20save <k> <v>  Save <v> under key <k> on the selected save disk\n\
-             \x20\x20load <k>      Print the value saved under key <k>\n\
-             \x20\x20keys          List every key on the save disk\n\
-             \x20\x20delete <k>    Delete key <k> from the save disk\n\
-             \x20\x20disks         List AHCI, NVMe and USB disks and the selected save disk\n\
-             \x20\x20disk <n>      Select a disk for save/load (does not format it)\n\
-             \x20\x20format        Set up the selected disk for saves (ERASES save region; asks)\n\
-             Press Esc to stop a running program. Arrows, Home, End and Delete edit\n\
-             a line; Up and Down recall earlier ones.\n",
+             \x20\x20uptime / date Show elapsed uptime or wall-clock date and time\n\
+             \x20\x20dmesg / lspci Print kernel boot log ring or PCI device inventory\n\
+             \x20\x20keymap [name] Show or switch keyboard layout (us/uk/de/fr/es/dvorak/colemak)\n\
+             \x20\x20mem / version Show memory usage or kernel version and protections\n\
+             \x20\x20save / load   save <k> <v> or load <k> on the selected save disk\n\
+             \x20\x20keys / delete List or delete keys on the save disk\n\
+             \x20\x20disks / disk  List disks or select disk <n>; 'format' initializes saves\n\
+             \x20\x20reboot / poweroff / halt  Restart, power off, or halt the machine\n\
+             Press Esc to stop a running program. Tab completes commands and apps;\n\
+             PageUp/PageDown scroll back; Arrows, Home, End, Delete and Up/Down edit.\n",
         );
     }
 
@@ -516,7 +624,12 @@ impl Shell {
         match disk.keys() {
             Ok(keys) => {
                 for (key, len) in &keys {
-                    let _ = write!(console, "     {key}  ({len} bytes)\n");
+                    let tag = if key.starts_with("sys.") {
+                        " [system]"
+                    } else {
+                        ""
+                    };
+                    let _ = write!(console, "     {key}  ({len} bytes){tag}\n");
                 }
                 let _ = write!(console, "{} of {} keys in use\n", keys.len(), save_format::MAX_KEYS);
             }
@@ -675,7 +788,11 @@ impl Shell {
         let mut count = 0;
         if normalized != "PROGRAMS" {
             for (name, source) in &self.apps {
-                let _ = writeln!(console, "     {name}  ({} bytes) [bundled]", source.len());
+                if let Some(desc) = extract_app_description(source, 42) {
+                    let _ = writeln!(console, "     {name}  ({} bytes) [bundled] -- {desc}", source.len());
+                } else {
+                    let _ = writeln!(console, "     {name}  ({} bytes) [bundled]", source.len());
+                }
                 count += 1;
             }
         }
@@ -696,6 +813,286 @@ impl Shell {
             }
         }
         if count == 0 { console.write_str("(empty)\n"); }
+        if normalized != "PROGRAMS" {
+            let skipped = crate::fs::skipped_apps_count();
+            if skipped > 0 {
+                let _ = writeln!(console, "({skipped} skipped: see dmesg)");
+            }
+        }
+    }
+
+    fn cmd_dmesg(&self, console: &mut Console) {
+        let mut last_was_newline = true;
+        crate::log::with_ring(|ring| {
+            let total = ring.total_written();
+            let retained = ring.len() as u64;
+            if total > retained {
+                let _ = writeln!(
+                    console,
+                    "[dmesg: showing last {} of {} bytes]",
+                    ring.len(),
+                    total
+                );
+            }
+            ring.visit_bytes(|chunk| {
+                for &b in chunk {
+                    match b {
+                        b'\n' => {
+                            console.newline();
+                            last_was_newline = true;
+                        }
+                        0x20..=0x7e => {
+                            let s = [b];
+                            if let Ok(ch) = core::str::from_utf8(&s) {
+                                console.write_str(ch);
+                            }
+                            last_was_newline = false;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        });
+        if !last_was_newline {
+            console.newline();
+        }
+    }
+
+    fn cmd_cat(&self, rest: &str, console: &mut Console) {
+        let name = rest.trim();
+        if name.is_empty() {
+            console.set_fg(gfx::ERROR);
+            console.write_str("cat: expected a program name, e.g. 'cat hello'\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        }
+        let source = match crate::projects::load_source(name, &self.apps, self.save_disk.as_ref()) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "cat: '{name}' not found in saved programs or bundled apps");
+                console.set_fg(gfx::FOREGROUND);
+                return;
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "cat: {msg}");
+                console.set_fg(gfx::FOREGROUND);
+                return;
+            }
+        };
+        let page_lines = crate::line_editor::Screen::rows(console).saturating_sub(2).max(1);
+        for (idx, line) in source.lines().enumerate() {
+            if idx > 0 && idx % page_lines == 0 {
+                console.set_fg(gfx::ACCENT);
+                console.write_str("-- more (Space/Enter: next page, q/Esc: quit) --");
+                console.set_fg(gfx::FOREGROUND);
+                let key = keyboard::wait_for_key();
+                console.newline();
+                if key == keyboard::ESC || key == b'q' || key == b'Q' {
+                    keyboard::clear_stop_request();
+                    break;
+                }
+            }
+            let _ = writeln!(console, "{line}");
+        }
+    }
+
+    fn cmd_rm(&mut self, rest: &str, console: &mut Console) {
+        let name = rest.trim();
+        if name.is_empty() {
+            console.set_fg(gfx::ERROR);
+            console.write_str("rm: expected a saved program name, e.g. 'rm demo'\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        }
+        match crate::projects::delete_source(name, self.save_disk.as_ref()) {
+            Ok(true) => {
+                if let Ok(norm) = crate::projects::normalize_name(name) {
+                    let _ = writeln!(console, "removed prog.{norm}");
+                }
+            }
+            Ok(false) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "rm: saved program '{name}' not found");
+                console.set_fg(gfx::FOREGROUND);
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "rm: {msg}");
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+    }
+
+    fn cmd_cp(&mut self, rest: &str, console: &mut Console) {
+        let mut parts = rest.split_whitespace();
+        let (Some(src), Some(dst), None) = (parts.next(), parts.next(), parts.next()) else {
+            console.set_fg(gfx::ERROR);
+            console.write_str("cp: expected 'cp <src> <dst>'\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        };
+        match crate::projects::copy_source(src, dst, &self.apps, self.save_disk.as_ref()) {
+            Ok(()) => {
+                if let (Ok(s), Ok(d)) = (
+                    crate::projects::normalize_name(src),
+                    crate::projects::normalize_name(dst),
+                ) {
+                    let _ = writeln!(console, "copied '{s}' -> prog.{d}");
+                }
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "cp: {msg}");
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+    }
+
+    fn cmd_mv(&mut self, rest: &str, console: &mut Console) {
+        let mut parts = rest.split_whitespace();
+        let (Some(src), Some(dst), None) = (parts.next(), parts.next(), parts.next()) else {
+            console.set_fg(gfx::ERROR);
+            console.write_str("mv: expected 'mv <src> <dst>'\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        };
+        match crate::projects::move_source(src, dst, self.save_disk.as_ref()) {
+            Ok(()) => {
+                if let (Ok(s), Ok(d)) = (
+                    crate::projects::normalize_name(src),
+                    crate::projects::normalize_name(dst),
+                ) {
+                    let _ = writeln!(console, "renamed prog.{s} -> prog.{d}");
+                }
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "mv: {msg}");
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+    }
+
+    fn cmd_export(&self, rest: &str, console: &mut Console) {
+        let name = rest.trim();
+        if name.is_empty() {
+            console.set_fg(gfx::ERROR);
+            console.write_str("export: expected a program name, e.g. 'export hello'\n");
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        }
+        let norm = match crate::projects::normalize_name(name) {
+            Ok(n) => n,
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "export: {msg}");
+                console.set_fg(gfx::FOREGROUND);
+                return;
+            }
+        };
+        let source = match crate::projects::load_source(&norm, &self.apps, self.save_disk.as_ref()) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "export: '{name}' not found");
+                console.set_fg(gfx::FOREGROUND);
+                return;
+            }
+            Err(msg) => {
+                console.set_fg(gfx::ERROR);
+                let _ = writeln!(console, "export: {msg}");
+                console.set_fg(gfx::FOREGROUND);
+                return;
+            }
+        };
+        let begin = format!("--- BEGIN WISP EXPORT {norm}.wisp ({} bytes) ---\n", source.len());
+        let end = "--- END WISP EXPORT ---\n";
+        console.write_str(&begin);
+        crate::debugcon::write_str(&begin);
+        console.write_str(&source);
+        crate::debugcon::write_str(&source);
+        if !source.ends_with('\n') {
+            console.newline();
+            crate::debugcon::write_str("\n");
+        }
+        console.write_str(end);
+        crate::debugcon::write_str(end);
+    }
+
+    fn cmd_lspci(&self, console: &mut Console) {
+        let devices = crate::pci::cached_devices();
+        if devices.is_empty() {
+            console.write_str("No PCI devices found.\n");
+            return;
+        }
+        for dev in devices {
+            let desc = crate::pci::class_description(dev.class, dev.subclass, dev.prog_if);
+            if let Some(domain) = crate::pci::vmd_domain(dev.address) {
+                let _ = writeln!(
+                    console,
+                    "vmd{domain}:{:02x}:{:02x}.{:x} [{:04x}:{:04x}] {:02x}:{:02x}.{:02x} {desc}",
+                    dev.address.bus,
+                    dev.address.device,
+                    dev.address.function,
+                    dev.vendor_id,
+                    dev.device_id,
+                    dev.class,
+                    dev.subclass,
+                    dev.prog_if
+                );
+            } else {
+                let _ = writeln!(
+                    console,
+                    "{:02x}:{:02x}.{:x} [{:04x}:{:04x}] {:02x}:{:02x}.{:02x} {desc}",
+                    dev.address.bus,
+                    dev.address.device,
+                    dev.address.function,
+                    dev.vendor_id,
+                    dev.device_id,
+                    dev.class,
+                    dev.subclass,
+                    dev.prog_if
+                );
+            }
+        }
+    }
+
+    fn cmd_keymap(&mut self, rest: &str, console: &mut Console) {
+        let arg = rest.trim();
+        if arg.is_empty() {
+            let current = crate::keymap::active();
+            let _ = writeln!(console, "Active keymap: {} ({})", current.name(), current.description());
+            console.write_str("Available layouts:\n");
+            for layout in crate::keymap::ALL_LAYOUTS {
+                let mark = if layout == current { "*" } else { " " };
+                let _ = writeln!(console, " {mark} {:<8} {}", layout.name(), layout.description());
+            }
+            return;
+        }
+        let Some(layout) = crate::keymap::LayoutId::from_name(arg) else {
+            console.set_fg(gfx::ERROR);
+            let _ = writeln!(
+                console,
+                "keymap: unknown layout '{arg}' (choose us, uk, de, fr, es, dvorak, or colemak)"
+            );
+            console.set_fg(gfx::FOREGROUND);
+            return;
+        };
+        crate::keymap::set_active(layout);
+        let mut persisted = false;
+        if let Some(disk) = self.save_disk.as_ref().filter(|d| d.is_mounted()) {
+            let val = Value::Str(Rc::new(String::from(layout.name())));
+            persisted = disk.save("sys.keymap", &val).is_ok();
+        }
+        let _ = writeln!(
+            console,
+            "Keymap set to '{}' ({}){}.",
+            layout.name(),
+            layout.description(),
+            if persisted { ", saved in sys.keymap" } else { "" }
+        );
     }
 
     fn cmd_run(&mut self, console: &mut Console, name: &str) {
@@ -732,8 +1129,8 @@ impl Shell {
             }
         };
 
-        let result = run_program_source(source, console, &mut self.rng_state, self.save_disk.as_ref());
-        if let Err(e) = result {
+        let result = run_program_source_detailed(source, console, &mut self.rng_state, self.save_disk.as_ref());
+        if let Err((e, details)) = result {
             // A stop is logged (just the fact and the line -- never message
             // text, which can quote what the user typed) so the test
             // harness can verify it without OCR'ing a scrolling screen.
@@ -744,7 +1141,7 @@ impl Shell {
                 ));
             }
             console.set_fg(gfx::ERROR);
-            let _ = write!(console, "{}\n", e.to_display_string());
+            let _ = write!(console, "{}\n", e.to_detailed_string(&details));
             console.set_fg(gfx::FOREGROUND);
         }
     }
@@ -828,6 +1225,7 @@ impl Shell {
             }
             Ok(_) => {}
             Err(e) => {
+                let details = session.take_error_details();
                 if e.message == wisp::interp::STOPPED_MESSAGE {
                     let _ = crate::debugcon::write_fmt(format_args!(
                         "[wisp] prompt input stopped by Esc at line {}\n",
@@ -835,7 +1233,7 @@ impl Shell {
                     ));
                 }
                 console.set_fg(gfx::ERROR);
-                let _ = write!(console, "{}\n", e.to_display_string());
+                let _ = write!(console, "{}\n", e.to_detailed_string(&details));
                 console.set_fg(gfx::FOREGROUND);
             }
         }
@@ -896,6 +1294,47 @@ impl Shell {
             clock::ticks()
         );
     }
+
+    fn cmd_date(&self, console: &mut Console) {
+        let tz = read_tz_offset_minutes(self.save_disk.as_ref());
+        match crate::rtc::now(tz) {
+            Some(dt) => {
+                let _ = writeln!(console, "{}", dt.format_iso(tz));
+            }
+            None => {
+                console.set_fg(gfx::ERROR);
+                console.write_str("date: real-time clock unavailable\n");
+                console.set_fg(gfx::FOREGROUND);
+            }
+        }
+    }
+
+    fn flush_active_disk(&self) {
+        if let Some(disk) = self.save_disk.as_ref().filter(|d| d.is_mounted()) {
+            let _ = unsafe { disk.hba().flush_cache() };
+        }
+    }
+
+    fn cmd_reboot(&self, console: &mut Console) -> ! {
+        console.write_str("Rebooting...\n");
+        self.flush_active_disk();
+        crate::power::reboot()
+    }
+
+    fn cmd_poweroff(&self, console: &mut Console) {
+        console.write_str("Powering off...\n");
+        self.flush_active_disk();
+        crate::power::poweroff();
+        console.set_fg(gfx::ERROR);
+        console.write_str("poweroff: firmware could not power off the machine; use the power button\n");
+        console.set_fg(gfx::FOREGROUND);
+    }
+
+    fn cmd_halt(&self, console: &mut Console) -> ! {
+        self.flush_active_disk();
+        console.write_str("System halted. It is now safe to turn off the machine.\n");
+        crate::power::halt()
+    }
 }
 
 /// Free heap a running script may not dip below: when it does, the
@@ -948,6 +1387,63 @@ enum LineMode {
 /// pressed. Shared by the shell's own prompt, the `wisp>` prompt and the
 /// WISP `input()` builtin, so all of them edit alike -- except for Esc;
 /// see [`LineMode`].
+const SHELL_COMMANDS: &[&str] = &[
+    "cat", "clear", "cp", "date", "delete", "disk", "disks", "dmesg", "echo", "edit", "export",
+    "format", "halt", "help", "ide", "keymap", "keys", "load", "ls", "lspci", "mem", "mv",
+    "poweroff", "reboot", "rm", "run", "save", "uptime", "version", "wisp",
+];
+
+const KEYMAP_NAMES: &[&str] = &["us", "uk", "de", "fr", "es", "dvorak", "colemak"];
+
+fn read_shell_prompt_line(
+    console: &mut Console,
+    history: &mut History,
+    programs: &[String],
+) -> String {
+    let mut next_key = || {
+        let key = keyboard::wait_for_key();
+        if key == keyboard::ESC {
+            keyboard::clear_stop_request();
+        }
+        key
+    };
+    let mut completer = |prefix: &str| {
+        line_editor::complete_shell_prefix(prefix, SHELL_COMMANDS, programs, KEYMAP_NAMES)
+    };
+    match line_editor::read_line_with_completer(
+        console,
+        &mut next_key,
+        Some(history),
+        true,
+        Some(&mut completer),
+    ) {
+        line_editor::Outcome::Line(line) | line_editor::Outcome::Escaped(line) => line,
+    }
+}
+
+fn extract_app_description(source: &str, max_chars: usize) -> Option<String> {
+    let first = source.lines().next()?.trim();
+    let comment = first.strip_prefix('#')?.trim();
+    if comment.is_empty() {
+        return None;
+    }
+    let body = if let Some((_, after_dash)) = comment.split_once(" -- ") {
+        after_dash.trim()
+    } else if let Some((_, after_colon)) = comment.split_once(':') {
+        after_colon.trim()
+    } else {
+        comment
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for ch in body.chars().take(max_chars) {
+        out.push(ch);
+    }
+    Some(out)
+}
+
 fn read_line(console: &mut Console, mode: LineMode, history: Option<&mut History>) -> String {
     let mut next_key = || {
         let key = keyboard::wait_for_key();
@@ -990,10 +1486,23 @@ fn next_rand_u64(state: &mut u64) -> u64 {
 
 /// Shared execution path for the shell and Studio, with a fresh session.
 pub(crate) fn run_program_source(source: &str, console: &mut Console, rng: &mut u64, save_disk: Option<&save_format::SaveDisk>) -> Result<(), wisp::WispError> {
-    // Esc and queued program input must not leak between runs or into the editor.
     keyboard::clear_stop_request();
     let mut host = ShellHost { console, rng, save_disk, last_usb_poll_tick: u64::MAX };
     let result = wisp::run_source(source, &mut host);
+    keyboard::clear_stop_request();
+    result
+}
+
+pub(crate) fn run_program_source_detailed(
+    source: &str,
+    console: &mut Console,
+    rng: &mut u64,
+    save_disk: Option<&save_format::SaveDisk>,
+) -> Result<(), (wisp::WispError, wisp::ErrorDetails)> {
+    // Esc and queued program input must not leak between runs or into the editor.
+    keyboard::clear_stop_request();
+    let mut host = ShellHost { console, rng, save_disk, last_usb_poll_tick: u64::MAX };
+    let result = wisp::run_source_detailed(source, &mut host);
     keyboard::clear_stop_request();
     result
 }
@@ -1101,4 +1610,63 @@ impl wisp::interp::Host for ShellHost<'_> {
     fn fill_screen(&mut self, color: u32) {
         self.console.fill_screen(gfx::Color::from_rgb24(color));
     }
+
+    fn now_datetime(&mut self) -> Option<(i64, u8, u8, u8, u8, u8)> {
+        let tz = read_tz_offset_minutes(self.save_disk);
+        crate::rtc::now(tz).map(|dt| (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second))
+    }
+
+    fn beep(&mut self, hz: u32, ms: u64) {
+        crate::pit::beep(hz, ms, || {
+            usb_hid::poll();
+            keyboard::stop_requested()
+        });
+    }
+
+    fn load_module(&mut self, name: &str) -> Result<Option<String>, String> {
+        Ok(crate::fs::find_lib_source(name))
+    }
+
+    fn file_write(&mut self, name: &str, text: &str) -> Result<(), &'static str> {
+        let disk = self
+            .save_disk
+            .ok_or("no save disk selected (use 'disks' and 'disk <n>')")?;
+        disk.save_chained(&format!("file.{name}"), &Value::Str(Rc::new(String::from(text))))
+    }
+
+    fn file_list(&mut self) -> Result<Vec<String>, &'static str> {
+        let disk = self
+            .save_disk
+            .ok_or("no save disk selected (use 'disks' and 'disk <n>')")?;
+        let mut out = Vec::new();
+        for (key, _) in disk.keys()? {
+            if let Some(name) = key.strip_prefix("file.") {
+                if !name.is_empty() {
+                    out.push(String::from(name));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn file_delete(&mut self, name: &str) -> Result<bool, &'static str> {
+        let disk = self
+            .save_disk
+            .ok_or("no save disk selected (use 'disks' and 'disk <n>')")?;
+        disk.delete(&format!("file.{name}"))
+    }
+}
+
+fn read_tz_offset_minutes(save_disk: Option<&save_format::SaveDisk>) -> i64 {
+    let Some(disk) = save_disk.filter(|d| d.is_mounted()) else {
+        return 0;
+    };
+    let parsed = match disk.load("sys.tz") {
+        Ok(Some(Value::Int(mins))) => Some(mins),
+        Ok(Some(Value::Str(s))) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    parsed
+        .filter(|&mins| (-14 * 60..=14 * 60).contains(&mins))
+        .unwrap_or(0)
 }

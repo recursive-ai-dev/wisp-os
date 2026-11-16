@@ -5,11 +5,33 @@
 //! [`crate::font`]. It deliberately does not use the UEFI Simple Text
 //! Output protocol for on-screen rendering.
 
+extern crate alloc;
+
+use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt;
 
 use uefi::proto::console::gop::PixelFormat;
 
 use crate::font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
+
+pub const SCROLLBACK_MAX_ROWS: usize = 200;
+const MAX_TRACKED_COLS: usize = 256;
+const MAX_TRACKED_ROWS: usize = 128;
+
+#[derive(Clone, Copy)]
+struct ScrollCell {
+    ch: u8,
+    fg: Color,
+    bg: Color,
+}
+
+impl ScrollCell {
+    const fn blank(fg: Color, bg: Color) -> Self {
+        Self { ch: b' ', fg, bg }
+    }
+}
 
 /// An RGB color, channel order independent of the framebuffer's native
 /// byte layout -- [`Console`] re-encodes it correctly for whichever
@@ -81,6 +103,11 @@ pub struct Console {
     /// How many times the contents have scrolled up a row, ever -- what
     /// lets `line_editor` find a line that scrolled while being typed.
     scrolls: u64,
+    tracked_cols: usize,
+    tracked_rows: usize,
+    screen_cells: Vec<ScrollCell>,
+    history_rows: VecDeque<Vec<ScrollCell>>,
+    view_offset: usize,
 }
 
 impl Console {
@@ -139,6 +166,8 @@ impl Console {
             return Err("display resolution is too small for an 8x16 text console");
         }
 
+        let tracked_cols = cols.min(MAX_TRACKED_COLS);
+        let tracked_rows = rows.min(MAX_TRACKED_ROWS);
         let mut console = Self {
             fb,
             fb_len,
@@ -153,6 +182,11 @@ impl Console {
             fg: FOREGROUND,
             bg: BLACK,
             scrolls: 0,
+            tracked_cols,
+            tracked_rows,
+            screen_cells: vec![ScrollCell::blank(FOREGROUND, BLACK); tracked_cols * tracked_rows],
+            history_rows: VecDeque::new(),
+            view_offset: 0,
         };
         console.clear();
         Ok(console)
@@ -186,6 +220,9 @@ impl Console {
     /// Fill the entire framebuffer (including any stride padding) with the
     /// current background color and reset the cursor to the top-left.
     pub fn clear(&mut self) {
+        self.view_offset = 0;
+        let blank = ScrollCell::blank(self.fg, self.bg);
+        self.screen_cells.fill(blank);
         let bg = self.encode(self.bg);
         let total_pixels = self.stride * self.height;
         for i in 0..total_pixels {
@@ -219,6 +256,21 @@ impl Console {
     /// Move the contents up by one character row, revealing a blank row at
     /// the bottom. Used when output reaches the last row.
     fn scroll_up_one_row(&mut self) {
+        let _ = self.exit_scrollback();
+        if self.tracked_cols > 0 && self.tracked_rows > 0 {
+            let top_row = self.screen_cells[..self.tracked_cols].to_vec();
+            if self.history_rows.len() == SCROLLBACK_MAX_ROWS {
+                self.history_rows.pop_front();
+            }
+            self.history_rows.push_back(top_row);
+            if self.tracked_rows > 1 {
+                self.screen_cells.copy_within(self.tracked_cols.., 0);
+            }
+            let last_start = (self.tracked_rows - 1) * self.tracked_cols;
+            let blank = ScrollCell::blank(self.fg, self.bg);
+            self.screen_cells[last_start..].fill(blank);
+        }
+
         let usable_height = self.usable_height();
         let row_bytes = self.stride * 4;
         let move_bytes = (usable_height - GLYPH_HEIGHT) * row_bytes;
@@ -248,6 +300,7 @@ impl Console {
     /// Advance the cursor to the start of the next line, scrolling if
     /// necessary.
     pub fn newline(&mut self) {
+        let _ = self.exit_scrollback();
         self.cursor_col = 0;
         self.cursor_row += 1;
         if self.cursor_row >= self.rows {
@@ -259,13 +312,75 @@ impl Console {
     /// Write one printable ASCII byte at the cursor and advance it,
     /// wrapping to a new line if the current row is full.
     pub fn put_ascii(&mut self, byte: u8) {
+        let _ = self.exit_scrollback();
         if self.cursor_col >= self.cols {
             self.newline();
         }
         let fg = self.fg;
         let bg = self.bg;
+        if self.cursor_col < self.tracked_cols && self.cursor_row < self.tracked_rows {
+            let idx = self.cursor_row * self.tracked_cols + self.cursor_col;
+            self.screen_cells[idx] = ScrollCell { ch: byte, fg, bg };
+        }
         self.draw_glyph(self.cursor_col, self.cursor_row, byte, fg, bg);
         self.cursor_col += 1;
+    }
+
+    fn redraw_scrollback_view(&mut self) {
+        let hist_len = self.history_rows.len();
+        let top_virtual = hist_len.saturating_sub(self.view_offset);
+        for r in 0..self.tracked_rows {
+            let v = top_virtual + r;
+            if v < hist_len {
+                let row = self.history_rows[v].clone();
+                for (c, cell) in row.into_iter().enumerate() {
+                    self.draw_glyph(c, r, cell.ch, cell.fg, cell.bg);
+                }
+            } else {
+                let screen_r = v - hist_len;
+                if screen_r < self.tracked_rows {
+                    let start = screen_r * self.tracked_cols;
+                    for c in 0..self.tracked_cols {
+                        let cell = self.screen_cells[start + c];
+                        self.draw_glyph(c, r, cell.ch, cell.fg, cell.bg);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn scrollback_page_up(&mut self) {
+        if self.history_rows.is_empty() {
+            return;
+        }
+        let step = (self.rows / 2).max(1);
+        let next = (self.view_offset + step).min(self.history_rows.len());
+        if next != self.view_offset {
+            self.view_offset = next;
+            self.redraw_scrollback_view();
+        }
+    }
+
+    pub fn scrollback_page_down(&mut self) {
+        if self.view_offset == 0 {
+            return;
+        }
+        let step = (self.rows / 2).max(1);
+        self.view_offset = self.view_offset.saturating_sub(step);
+        self.redraw_scrollback_view();
+    }
+
+    pub fn is_scrolled_back(&self) -> bool {
+        self.view_offset > 0
+    }
+
+    pub fn exit_scrollback(&mut self) -> bool {
+        if self.view_offset == 0 {
+            return false;
+        }
+        self.view_offset = 0;
+        self.redraw_scrollback_view();
+        true
     }
 
     /// Write a string, honoring `\n` as a line break and rendering every
@@ -569,6 +684,9 @@ impl crate::line_editor::Screen for Console {
             return;
         }
         let (fg, bg) = (self.fg, self.bg);
+        if col < self.tracked_cols && row < self.tracked_rows && self.view_offset == 0 {
+            self.screen_cells[row * self.tracked_cols + col] = ScrollCell { ch: byte, fg, bg };
+        }
         self.draw_glyph(col, row, byte, fg, bg);
         if on {
             let px = self.encode(fg);
@@ -579,5 +697,21 @@ impl crate::line_editor::Screen for Console {
                 }
             }
         }
+    }
+
+    fn page_up(&mut self) {
+        self.scrollback_page_up();
+    }
+
+    fn page_down(&mut self) {
+        self.scrollback_page_down();
+    }
+
+    fn is_scrolled_back(&self) -> bool {
+        Console::is_scrolled_back(self)
+    }
+
+    fn exit_scrollback(&mut self) -> bool {
+        Console::exit_scrollback(self)
     }
 }

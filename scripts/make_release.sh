@@ -87,6 +87,11 @@ while IFS= read -r -d '' f; do
     FILES+=("${f#./}")
 done < <(find ./src ./docs ./scripts ./tools ./esp/APPS -type f \
             -not -path '*/__pycache__/*' -not -name '*.pyc' -print0)
+if [[ -d ./esp/LIB ]]; then
+    while IFS= read -r -d '' f; do
+        FILES+=("${f#./}")
+    done < <(find ./esp/LIB -type f -print0)
+fi
 while IFS= read -r -d '' f; do
     FILES+=("${f#./}")
 done < <(find ./tests -maxdepth 1 -type f -name '*.py' -print0)

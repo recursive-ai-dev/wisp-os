@@ -473,6 +473,49 @@ pub fn dump_devices(devices: &[PciDevice]) {
     }
 }
 
+/// Snapshot the discovered PCI inventory for `lspci`.
+pub fn cached_devices() -> Vec<PciDevice> {
+    INVENTORY.with(|cached| cached.clone()).unwrap_or_default()
+}
+
+/// Return the Intel VMD domain index if `addr` sits behind a VMD controller.
+pub fn vmd_domain(addr: PciAddress) -> Option<u8> {
+    match addr.space {
+        ConfigSpace::Legacy => None,
+        ConfigSpace::Vmd(cfg) => Some(cfg.domain),
+    }
+}
+
+/// Human-readable description for common PCI class/subclass/prog_if codes.
+pub const fn class_description(class: u8, subclass: u8, prog_if: u8) -> &'static str {
+    match (class, subclass, prog_if) {
+        (0x01, 0x01, _) => "IDE storage controller",
+        (0x01, 0x04, _) => "RAID / VMD storage controller",
+        (0x01, 0x06, 0x01) => "SATA AHCI controller",
+        (0x01, 0x06, _) => "SATA controller",
+        (0x01, 0x08, 0x02) => "NVMe solid-state controller",
+        (0x01, 0x08, _) => "Non-Volatile Memory controller",
+        (0x01, _, _) => "Mass storage controller",
+        (0x02, _, _) => "Network controller (unclaimed by design)",
+        (0x03, 0x00, _) => "VGA compatible display controller",
+        (0x03, 0x80, _) => "Display controller",
+        (0x03, _, _) => "Graphics controller",
+        (0x04, 0x03, _) => "HD Audio controller",
+        (0x04, _, _) => "Multimedia controller",
+        (0x06, 0x00, _) => "Host bridge",
+        (0x06, 0x01, _) => "ISA bridge",
+        (0x06, 0x04, _) => "PCI-to-PCI bridge",
+        (0x06, _, _) => "Bridge device",
+        (0x0c, 0x03, 0x00) => "USB UHCI controller",
+        (0x0c, 0x03, 0x10) => "USB OHCI controller",
+        (0x0c, 0x03, 0x20) => "USB EHCI controller",
+        (0x0c, 0x03, 0x30) => "USB xHCI controller",
+        (0x0c, 0x03, _) => "USB controller",
+        (0x0c, 0x05, _) => "SMBus controller",
+        _ => "PCI device",
+    }
+}
+
 pub fn find_ahci_controller(devices: &[PciDevice]) -> Option<PciDevice> {
     devices
         .iter()

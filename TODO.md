@@ -1,4 +1,38 @@
-# WISP OS engineering sprint
+# WISP OS Horizons 1–3 Expansion Ledger (v1.3.0 → v1.5.0)
+
+Status flow: `PENDING → IN_PROGRESS → VERIFIED`; `BLOCKED` requires an external dependency.
+Blueprint: `implementation_plan.md` and `docs/MANUAL.md` (Chapters 42–44).
+
+## Horizon 1 — v1.3.0 (Voice & Door)
+- **H1-1** (`VERIFIED`): Serial console (COM1 `0x3F8` 16550 with scratch/loopback detection), 32 KiB static log ring (`src/log.rs`), `dmesg` command, skipped app counter in `fs::snapshot_apps` and `ls`.
+- **H1-2** (`VERIFIED`): Preserve UEFI Runtime Services table across `exit_boot_services`, map `RUNTIME_SERVICES_CODE` (RX) and `RUNTIME_SERVICES_DATA` (RW+NX) in `src/paging.rs`, add `reboot`, `poweroff`, and `halt` commands (`src/power.rs`).
+- **H1-3** (`VERIFIED`): Wall-clock time (`src/rtc.rs`): pre-exit UEFI `GetTime` + CMOS `0x70`/`0x71` fallback, monotonic tick progression, optional `sys.tz` offset, `date` shell command, and soft `date()` builtin.
+- **H1-4** (`VERIFIED`): Shell comfort: Tab completion (`src/line_editor.rs`), `cat <name>` (paged), `help <cmd>`, `lspci` (`src/pci.rs`), 200-row scrollback (`src/gfx.rs`), first-line app descriptions in `ls`, and `sys.autorun`.
+- **H1-5** (`VERIFIED`): Keymaps & modifiers (`src/keymap.rs`): `us`, `uk`, `de`, `fr`, `es`, `dvorak`, `colemak` tables for PS/2 and USB HID, Shift/AltGr/Caps Lock, USB software key repeat, `keymap` command, and `sys.keymap` persistence.
+- **H1-6** (`VERIFIED`): PC speaker `beep(hz, ms)` via PIT channel 2 (`0x42`/`0x43`, port `0x61` bits 0–1) with `Esc` interruption and gate restoration.
+
+## Horizon 2 — v1.4.0 (Language Grows Up)
+- **H2-0** (`VERIFIED`): Soft builtin dispatch seam (`is_hard_builtin` vs `is_soft_builtin`) allowing user `fn` and `let` bindings to shadow post-1.1 builtins.
+- **H2-1** (`VERIFIED`): Bitwise builtins: `band`, `bor`, `bxor`, `bnot`, `shl`, `shr`, `lshr`, `rgb_parts`.
+- **H2-2** (`VERIFIED`): String & number formatting: `pad_left`, `pad_right`, `hex`, `bin`, `int(s[, base])`, `fixed`, `fmt`.
+- **H2-7** (`VERIFIED`): Integer helpers: `divmod`, `pow`, `isqrt`, `muldiv` (128-bit intermediate), variadic `min`/`max`, `sum`.
+- **H2-3** (`VERIFIED`): `pcall(f, ...)` and `error(msg)` with uncatchable `Esc` (`STOPPED_MESSAGE`) and OOM (`OUT_OF_MEMORY_MESSAGE`).
+- **H2-4** (`VERIFIED`): Richer diagnostics: token column tracking, source line + caret display, call-stack trace, and module attribution.
+- **H2-5** (`VERIFIED`): Modules: `import(name)` with `LIB/*.wisp` boot snapshot, single evaluation per session in isolated module globals, and cycle detection.
+- **H2-6** (`VERIFIED`): Standard library in `esp/LIB/`: `strings.wisp`, `math.wisp`, `collections.wisp`, `fixed.wisp`, `text.wisp`.
+- **H2-8** (`VERIFIED`): Syntax & collection conveniences: compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`), `enumerate(list)`, `last(list)`.
+- **H2-9** (`VERIFIED`): Updated EBNF grammar and host conformance test suite (`tests/host/tests/horizon2_conformance.rs`).
+
+## Horizon 3 — v1.5.0 (Autonomy)
+- **H3-7** (`VERIFIED`): Reserved `sys.*` settings namespace (`sys.keymap`, `sys.tz`, `sys.autorun`, `sys.theme`) annotated in `keys`.
+- **H3-1** (`VERIFIED`): Save format v3 (`src/save_format.rs`): multi-slot chained values (`STATE_CHAIN_HEAD`, `STATE_CHAIN_DATA`) up to 64 KiB (`MAX_CHAINED_VALUE_LEN`), backward-compatible with v2 single-slot records, and exhaustive crash-atomicity model (`tests/host/tests/save_format_v3.rs`).
+- **H3-4** (`VERIFIED`): Program store v3 (64 KiB multi-slot sources in `src/projects.rs`) and shell file commands: `rm`, `cp`, `mv`, `cat`, `export <name>`.
+- **H3-5** (`VERIFIED`): Wisp Studio v3 (`src/ide.rs`, `src/editor.rs`): 64 KiB buffer cap, F4 search (`search_next`), F7 go-to-line, and built-in/keyword syntax coloring.
+- **H3-6** (`VERIFIED`): Sandboxed file builtins (`file.<name>` namespace): `read_file`, `write_file`, `append_file`, `list_files`, `delete_file`.
+
+---
+
+# WISP OS engineering sprint (v1.2.0 Archive)
 
 Status flow: `PENDING → IN_PROGRESS → VERIFIED`; `BLOCKED` requires an external dependency.
 

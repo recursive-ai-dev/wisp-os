@@ -100,7 +100,10 @@ impl Callee {
     fn quoted(&self) -> String {
         match self {
             Callee::Name(name) => format!("'{name}'"),
-            Callee::Closure(_) => String::from("the anonymous function"),
+            Callee::Closure(c) => match &c.lambda.name {
+                Some(name) => format!("'{name}'"),
+                None => String::from("the anonymous function"),
+            },
         }
     }
 }
@@ -204,6 +207,60 @@ pub trait Host {
     /// otherwise affect the text cursor -- see `docs/WISP_GRAPHICS.md`'s
     /// note on how text and graphics share one framebuffer.
     fn fill_screen(&mut self, color: u32);
+
+    /// Current wall-clock date/time as `(year, month, day, hour, minute, second)`,
+    /// or `None` if no real-time clock is available.
+    fn now_datetime(&mut self) -> Option<(i64, u8, u8, u8, u8, u8)> {
+        Some((2026, 11, 15, 12, 0, 0))
+    }
+
+    /// Sound the PC speaker at `hz` for `ms` milliseconds.
+    fn beep(&mut self, _hz: u32, _ms: u64) {}
+
+    /// Load a `LIB/<name>.wisp` module source from the host environment.
+    /// Returning `Ok(None)` falls back to the built-in standard library.
+    fn load_module(&mut self, _name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    // ---- H3-6: sandboxed `file.<name>` text storage --------------------
+
+    /// Read a text file from the `file.<name>` namespace on the save disk.
+    fn file_read(&mut self, name: &str) -> Result<Option<String>, &'static str> {
+        match self.load(&format!("file.{name}"))? {
+            Some(Value::Str(s)) => Ok(Some((*s).clone())),
+            Some(_) => Err("saved file contains a non-string value"),
+            None => Ok(None),
+        }
+    }
+
+    /// Write a text file in the `file.<name>` namespace on the save disk.
+    fn file_write(&mut self, name: &str, text: &str) -> Result<(), &'static str> {
+        self.save(&format!("file.{name}"), &Value::Str(Rc::new(String::from(text))))
+    }
+
+    /// Append text to a file in the `file.<name>` namespace on the save disk.
+    fn file_append(&mut self, name: &str, text: &str) -> Result<(), &'static str> {
+        let mut cur = self.file_read(name)?.unwrap_or_default();
+        cur.try_reserve(text.len())
+            .map_err(|_| "out of memory appending to file")?;
+        cur.push_str(text);
+        self.file_write(name, &cur)
+    }
+
+    /// List all file names in the `file.<name>` namespace on the save disk.
+    fn file_list(&mut self) -> Result<Vec<String>, &'static str> {
+        Ok(Vec::new())
+    }
+
+    /// Delete a file in the `file.<name>` namespace on the save disk.
+    fn file_delete(&mut self, name: &str) -> Result<bool, &'static str> {
+        let existed = self.file_read(name)?.is_some();
+        if existed {
+            self.save(&format!("file.{name}"), &Value::Nil)?;
+        }
+        Ok(existed)
+    }
 }
 
 /// The runtime error a program stopped with Esc ends with. Reported in the
@@ -232,6 +289,9 @@ enum Flow {
 pub struct Session {
     globals: BTreeMap<String, Value>,
     functions: BTreeMap<String, Rc<FuncDecl>>,
+    modules: BTreeMap<String, Value>,
+    importing: Vec<String>,
+    error_details: super::ErrorDetails,
     /// Every list and map this session creates; emptied when the session
     /// is dropped, which is what frees cycles. See [`ObjectRegistry`].
     objects: ObjectRegistry,
@@ -248,8 +308,15 @@ impl Session {
         Self {
             globals: BTreeMap::new(),
             functions: BTreeMap::new(),
+            modules: BTreeMap::new(),
+            importing: Vec::new(),
+            error_details: super::ErrorDetails::default(),
             objects: ObjectRegistry::new(),
         }
+    }
+
+    pub fn take_error_details(&mut self) -> super::ErrorDetails {
+        core::mem::take(&mut self.error_details)
     }
 
     /// Run a whole program: register every `fn` first (so forward
@@ -304,7 +371,7 @@ impl Interp<'_, '_> {
         let mut defined_here: Vec<&str> = Vec::new();
         for item in &program.items {
             if let TopItem::Func(f) = item {
-                if builtins::is_builtin(&f.name) {
+                if builtins::is_hard_builtin(&f.name) {
                     return Err(WispError::new(
                         f.line,
                         format!("'{}' is a built-in function and cannot be redefined", f.name),
@@ -476,7 +543,7 @@ impl Interp<'_, '_> {
     fn exec_stmt_inner(&mut self, stmt: &Stmt, stack: &mut ScopeStack) -> Result<Flow, WispError> {
         match stmt {
             Stmt::Let { name, expr, line } => self.exec_let(name, expr, *line, stack),
-            Stmt::Assign { name, expr, line } => self.exec_assign(name, expr, *line, stack),
+            Stmt::Assign { name, op, expr, line } => self.exec_assign(name, *op, expr, *line, stack),
             Stmt::ExprStmt(expr) => {
                 self.eval_expr(expr, stack)?;
                 Ok(Flow::Normal)
@@ -487,9 +554,10 @@ impl Interp<'_, '_> {
             Stmt::IndexAssign {
                 object,
                 index,
+                op,
                 value,
                 line,
-            } => self.exec_index_assign(object, index, value, *line, stack),
+            } => self.exec_index_assign(object, index, *op, value, *line, stack),
             Stmt::Break { line } => Ok(Flow::Break(*line)),
             Stmt::Continue { line } => Ok(Flow::Continue(*line)),
             Stmt::Return { expr } => {
@@ -510,8 +578,24 @@ impl Interp<'_, '_> {
     }
 
     #[inline(never)]
-    fn exec_assign(&mut self, name: &str, expr: &Expr, line: u32, stack: &mut ScopeStack) -> Result<Flow, WispError> {
-        let v = self.eval_expr(expr, stack)?;
+    fn exec_assign(
+        &mut self,
+        name: &str,
+        op: Option<BinaryOp>,
+        expr: &Expr,
+        line: u32,
+        stack: &mut ScopeStack,
+    ) -> Result<Flow, WispError> {
+        let v = match op {
+            None => self.eval_expr(expr, stack)?,
+            Some(bin_op) => {
+                let cur = self
+                    .get_var(stack, name)
+                    .ok_or_else(|| undefined_variable(name, line))?;
+                let rhs = self.eval_expr(expr, stack)?;
+                self.apply_binary_values(bin_op, cur, rhs, line)?
+            }
+        };
         self.assign_var(stack, name, v, line)?;
         Ok(Flow::Normal)
     }
@@ -645,13 +729,13 @@ impl Interp<'_, '_> {
         &mut self,
         object: &Expr,
         index: &Expr,
+        op: Option<BinaryOp>,
         value: &Expr,
         line: u32,
         stack: &mut ScopeStack,
     ) -> Result<Flow, WispError> {
         let obj = self.eval_expr(object, stack)?;
         let idx = self.eval_expr(index, stack)?;
-        let v = self.eval_expr(value, stack)?;
         if let Value::Str(_) = obj {
             return Err(WispError::new(
                 line,
@@ -660,6 +744,19 @@ impl Interp<'_, '_> {
         }
         if let Value::Map(map) = &obj {
             let key = map_key(&idx, line)?;
+            let v = match op {
+                None => self.eval_expr(value, stack)?,
+                Some(bin_op) => {
+                    let cur = map.borrow().get(&key).cloned().ok_or_else(|| {
+                        WispError::new(
+                            line,
+                            format!("key {} is not in the map", idx.to_echo_string()),
+                        )
+                    })?;
+                    let rhs = self.eval_expr(value, stack)?;
+                    self.apply_binary_values(bin_op, cur, rhs, line)?
+                }
+            };
             let mut entries = map.borrow_mut();
             if entries.len() >= MAX_MAP_LEN && !entries.contains_key(&key) {
                 return Err(WispError::new(
@@ -673,7 +770,22 @@ impl Interp<'_, '_> {
             return Ok(Flow::Normal);
         }
         let (list, i) = index_target(&obj, &idx, line)?;
-        list.borrow_mut()[i] = v;
+        let v = match op {
+            None => self.eval_expr(value, stack)?,
+            Some(bin_op) => {
+                let cur = list.borrow()[i].clone();
+                let rhs = self.eval_expr(value, stack)?;
+                self.apply_binary_values(bin_op, cur, rhs, line)?
+            }
+        };
+        let mut items = list.borrow_mut();
+        if i >= items.len() {
+            return Err(WispError::new(
+                line,
+                format!("list index {i} out of bounds for length {}", items.len()),
+            ));
+        }
+        items[i] = v;
         Ok(Flow::Normal)
     }
 
@@ -800,6 +912,14 @@ impl Interp<'_, '_> {
         builtins::is_builtin(name) || self.session.functions.contains_key(name)
     }
 
+    /// Whether `name` is a user-declared function or a reserved 1.1 built-in.
+    /// Soft built-ins (added in 1.3+) yield to a non-function variable of the
+    /// same name so existing programs that used `let date = ...` or similar
+    /// never change behavior.
+    fn hard_or_user_function_exists(&self, name: &str) -> bool {
+        builtins::is_hard_builtin(name) || self.session.functions.contains_key(name)
+    }
+
     /// The function value a bare name stands for when no variable of that
     /// name exists: `apply(double, 3)`, `map(len, words)`.
     #[inline(never)]
@@ -818,7 +938,7 @@ impl Interp<'_, '_> {
         match self.get_var(stack, name) {
             Some(value) => match Callee::of(&value) {
                 Some(target) => Ok(Some(target)),
-                None if !self.function_exists(name) => Err(WispError::new(
+                None if !self.hard_or_user_function_exists(name) => Err(WispError::new(
                     line,
                     format!("cannot call '{name}': it holds {}, not a function", value.type_name()),
                 )),
@@ -989,7 +1109,16 @@ impl Interp<'_, '_> {
 
         let lhs = self.eval_expr(lhs_e, stack)?;
         let rhs = self.eval_expr(rhs_e, stack)?;
+        self.apply_binary_values(op, lhs, rhs, line)
+    }
 
+    fn apply_binary_values(
+        &mut self,
+        op: BinaryOp,
+        lhs: Value,
+        rhs: Value,
+        line: u32,
+    ) -> Result<Value, WispError> {
         match op {
             BinaryOp::Add => match (&lhs, &rhs) {
                 (Value::Int(a), Value::Int(b)) => a
@@ -1068,6 +1197,12 @@ impl Interp<'_, '_> {
 
     #[inline(never)]
     fn call_named(&mut self, name: &str, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        // User-declared functions are checked first so a user `fn` can shadow
+        // any soft built-in (hard built-ins were already rejected at
+        // registration time in `run_program`).
+        if let Some(f) = self.session.functions.get(name).cloned() {
+            return self.invoke(Target::Declared(&f), args, line);
+        }
         if builtins::is_higher_order(name) {
             return self.call_higher_order(name, args, line);
         }
@@ -1080,10 +1215,7 @@ impl Interp<'_, '_> {
             }
             return Ok(result);
         }
-        match self.session.functions.get(name).cloned() {
-            Some(f) => self.invoke(Target::Declared(&f), args, line),
-            None => Err(WispError::new(line, format!("undefined function '{name}'"))),
-        }
+        Err(WispError::new(line, format!("undefined function '{name}'")))
     }
 
     /// Call whatever `callee` is.
@@ -1114,7 +1246,10 @@ impl Interp<'_, '_> {
         if args.len() != params.len() {
             let who = match target {
                 Target::Declared(f) => format!("'{}'", f.name),
-                Target::Closure(_) => String::from("the anonymous function"),
+                Target::Closure(c) => match &c.lambda.name {
+                    Some(name) => format!("'{name}'"),
+                    None => String::from("the anonymous function"),
+                },
             };
             return Err(WispError::new(
                 line,
@@ -1155,11 +1290,31 @@ impl Interp<'_, '_> {
         };
         self.call_depth -= 1;
 
+        if result.is_err() {
+            self.record_call_frame(&target, line);
+        }
+
         match result? {
             Flow::Return(v) => Ok(v),
             Flow::Normal => Ok(Value::Nil),
             Flow::Break(line) => Err(WispError::new(line, "'break' outside of a loop")),
             Flow::Continue(line) => Err(WispError::new(line, "'continue' outside of a loop")),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_call_frame(&mut self, target: &Target, call_line: u32) {
+        if self.session.error_details.stack_trace.len() < 16 {
+            let name = match target {
+                Target::Declared(f) => (*f.name).clone(),
+                Target::Closure(c) => c
+                    .lambda
+                    .name
+                    .as_deref()
+                    .map_or_else(|| String::from("<anonymous>"), String::clone),
+            };
+            self.session.error_details.stack_trace.push((name, call_line));
         }
     }
 }
@@ -1185,10 +1340,215 @@ impl Interp<'_, '_> {
             "map" => self.hof_map(args, line),
             "filter" => self.hof_filter(args, line),
             "reduce" => self.hof_reduce(args, line),
+            "pcall" => self.hof_pcall(args, line),
+            "import" => self.hof_import(args, line),
             _ => self.hof_sort_by(args, line),
         };
         self.nesting -= 2;
         result
+    }
+
+    #[inline(never)]
+    fn hof_import(&mut self, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        if args.len() != 1 {
+            return Err(WispError::new(
+                line,
+                format!("import() expects 1 argument, got {}", args.len()),
+            ));
+        }
+        let raw_name = match &args[0] {
+            Value::Str(s) => s.trim(),
+            other => {
+                return Err(WispError::new(
+                    line,
+                    format!(
+                        "import() expects a string module name, found {}",
+                        other.type_name()
+                    ),
+                ))
+            }
+        };
+        let mod_name = normalize_module_name(raw_name, line)?;
+        if let Some(cached) = self.session.modules.get(&mod_name) {
+            return Ok(cached.clone());
+        }
+        if self.session.importing.contains(&mod_name) {
+            let mut chain = self.session.importing.join(" -> ");
+            chain.push_str(" -> ");
+            chain.push_str(&mod_name);
+            return Err(WispError::new(
+                line,
+                format!("import cycle detected: {chain}"),
+            ));
+        }
+        if self.session.importing.len() >= 16 {
+            return Err(WispError::new(line, "import() nesting depth exceeded (limit is 16)"));
+        }
+
+        let source = match self.host.load_module(&mod_name) {
+            Ok(Some(src)) => src,
+            Ok(None) => match embedded_stdlib_source(&mod_name) {
+                Some(src) => String::from(src),
+                None => {
+                    return Err(WispError::new(
+                        line,
+                        format!("import(): module '{mod_name}' not found"),
+                    ))
+                }
+            },
+            Err(msg) => {
+                return Err(WispError::new(line, format!("import(): {msg}")));
+            }
+        };
+
+        let mod_label = format!("LIB/{mod_name}.wisp");
+        let tokens = super::lexer::lex(&source).map_err(|err| {
+            self.record_module_error(&mod_label, &source, &err);
+            err
+        })?;
+        let program = super::parser::parse(&tokens).map_err(|err| {
+            self.record_module_error(&mod_label, &source, &err);
+            err
+        })?;
+
+        let mut defined_in_mod: Vec<&str> = Vec::new();
+        for item in &program.items {
+            if let TopItem::Func(f) = item {
+                if builtins::is_hard_builtin(&f.name) {
+                    let err = WispError::new(
+                        f.line,
+                        format!("'{}' is a built-in function and cannot be redefined", f.name),
+                    );
+                    self.record_module_error(&mod_label, &source, &err);
+                    return Err(err);
+                }
+                if defined_in_mod.contains(&f.name.as_str()) {
+                    let err = WispError::new(
+                        f.line,
+                        format!("function '{}' is already defined", f.name),
+                    );
+                    self.record_module_error(&mod_label, &source, &err);
+                    return Err(err);
+                }
+                defined_in_mod.push(f.name.as_str());
+            }
+        }
+
+        let mod_frame = FrameCell::new(BTreeMap::new());
+        for item in &program.items {
+            if let TopItem::Func(f) = item {
+                let lambda = Rc::new(Lambda {
+                    name: Some(f.name.clone()),
+                    params: f.params.clone(),
+                    body: f.body.clone(),
+                    line: f.line,
+                });
+                let closure = self
+                    .session
+                    .objects
+                    .new_closure(lambda, alloc::vec![mod_frame.clone()]);
+                mod_frame.borrow_mut().insert((*f.name).clone(), closure);
+            }
+        }
+
+        self.session.importing.push(mod_name.clone());
+        let mut stack: ScopeStack = alloc::vec![mod_frame];
+        let mut export = Value::Nil;
+        let eval_res = (|| -> Result<(), WispError> {
+            for item in &program.items {
+                let TopItem::Stmt(s) = item else { continue };
+                match self.exec_stmt(s, &mut stack)? {
+                    Flow::Normal => {}
+                    Flow::Return(v) => {
+                        export = v;
+                        break;
+                    }
+                    Flow::Break(l) => {
+                        return Err(WispError::new(l, "'break' outside of a loop"));
+                    }
+                    Flow::Continue(l) => {
+                        return Err(WispError::new(l, "'continue' outside of a loop"));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.session.importing.pop();
+
+        if let Err(err) = eval_res {
+            self.record_module_error(&mod_label, &source, &err);
+            return Err(err);
+        }
+
+        self.session.modules.insert(mod_name, export.clone());
+        Ok(export)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_module_error(&mut self, mod_label: &str, source: &str, err: &WispError) {
+        if self.session.error_details.module.is_none() && !err.is_uncatchable() {
+            self.session.error_details.module = Some(String::from(mod_label));
+            super::attach_source_line(&mut self.session.error_details, err.line, source);
+        }
+    }
+
+    #[inline(never)]
+    fn hof_pcall(&mut self, args: Vec<Value>, line: u32) -> Result<Value, WispError> {
+        if args.is_empty() {
+            return Err(WispError::new(
+                line,
+                "pcall() expects at least 1 argument, got 0",
+            ));
+        }
+        self.check_interrupts(line)?;
+        let saved_call_depth = self.call_depth;
+        let saved_nesting = self.nesting;
+
+        let call_res = match Callee::of(&args[0]) {
+            Some(func) => {
+                let call_args: Vec<Value> = args.into_iter().skip(1).collect();
+                self.call_callee(&func, call_args, line)
+            }
+            None => Err(WispError::new(
+                line,
+                format!(
+                    "pcall() expects a function as its first argument, found {}",
+                    args[0].type_name()
+                ),
+            )),
+        };
+
+        self.call_depth = saved_call_depth;
+        self.nesting = saved_nesting;
+        self.session.error_details = super::ErrorDetails::default();
+
+        if let Err(ref err) = call_res {
+            if err.is_uncatchable() {
+                return Err(err.clone());
+            }
+        }
+        self.check_interrupts(line)?;
+
+        let mut entries = BTreeMap::new();
+        match call_res {
+            Ok(val) => {
+                entries.insert(MapKey::Str(Rc::new(String::from("ok"))), Value::Bool(true));
+                entries.insert(MapKey::Str(Rc::new(String::from("value"))), val);
+            }
+            Err(err) => {
+                entries.insert(MapKey::Str(Rc::new(String::from("ok"))), Value::Bool(false));
+                entries.insert(
+                    MapKey::Str(Rc::new(String::from("error"))),
+                    Value::Str(Rc::new(err.message)),
+                );
+                entries.insert(
+                    MapKey::Str(Rc::new(String::from("line"))),
+                    Value::Int(i64::from(err.line)),
+                );
+            }
+        }
+        Ok(self.session.objects.new_map(entries))
     }
 
     /// Check `args` is `want` long and pull out the function and list
@@ -1574,4 +1934,39 @@ fn concat(a: &str, b: &str, line: u32) -> Result<Value, WispError> {
 #[inline(never)]
 fn undefined_variable(name: &str, line: u32) -> WispError {
     WispError::new(line, format!("undefined variable '{name}' (did you forget 'let'?)"))
+}
+
+fn normalize_module_name(input: &str, line: u32) -> Result<String, WispError> {
+    let trimmed = input.trim();
+    let stem = trimmed
+        .strip_suffix(".wisp")
+        .or_else(|| trimmed.strip_suffix(".WISP"))
+        .unwrap_or(trimmed);
+    if stem.is_empty() || stem.len() > 32 {
+        return Err(WispError::new(
+            line,
+            "import() expects a module name of 1-32 characters",
+        ));
+    }
+    if !stem
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(WispError::new(
+            line,
+            format!("import(): invalid module name '{trimmed}'"),
+        ));
+    }
+    Ok(stem.to_ascii_lowercase())
+}
+
+fn embedded_stdlib_source(name: &str) -> Option<&'static str> {
+    match name {
+        "strings" => Some(include_str!("../../esp/LIB/strings.wisp")),
+        "math" => Some(include_str!("../../esp/LIB/math.wisp")),
+        "collections" => Some(include_str!("../../esp/LIB/collections.wisp")),
+        "fixed" => Some(include_str!("../../esp/LIB/fixed.wisp")),
+        "text" => Some(include_str!("../../esp/LIB/text.wisp")),
+        _ => None,
+    }
 }

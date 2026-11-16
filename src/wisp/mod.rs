@@ -20,9 +20,24 @@ pub mod value;
 /// the source line it happened on so a script author (human or LLM) can
 /// find the problem immediately, per the error-reporting contract in
 /// `docs/WISP_LANGUAGE.md`: "wisp: line N: <message>".
+/// Extended diagnostic context (module name, offending source line, and call
+/// stack trace) recorded alongside a [`WispError`] without increasing the
+/// size of `Result<Value, WispError>` on the native recursion stack.
+#[derive(Debug, Clone, Default)]
+pub struct ErrorDetails {
+    pub module: Option<String>,
+    pub source_line: Option<String>,
+    pub stack_trace: alloc::vec::Vec<(String, u32)>,
+}
+
+/// A single error from any stage (lex, parse, or runtime), always carrying
+/// the source line (and column when known) it happened on so a script author
+/// can find the problem immediately, per the error-reporting contract in
+/// `docs/WISP_LANGUAGE.md`: "wisp: line N: <message>".
 #[derive(Debug, Clone)]
 pub struct WispError {
     pub line: u32,
+    pub col: u32,
     pub message: String,
 }
 
@@ -30,13 +45,50 @@ impl WispError {
     pub fn new(line: u32, message: impl Into<String>) -> Self {
         Self {
             line,
+            col: 0,
             message: message.into(),
         }
+    }
+
+    pub fn with_col(mut self, col: u32) -> Self {
+        self.col = col;
+        self
     }
 
     /// Render in the exact format the language spec promises.
     pub fn to_display_string(&self) -> String {
         format!("wisp: line {}: {}", self.line, self.message)
+    }
+
+    /// Render with source line, column caret, and call stack from `details`.
+    pub fn to_detailed_string(&self, details: &ErrorDetails) -> String {
+        let mut out = match &details.module {
+            Some(module) => format!("wisp: {module}: line {}: {}", self.line, self.message),
+            None => self.to_display_string(),
+        };
+        if let Some(src) = &details.source_line {
+            let trimmed = src.trim_end();
+            if !trimmed.is_empty() {
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("\n  {trimmed}"));
+                if self.col > 0 {
+                    let caret_pos = (self.col as usize).saturating_sub(1).min(trimmed.len());
+                    let pad: String = (0..caret_pos).map(|_| ' ').collect();
+                    let _ = core::fmt::Write::write_fmt(&mut out, format_args!("\n  {pad}^"));
+                }
+            }
+        }
+        for (func_name, call_line) in &details.stack_trace {
+            let _ = core::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("\n  in {func_name} (called from line {call_line})"),
+            );
+        }
+        out
+    }
+
+    /// Errors that must never be caught by `pcall` (user Esc stop and heap exhaustion).
+    pub fn is_uncatchable(&self) -> bool {
+        self.message == interp::STOPPED_MESSAGE || self.message == interp::OUT_OF_MEMORY_MESSAGE
     }
 }
 
@@ -54,6 +106,51 @@ pub fn run_source(source: &str, host: &mut dyn interp::Host) -> Result<(), WispE
     let tokens = lexer::lex(source)?;
     let program = parser::parse(&tokens)?;
     interp::Session::new().run(host, &program)
+}
+
+/// Run `source` and return detailed diagnostics (`ErrorDetails`) on failure.
+pub fn run_source_detailed(
+    source: &str,
+    host: &mut dyn interp::Host,
+) -> Result<(), (WispError, ErrorDetails)> {
+    let tokens = match lexer::lex(source) {
+        Ok(t) => t,
+        Err(e) => {
+            let mut details = ErrorDetails::default();
+            attach_source_line(&mut details, e.line, source);
+            return Err((e, details));
+        }
+    };
+    let program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => {
+            let mut details = ErrorDetails::default();
+            attach_source_line(&mut details, e.line, source);
+            return Err((e, details));
+        }
+    };
+    let mut session = interp::Session::new();
+    match session.run(host, &program) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let mut details = session.take_error_details();
+            if details.module.is_none() {
+                attach_source_line(&mut details, e.line, source);
+            }
+            Err((e, details))
+        }
+    }
+}
+
+pub(crate) fn attach_source_line(details: &mut ErrorDetails, line: u32, source: &str) {
+    if details.source_line.is_some() || line == 0 {
+        return;
+    }
+    if let Some(line_str) = source.lines().nth((line - 1) as usize) {
+        if line_str.len() <= 256 {
+            details.source_line = Some(String::from(line_str));
+        }
+    }
 }
 
 /// Lex and parse one piece of an interactive session (see
@@ -80,7 +177,7 @@ pub fn parse_interactive(source: &str) -> Result<ast::Program, WispError> {
             // lexing the whole source a second time.
             let eof = tokens.pop().expect("the lexer always appends EOF");
             tokens.try_reserve(2).map_err(|_| WispError::new(eof.line, interp::OUT_OF_MEMORY_MESSAGE))?;
-            tokens.push(lexer::Token { tok: lexer::Tok::Semi, line: eof.line });
+            tokens.push(lexer::Token { tok: lexer::Tok::Semi, line: eof.line, col: eof.col });
             tokens.push(eof);
             parser::parse(&tokens).map_err(|_| first)
         }

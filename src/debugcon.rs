@@ -30,6 +30,8 @@ pub fn write_str(s: &str) {
     for byte in s.bytes() {
         write_byte(byte);
     }
+    #[cfg(target_os = "uefi")]
+    crate::log::record_str(s);
 }
 
 struct DebugconWriter;

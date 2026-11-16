@@ -109,7 +109,7 @@ fn missing_projects_are_distinct_from_store_errors() {
 #[test]
 fn exact_slot_limit_is_in_bytes_and_oversize_never_writes() {
     let disk = disk();
-    assert_eq!(MAX_SAVED_SOURCE_BYTES, 4042);
+    assert_eq!(MAX_SAVED_SOURCE_BYTES, 65_536);
     let exact = "é".repeat(MAX_SAVED_SOURCE_BYTES / 2);
     projects::save_source("limit", &exact, Some(&disk)).unwrap();
     assert_eq!(
@@ -127,6 +127,28 @@ fn exact_slot_limit_is_in_bytes_and_oversize_never_writes() {
             .as_deref(),
         Some(exact.as_str())
     );
+}
+
+#[test]
+fn delete_copy_and_move_projects_round_trip() {
+    let disk = disk();
+    // Copy bundled template "hello" to saved project "copy1".
+    projects::copy_source("hello", "copy1", &templates(), Some(&disk)).unwrap();
+    assert_eq!(
+        projects::load_source("copy1", &[], Some(&disk)).unwrap(),
+        Some(templates()[0].1.clone())
+    );
+    // Move saved project "copy1" to "moved1".
+    projects::move_source("copy1", "moved1", Some(&disk)).unwrap();
+    assert_eq!(projects::load_source("copy1", &[], Some(&disk)).unwrap(), None);
+    assert_eq!(
+        projects::load_source("moved1", &[], Some(&disk)).unwrap(),
+        Some(templates()[0].1.clone())
+    );
+    // Delete saved project "moved1".
+    assert!(projects::delete_source("moved1", Some(&disk)).unwrap());
+    assert!(!projects::delete_source("moved1", Some(&disk)).unwrap());
+    assert_eq!(projects::load_source("moved1", &[], Some(&disk)).unwrap(), None);
 }
 
 #[test]

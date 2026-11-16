@@ -134,17 +134,19 @@ pub enum Stmt {
     },
     Assign {
         name: Rc<String>,
+        op: Option<BinaryOp>,
         expr: Expr,
         line: u32,
     },
     ExprStmt(Expr),
-    /// `object[index] = value;` -- a list element write, or a map entry
-    /// write (adding the key if it is new). All three of `object`,
-    /// `index`, and `value` are ordinary expressions, (re-)evaluated fresh
-    /// every time this statement runs.
+    /// `object[index] = value;` (or compound `+=`, `-=`, `*=`, `/=`, `%=`) -- a
+    /// list element write, or a map entry write (adding the key if it is new).
+    /// All three of `object`, `index`, and `value` are ordinary expressions,
+    /// evaluated once each time this statement runs.
     IndexAssign {
         object: Expr,
         index: Expr,
+        op: Option<BinaryOp>,
         value: Expr,
         line: u32,
     },
@@ -199,10 +201,11 @@ pub struct FuncDecl {
     pub line: u32,
 }
 
-/// An anonymous function: the parameters and body of an `fn (...) { ... }`
-/// expression. `line` is the `fn` keyword's own.
+/// An anonymous function (or a module-scoped function): the parameters and
+/// body of an `fn (...) { ... }` expression. `line` is the `fn` keyword's own.
 #[derive(Debug)]
 pub struct Lambda {
+    pub name: Option<Rc<String>>,
     pub params: Vec<Rc<String>>,
     pub body: Vec<Stmt>,
     pub line: u32,

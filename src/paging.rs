@@ -522,6 +522,8 @@ fn map_identity_range(pml4_phys: u64, start: u64, len: u64, flags: PageFlags, gu
 fn flags_for_memory_type(ty: MemoryType, image_protected: bool) -> PageFlags {
     if ty == MemoryType::MMIO || ty == MemoryType::MMIO_PORT_SPACE {
         PageFlags::Mmio
+    } else if ty == MemoryType::RUNTIME_SERVICES_CODE {
+        PageFlags::Code
     } else if ty == MemoryType::LOADER_CODE && !image_protected {
         PageFlags::Rwx
     } else {

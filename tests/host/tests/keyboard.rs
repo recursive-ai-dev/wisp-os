@@ -1,3 +1,4 @@
+pub use wisp_host_tests::keymap;
 pub use wisp_host_tests::line_editor;
 
 #[allow(dead_code)]

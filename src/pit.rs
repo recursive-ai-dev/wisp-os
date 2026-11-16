@@ -13,7 +13,9 @@ use core::arch::asm;
 use crate::clock::TICK_HZ;
 
 const CHANNEL0_DATA: u16 = 0x40;
+const CHANNEL2_DATA: u16 = 0x42;
 const COMMAND: u16 = 0x43;
+const SPEAKER_PORT: u16 = 0x61;
 
 /// The PIT's fixed input oscillator frequency, in Hz. Architectural
 /// constant of the 8253/8254, not configurable.
@@ -23,6 +25,14 @@ fn out8(port: u16, value: u8) {
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
     }
+}
+
+fn in8(port: u16) -> u8 {
+    let value: u8;
+    unsafe {
+        asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));
+    }
+    value
 }
 
 /// Program channel 0 for square-wave mode (mode 3) at [`TICK_HZ`]. Must run
@@ -39,4 +49,27 @@ pub unsafe fn init() {
     out8(COMMAND, SELECT_CHANNEL0_LOHI_MODE3);
     out8(CHANNEL0_DATA, (divisor & 0xFF) as u8);
     out8(CHANNEL0_DATA, ((divisor >> 8) & 0xFF) as u8);
+}
+
+/// Drive the PC speaker via PIT channel 2 in square-wave mode (mode 3) at
+/// `hz` for `ms` milliseconds, polling `stop` every tick and always restoring
+/// the speaker gate (port `0x61` bits 0-1) before returning.
+pub fn beep(hz: u32, ms: u64, stop: impl FnMut() -> bool) {
+    if ms == 0 {
+        return;
+    }
+    let hz = hz.clamp(20, 20_000);
+    let divisor = (PIT_INPUT_HZ / hz).clamp(1, 0xFFFF) as u16;
+    // Channel 2, lobyte/hibyte, mode 3 (square wave), binary.
+    const SELECT_CHANNEL2_LOHI_MODE3: u8 = 0b10_11_011_0;
+    out8(COMMAND, SELECT_CHANNEL2_LOHI_MODE3);
+    out8(CHANNEL2_DATA, (divisor & 0xFF) as u8);
+    out8(CHANNEL2_DATA, (divisor >> 8) as u8);
+
+    let prev = in8(SPEAKER_PORT);
+    if prev & 0x03 != 0x03 {
+        out8(SPEAKER_PORT, prev | 0x03);
+    }
+    let _ = crate::clock::sleep_ms_unless(ms, stop);
+    out8(SPEAKER_PORT, in8(SPEAKER_PORT) & !0x03);
 }

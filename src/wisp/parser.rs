@@ -84,6 +84,10 @@ impl<'t> Parser<'t> {
         self.tokens[self.pos].line
     }
 
+    fn peek_col(&self) -> u32 {
+        self.tokens[self.pos].col
+    }
+
     fn peek_at(&self, offset: usize) -> Tok {
         self.tokens
             .get(self.pos + offset)
@@ -118,24 +122,28 @@ impl<'t> Parser<'t> {
 
     fn expect(&mut self, want: Tok) -> Result<Token, WispError> {
         let line = self.peek_line();
+        let col = self.peek_col();
         if self.check(&want) {
             Ok(self.advance())
         } else {
             Err(WispError::new(
                 line,
                 format!("expected {}, found {}", describe(&want), describe(self.peek())),
-            ))
+            )
+            .with_col(col))
         }
     }
 
     fn expect_ident(&mut self) -> Result<alloc::rc::Rc<String>, WispError> {
         let line = self.peek_line();
+        let col = self.peek_col();
         match self.advance().tok {
             Tok::Ident(name) => Ok(name),
             other => Err(WispError::new(
                 line,
                 format!("expected identifier, found {}", describe(&other)),
-            )),
+            )
+            .with_col(col)),
         }
     }
 
@@ -189,7 +197,7 @@ impl<'t> Parser<'t> {
             ));
         }
         let (params, body) = self.parse_params_and_body()?;
-        self.finish(alloc::rc::Rc::new(Lambda { params, body, line }), self.height + 1)
+        self.finish(alloc::rc::Rc::new(Lambda { name: None, params, body, line }), self.height + 1)
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, WispError> {
@@ -233,15 +241,8 @@ impl<'t> Parser<'t> {
                 self.finish(Stmt::Continue { line }, 1)
             }
             Tok::Return => self.parse_return(),
-            Tok::Ident(_) if matches!(self.peek_at(1), Tok::Eq) => self.parse_assign(),
-            Tok::Ident(_) if matches!(self.peek_at(1), Tok::LBracket) => {
-                self.parse_index_assign_or_expr_stmt()
-            }
-            _ => {
-                let expr = self.parse_expr()?;
-                self.expect(Tok::Semi)?;
-                self.finish(Stmt::ExprStmt(expr), self.height + 1)
-            }
+            Tok::Ident(_) if assign_op(&self.peek_at(1)).is_some() => self.parse_assign(),
+            _ => self.parse_index_assign_or_expr_stmt(),
         }
     }
 
@@ -260,10 +261,11 @@ impl<'t> Parser<'t> {
     fn parse_assign(&mut self) -> Result<Stmt, WispError> {
         let line = self.peek_line();
         let name = self.expect_ident()?;
-        self.expect(Tok::Eq)?;
+        let op = assign_op(self.peek()).expect("checked by parse_stmt");
+        self.advance();
         let expr = self.parse_expr()?;
         self.expect(Tok::Semi)?;
-        self.finish(Stmt::Assign { name, expr, line }, self.height + 1)
+        self.finish(Stmt::Assign { name, op, expr, line }, self.height + 1)
     }
 
     /// Handles a statement that starts `ident [` -- either a list write
@@ -281,7 +283,8 @@ impl<'t> Parser<'t> {
         let line = self.peek_line();
         let target = self.parse_expr()?;
         let target_height = self.height;
-        if self.match_tok(&Tok::Eq) {
+        if let Some(op) = assign_op(self.peek()) {
+            self.advance();
             if !matches!(target, Expr::Index { .. } | Expr::Slice { .. }) {
                 return Err(WispError::new(line, "invalid assignment target (expected an indexed element)"));
             }
@@ -291,6 +294,7 @@ impl<'t> Parser<'t> {
                 Expr::Index { object, index, .. } => self.finish(Stmt::IndexAssign {
                     object: *object,
                     index: *index,
+                    op,
                     value,
                     line,
                 }, target_height.max(self.height) + 1),
@@ -517,6 +521,7 @@ impl<'t> Parser<'t> {
 
     fn parse_primary(&mut self) -> Result<Expr, WispError> {
         let line = self.peek_line();
+        let col = self.peek_col();
         match self.advance().tok {
             Tok::Fn => Ok(Expr::Lambda(self.parse_lambda(line)?)),
             Tok::Int(v) => self.finish(Expr::IntLit(v, line), 0),
@@ -560,7 +565,7 @@ impl<'t> Parser<'t> {
                 let entries = self.parse_map_entries()?;
                 self.finish(Expr::MapLit { entries, line }, self.height + 1)
             }
-            other => Err(WispError::new(line, format!("unexpected {}", describe(&other)))),
+            other => Err(WispError::new(line, format!("unexpected {}", describe(&other))).with_col(col)),
         }
     }
 
@@ -593,6 +598,19 @@ impl<'t> Parser<'t> {
         self.expect(Tok::RBrace)?;
         self.finish(entries, height)
     }
+}
+
+/// Assignment token (`=` or compound `+=`, `-=`, `*=`, `/=`, `%=`).
+fn assign_op(tok: &Tok) -> Option<Option<BinaryOp>> {
+    Some(match tok {
+        Tok::Eq => None,
+        Tok::PlusEq => Some(BinaryOp::Add),
+        Tok::MinusEq => Some(BinaryOp::Sub),
+        Tok::StarEq => Some(BinaryOp::Mul),
+        Tok::SlashEq => Some(BinaryOp::Div),
+        Tok::PercentEq => Some(BinaryOp::Rem),
+        _ => return None,
+    })
 }
 
 /// A binary operator token's operator and precedence (higher binds
@@ -643,6 +661,11 @@ fn describe(tok: &Tok) -> String {
         Tok::Star => "'*'".into(),
         Tok::Slash => "'/'".into(),
         Tok::Percent => "'%'".into(),
+        Tok::PlusEq => "'+='".into(),
+        Tok::MinusEq => "'-='".into(),
+        Tok::StarEq => "'*='".into(),
+        Tok::SlashEq => "'/='".into(),
+        Tok::PercentEq => "'%='".into(),
         Tok::EqEq => "'=='".into(),
         Tok::NotEq => "'!='".into(),
         Tok::Lt => "'<'".into(),

@@ -31,3 +31,12 @@ pub mod disk_layout;
 
 #[path = "../../../src/projects.rs"]
 pub mod projects;
+
+#[path = "../../../src/log.rs"]
+pub mod log;
+
+#[path = "../../../src/rtc.rs"]
+pub mod rtc;
+
+#[path = "../../../src/keymap.rs"]
+pub mod keymap;

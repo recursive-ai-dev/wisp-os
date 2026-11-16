@@ -65,6 +65,8 @@ const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
 /// `"APIC"` -- the Multiple APIC Description Table's signature (ACPI
 /// 6.5, 5.2.12). The table everyone calls the MADT is signed `APIC`.
 const MADT_SIGNATURE: &[u8; 4] = b"APIC";
+/// `"FACP"` -- the Fixed ACPI Description Table's signature (ACPI 6.5, 5.2.9).
+const FADT_SIGNATURE: &[u8; 4] = b"FACP";
 
 /// Every ACPI table (and the RSDP's own v2 extension) is validated by
 /// this rule: the 8-bit sum of every byte in the structure must be zero
@@ -441,6 +443,39 @@ unsafe fn parse_madt(madt_addr: u64) -> Result<AcpiInfo, &'static str> {
     Ok(info)
 }
 
+/// Inspect the FADT (`"FACP"`) for a supported 8-bit reset register
+/// (`RESET_REG_SUP`, bit 10 of FADT flags at offset 112; `RESET_REG` GAS at
+/// offset 116..128; `RESET_VALUE` at offset 128).
+unsafe fn parse_fadt_reset(fadt_addr: u64) {
+    let Ok((_sig, length)) = (unsafe { sdt_header(fadt_addr) }) else {
+        return;
+    };
+    if length < 129 {
+        return;
+    }
+    let fadt = unsafe { phys_slice(fadt_addr, length) };
+    if !checksum_ok(fadt) || fadt[8] < 2 {
+        return;
+    }
+    let flags = read_u32(fadt, 112);
+    if flags & (1 << 10) == 0 {
+        return;
+    }
+    let space_id = fadt[116];
+    let bit_width = fadt[117];
+    let bit_offset = fadt[118];
+    let address = read_u64(fadt, 120);
+    let value = fadt[128];
+    if bit_width == 8 && bit_offset == 0 && address != 0 && (space_id == 0 || space_id == 1) {
+        let is_io = space_id == 1;
+        crate::power::register_fadt_reset(is_io, address, value);
+        let _ = debugcon::write_fmt(format_args!(
+            "[acpi] fadt reset register: {} 0x{address:x} value=0x{value:02x}\n",
+            if is_io { "io" } else { "mmio" }
+        ));
+    }
+}
+
 /// Find and parse the MADT, starting from the RSDP address captured
 /// before `exit_boot_services`.
 ///
@@ -465,6 +500,10 @@ pub unsafe fn parse(rsdp_addr: Option<u64>) -> Result<AcpiInfo, &'static str> {
         "[acpi] rsdp=0x{rsdp_addr:x} {}=0x{root_addr:x}\n",
         if is_xsdt { "xsdt" } else { "rsdt" },
     ));
+
+    if let Ok(Some(fadt_addr)) = unsafe { find_table(root_addr, is_xsdt, FADT_SIGNATURE) } {
+        unsafe { parse_fadt_reset(fadt_addr) };
+    }
 
     let Some(madt_addr) = (unsafe { find_table(root_addr, is_xsdt, MADT_SIGNATURE)? }) else {
         return Err("acpi: no MADT ('APIC') table present in the XSDT/RSDT");
